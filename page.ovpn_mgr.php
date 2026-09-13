@@ -11,14 +11,58 @@ $pidFile = "{$baseDir}/openvpn.pid";
 $serverKey = "{$pkiDir}/private/server.key";
 
 // Helper Functions
-function getOpenVpnVersion() {
-    $openvpnBin = file_exists('/usr/sbin/openvpn') ? '/usr/sbin/openvpn' : '/usr/local/sbin/openvpn';
-    exec("sudo -n {$openvpnBin} --version 2>&1", $output);
+if (!function_exists('getOpenVpnVersion')) {
+    function getOpenVpnVersion() {
+        $openvpnBin = file_exists('/usr/sbin/openvpn') ? '/usr/sbin/openvpn' : '/usr/local/sbin/openvpn';
+        exec("sudo -n {$openvpnBin} --version 2>&1", $output);
 
-    if (!empty($output[0]) && preg_match('/OpenVPN\s+([0-9]+\.[0-9]+\.[0-9]+)/i', $output[0], $matches)) {
-        return $matches[1];
+        if (!empty($output[0]) && preg_match('/OpenVPN\s+([0-9]+\.[0-9]+\.[0-9]+)/i', $output[0], $matches)) {
+            return $matches[1];
+        }
+        return '2.4.0';
     }
-    return '2.4.0';
+}
+
+if (!function_exists('netmaskToCidr')) {
+    function netmaskToCidr($netmask) {
+        $long = ip2long($netmask);
+        $base = ip2long('255.255.255.255');
+        return 32 - log(($long ^ $base) + 1, 2);
+    }
+}
+
+if (!function_exists('cidrToNetmask')) {
+    function cidrToNetmask($cidr) {
+        return long2ip(-1 << (32 - (int)$cidr));
+    }
+}
+
+if (!function_exists('getActiveServerSettings')) {
+    function getActiveServerSettings($serverConf) {
+        $ip = $_SERVER['SERVER_ADDR'] ?? '127.0.0.1';
+        $port = '1194';
+        $hostIp = '10.8.0.1';
+        $cidr = 24;
+        
+        if (file_exists($serverConf)) {
+            $content = (string)@file_get_contents($serverConf);
+            if (preg_match('/^port (\d+)/m', $content, $mPort)) {
+                $port = trim($mPort[1]);
+            }
+            if (preg_match('/^# client-remote-host (.+)/m', $content, $mIp)) {
+                $ip = trim($mIp[1]);
+            }
+            if (preg_match('/^server\s+([\d\.]+)\s+([\d\.]+)/m', $content, $mSubnet)) {
+                $netIp = ip2long(trim($mSubnet[1]));
+                $maskStr = trim($mSubnet[2]);
+                $cidr = netmaskToCidr($maskStr);
+                
+                // Server host IP is network IP + 1 by default
+                $hostIp = long2ip($netIp + 1);
+            }
+        }
+        return ['ip' => $ip, 'port' => $port, 'host_ip' => $hostIp, 'cidr' => $cidr];
+    }
 }
 
 function startOpenVpnServer($serverConf, $baseDir, $serverKey) {
@@ -155,22 +199,6 @@ function stopOpenVpnServer($pidFile, $serverConf) {
     clearstatcache();
 }
 
-function getActiveServerSettings($serverConf) {
-    $ip = $_SERVER['SERVER_ADDR'] ?? '127.0.0.1';
-    $port = '1194';
-    
-    if (file_exists($serverConf)) {
-        $content = (string)@file_get_contents($serverConf);
-        if (preg_match('/^port (\d+)/m', $content, $mPort)) {
-            $port = trim($mPort[1]);
-        }
-        if (preg_match('/^# client-remote-host (.+)/m', $content, $mIp)) {
-            $ip = trim($mIp[1]);
-        }
-    }
-    return ['ip' => $ip, 'port' => $port];
-}
-
 // 0. Live Log Endpoint, Line Break Endpoint & Public IP Endpoint
 if (isset($_REQUEST['action'])) {
     if ($_REQUEST['action'] === 'fetch_log') {
@@ -196,7 +224,6 @@ if (isset($_REQUEST['action'])) {
         if (file_exists($logFile)) {
             $dividerText = "\n#############################################\n--- SEPARATOR (" . date('Y-m-d H:i:s') . ") ---\n#############################################\n";
             
-            // Append directly using native PHP (since directory/file permissions are owned by asterisk)
             $written = @file_put_contents($logFile, $dividerText, FILE_APPEND);
             exec("sudo -n /bin/chmod 644 " . escapeshellarg($logFile) . " 2>&1");
             
@@ -245,7 +272,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'manage_service') {
     exit();
 }
 
-// 2. Full Elevation & System Auto-Hardening via GUI (Includes /bin/bash and /usr/bin/printf permissions)
+// 2. Full Elevation & System Auto-Hardening via GUI
 $elevationError = '';
 if (isset($_POST['action']) && $_POST['action'] === 'elevate_permissions') {
     $rootPass = $_POST['sudo_password'] ?? '';
@@ -308,23 +335,44 @@ if (isset($_POST['action']) && $_POST['action'] === 'elevate_permissions') {
 if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
     $newPort = intval($_POST['ovpn_port']);
     $newIp = trim($_POST['server_ip']);
+    $hostIpStr = trim($_POST['host_ip']);
+    $cidr = intval($_POST['client_cidr']);
 
-    if ($newPort > 0 && $newPort < 65535 && !empty($newIp)) {
-        $confContent = (string)@file_get_contents($serverConf);
-        $confContent = preg_replace('/^port \d+/m', "port {$newPort}", $confContent);
+    if ($newPort > 0 && $newPort < 65535 && !empty($newIp) && filter_var($hostIpStr, FILTER_VALIDATE_IP) && $cidr >= 8 && $cidr <= 30) {
+        $netmask = cidrToNetmask($cidr);
         
-        if (preg_match('/^# client-remote-host .*/m', $confContent)) {
-            $confContent = preg_replace('/^# client-remote-host .*/m', "# client-remote-host {$newIp}", $confContent);
-        } else {
-            $confContent .= "\n# client-remote-host {$newIp}";
-        }
+        $hostIpLong = ip2long($hostIpStr);
+        $maskLong = ip2long($netmask);
+        
+        $networkIpLong = $hostIpLong & $maskLong;
+        $broadcastIpLong = $networkIpLong | (~$maskLong & 0xFFFFFFFF);
 
-        @file_put_contents($serverConf, $confContent);
+        // Ensure host IP is neither the Network ID nor Broadcast IP
+        if ($hostIpLong !== $networkIpLong && $hostIpLong !== $broadcastIpLong) {
+            $networkIp = long2ip($networkIpLong);
 
-        if (!file_exists("{$baseDir}/.stopped")) {
-            stopOpenVpnServer($pidFile, $serverConf);
-            sleep(1);
-            startOpenVpnServer($serverConf, $baseDir, $serverKey);
+            $confContent = (string)@file_get_contents($serverConf);
+            $confContent = preg_replace('/^port \d+/m', "port {$newPort}", $confContent);
+            
+            if (preg_match('/^# client-remote-host .*/m', $confContent)) {
+                $confContent = preg_replace('/^# client-remote-host .*/m', "# client-remote-host {$newIp}", $confContent);
+            } else {
+                $confContent .= "\n# client-remote-host {$newIp}";
+            }
+
+            if (preg_match('/^server .*/m', $confContent)) {
+                $confContent = preg_replace('/^server .*/m', "server {$networkIp} {$netmask}", $confContent);
+            } else {
+                $confContent .= "\nserver {$networkIp} {$netmask}";
+            }
+
+            @file_put_contents($serverConf, $confContent);
+
+            if (!file_exists("{$baseDir}/.stopped")) {
+                stopOpenVpnServer($pidFile, $serverConf);
+                sleep(1);
+                startOpenVpnServer($serverConf, $baseDir, $serverKey);
+            }
         }
     }
     header("Location: config.php?display=ovpn_mgr");
@@ -571,7 +619,7 @@ if (file_exists($logFile)) {
 
 <div class="container-fluid">
     <h1>OpenVPN Manager</h1>
-    <p>Manage legacy OpenVPN server configuration and Yealink provisioning packages.</p>
+    <p>Manage OpenVPN server configuration and provisioning packages.</p>
     <hr>
 
     <!-- Status Banner -->
@@ -655,6 +703,27 @@ if (file_exists($logFile)) {
                                 <label for="ovpn_port" style="font-size: 11px; display: block; margin-bottom: 5px;">Port</label>
                                 <input type="number" class="form-control" id="ovpn_port" name="ovpn_port" value="<?php echo htmlspecialchars($currentPort); ?>" required style="width: 70px; height: 34px; padding: 6px 4px;">
                             </div>
+                        </div>
+
+                        <div style="display: flex; align-items: flex-end; gap: 10px; margin-bottom: 15px; flex-wrap: wrap;">
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label for="host_ip" style="font-size: 11px; display: block; margin-bottom: 5px;">Host IP</label>
+                                <input type="text" class="form-control" id="host_ip" name="host_ip" value="<?php echo htmlspecialchars($activeSettings['host_ip']); ?>" required style="width: 120px; height: 34px;" placeholder="10.8.0.1" oninput="calculateIpRange()">
+                            </div>
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label for="client_cidr" style="font-size: 11px; display: block; margin-bottom: 5px;">CIDR</label>
+                                <div class="input-group" style="width: 75px;">
+                                    <span class="input-group-addon" style="padding: 6px 6px;">/</span>
+                                    <input type="number" class="form-control" id="client_cidr" name="client_cidr" value="<?php echo htmlspecialchars($activeSettings['cidr']); ?>" min="8" max="30" required style="height: 34px; padding: 6px 4px;" oninput="calculateIpRange()">
+                                </div>
+                            </div>
+                            <div class="form-group" style="margin-bottom: 0; align-self: center;">
+				    <label style="font-size: 11px; display: block; margin-bottom: 2px;">
+				        Client IP Range <span id="ip_count_display" style="font-weight: normal; color: #666; margin-left: 4px;"></span>
+				    </label>
+				    <span id="ip_range_display" class="label label-info" style="font-size: 12px; padding: 6px 10px; display: inline-block;">Calculating...</span>
+				    <div id="ip_warning_display" style="font-size: 11px; color: #a94442; margin-top: 3px; display: none;"></div>
+			    </div>
                         </div>
 
                         <button type="submit" class="btn btn-primary btn-block" style="max-width: 420px;">
@@ -805,6 +874,7 @@ if (file_exists($logFile)) {
                             <tr>
                                 <th>Common Name (Ext)</th>
                                 <th>Serial Number</th>
+                                <th>Target (Host:Port)</th>
                                 <th>Issued Date</th>
                                 <th style="width: 150px; text-align: center;">Revocation</th>
                             </tr>
@@ -815,10 +885,22 @@ if (file_exists($logFile)) {
                                 $parsedCert = openssl_x509_parse((string)@file_get_contents($crtPath));
                                 $serial = $parsedCert['serialNumberHex'] ?? $parsedCert['serialNumber'] ?? 'N/A';
                                 $validFrom = date("Y-m-d H:i", $parsedCert['validFrom_time_t'] ?? filemtime($crtPath));
+
+                                // Extract target host/port from generated package archive or active server defaults
+                                $targetHostPort = "{$currentServerIp}:{$currentPort}";
+                                $matchingTars = glob("{$pkgDir}/*_{$extName}_ovpn.tar");
+
+                                if (!empty($matchingTars[0]) && file_exists($matchingTars[0])) {
+                                    $cnfOutput = shell_exec("tar -xOf " . escapeshellarg($matchingTars[0]) . " vpn.cnf 2>/dev/null");
+                                    if (!empty($cnfOutput) && preg_match('/^remote\s+([^\s]+)\s+(\d+)/m', $cnfOutput, $mRemote)) {
+                                        $targetHostPort = "{$mRemote[1]}:{$mRemote[2]}";
+                                    }
+                                }
                             ?>
                                 <tr>
                                     <td><strong>Extension <?php echo htmlspecialchars($extName); ?></strong></td>
                                     <td><code><?php echo htmlspecialchars($serial); ?></code></td>
+                                    <td><code><?php echo htmlspecialchars($targetHostPort); ?></code></td>
                                     <td><?php echo $validFrom; ?></td>
                                     <td style="text-align: center;">
                                         <a href="config.php?display=ovpn_mgr&revoke_ext=<?php echo urlencode($extName); ?>" class="btn btn-xs btn-danger" onclick="return confirm('REVOKE Extension <?php echo $extName; ?>? This will block the phone from connecting and update the CRL.');">
@@ -967,5 +1049,75 @@ $('#logModal').on('hidden.bs.modal', function () {
         clearInterval(logInterval);
         logInterval = null;
     }
+});
+
+function ipToInt(ip) {
+    return ip.split('.').reduce((acc, octet) => (acc << 8) + parseInt(octet, 10), 0) >>> 0;
+}
+
+function intToIp(int) {
+    return [(int >>> 24) & 255, (int >>> 16) & 255, (int >>> 8) & 255, int & 255].join('.');
+}
+
+function calculateIpRange() {
+    const hostIpStr = $('#host_ip').val().trim();
+    const cidr = parseInt($('#client_cidr').val(), 10);
+    const display = $('#ip_range_display');
+    const warning = $('#ip_warning_display');
+    const countDisplay = $('#ip_count_display');
+
+    warning.hide().text('');
+
+    if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(hostIpStr) || isNaN(cidr) || cidr < 8 || cidr > 30) {
+        display.text('Invalid Input').removeClass('label-info').addClass('label-danger');
+        countDisplay.text('');
+        return;
+    }
+
+    try {
+        const hostIpInt = ipToInt(hostIpStr);
+        const maskInt = (-1 << (32 - cidr)) >>> 0;
+        const netInt = (hostIpInt & maskInt) >>> 0;
+        const broadcastInt = (netInt | ~maskInt) >>> 0;
+
+        const firstUsable = intToIp(netInt + 1);
+        const lastUsable = intToIp(broadcastInt - 1);
+
+        // Check Network ID boundary -> suggest last usable IP in lower block or first usable in current block
+        if (hostIpInt === netInt) {
+            const lowerUsable = intToIp(netInt - 2);
+            display.text(`Invalid Host. Use ${lowerUsable} or ${firstUsable}`)
+                   .removeClass('label-info').addClass('label-danger');
+            countDisplay.text('');
+            return;
+        }
+
+        // Check Broadcast IP boundary -> suggest last usable in current block or first usable in upper block
+        if (hostIpInt === broadcastInt) {
+            const upperUsable = intToIp(broadcastInt + 2);
+            display.text(`Invalid Host. Use ${lastUsable} or ${upperUsable}`)
+                   .removeClass('label-info').addClass('label-danger');
+            countDisplay.text('');
+            return;
+        }
+
+        const totalUsableIps = (broadcastInt - netInt - 1);
+
+        countDisplay.text(`(${totalUsableIps} total IPs)`);
+
+        if (hostIpStr !== firstUsable) {
+            warning.text(`Note: Host IP is not the primary IP in block (${firstUsable})`).show();
+        }
+
+        display.text(`${firstUsable} - ${lastUsable} (Host: ${hostIpStr})`)
+               .removeClass('label-danger').addClass('label-info');
+    } catch (e) {
+        display.text('Error').removeClass('label-info').addClass('label-danger');
+        countDisplay.text('');
+    }
+}
+
+$(document).ready(function() {
+    calculateIpRange();
 });
 </script>
