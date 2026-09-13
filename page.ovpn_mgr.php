@@ -2,6 +2,7 @@
 if (!defined('FREEPBX_IS_AUTH')) { die('No direct script access allowed'); }
 
 $baseDir = '/var/www/html/PhoneSettings/openvpn';
+$pkgDir = '/var/www/html/PhoneSettings/vpnkeys';
 $pkiDir = "{$baseDir}/legacy_pki";
 $logFile = "{$baseDir}/logs/openvpn.log";
 $serverConf = "{$baseDir}/legacy-vpn.conf";
@@ -212,7 +213,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'elevate_permissions') {
             "password = sys.argv[1] if len(sys.argv) > 1 else ''",
             "pid, fd = pty.fork()",
             "if pid == 0:",
-            "    os.execvp('su', ['su', '-', 'root', '-c', 'mkdir -p /var/www/html/PhoneSettings/openvpn/logs && chown -R asterisk:asterisk /var/www/html/PhoneSettings/openvpn && setcap cap_net_admin+ep /usr/sbin/openvpn && systemctl stop openvpn openvpn@* 2>/dev/null; systemctl disable openvpn openvpn@* 2>/dev/null; systemctl mask openvpn openvpn@* 2>/dev/null; echo \"asterisk ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /usr/bin/pgrep, /usr/bin/pkill, /bin/pkill, /bin/kill, /usr/bin/kill, /usr/bin/fuser, /bin/fuser, /usr/sbin/openvpn*, /bin/chmod*, /usr/sbin/setcap*, /sbin/ip\" > /etc/sudoers.d/openvpn_mgr && chmod 0644 /etc/sudoers.d/openvpn_mgr && echo SUCCESS_ELEVATED'])",
+            "    os.execvp('su', ['su', '-', 'root', '-c', 'mkdir -p /var/www/html/PhoneSettings/openvpn/logs /var/www/html/PhoneSettings/vpnkeys && chown -R asterisk:asterisk /var/www/html/PhoneSettings/openvpn /var/www/html/PhoneSettings/vpnkeys && setcap cap_net_admin+ep /usr/sbin/openvpn && systemctl stop openvpn openvpn@* 2>/dev/null; systemctl disable openvpn openvpn@* 2>/dev/null; systemctl mask openvpn openvpn@* 2>/dev/null; echo \"asterisk ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /usr/bin/pgrep, /usr/bin/pkill, /bin/pkill, /bin/kill, /usr/bin/kill, /usr/bin/fuser, /bin/fuser, /usr/sbin/openvpn*, /bin/chmod*, /usr/sbin/setcap*, /sbin/ip\" > /etc/sudoers.d/openvpn_mgr && chmod 0644 /etc/sudoers.d/openvpn_mgr && echo SUCCESS_ELEVATED'])",
             "else:",
             "    output = ''",
             "    pw_sent = False",
@@ -295,6 +296,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'generate_package') {
     $port = $settings['port'];
 
     if (!empty($ext) && !empty($mac)) {
+        if (!file_exists($pkgDir)) {
+            @mkdir($pkgDir, 0775, true);
+        }
+
         $clientKey = "{$pkiDir}/private/{$ext}.key";
         $clientCrt = "{$pkiDir}/issued/{$ext}.crt";
         $clientCsr = "{$pkiDir}/{$ext}.csr";
@@ -320,8 +325,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'generate_package') {
         $vpnCnf = "client\nnobind\nremote {$serverIp} {$port}\nproto udp\ndev tun\nca /config/openvpn/keys/ca.crt\ncert /config/openvpn/keys/client.crt\nkey /config/openvpn/keys/client.key\ncipher AES-128-CBC\nauth SHA1\nverb 3\n";
         @file_put_contents("{$buildDir}/vpn.cnf", $vpnCnf);
 
-        $tarPath = "{$baseDir}/keys_{$ext}_{$mac}.tar";
+        // Naming Structure: {$mac}_{$ext}_ovpn.tar
+        $tarPath = "{$pkgDir}/{$mac}_{$ext}_ovpn.tar";
         exec("tar -cvf {$tarPath} -C {$buildDir} ca.crt client.crt client.key keys vpn.cnf 2>&1");
+        exec("chmod 644 " . escapeshellarg($tarPath) . " 2>&1");
         
         exec("rm -rf " . escapeshellarg($buildDir));
     }
@@ -356,7 +363,18 @@ if (isset($_GET['revoke_ext'])) {
 
         @unlink($targetCrt);
         @unlink($targetKey);
-        foreach (glob("{$baseDir}/keys_{$revokeExt}_*.tar") as $matchingTar) {
+
+        // Delete matching tar archives (supports new {$mac}_{$ext}_ovpn.tar and legacy patterns)
+        foreach (glob("{$pkgDir}/*_{$revokeExt}_ovpn.tar") as $matchingTar) {
+            @unlink($matchingTar);
+        }
+        foreach (glob("{$pkgDir}/*_{$revokeExt}_keys.tar") as $matchingTar) {
+            @unlink($matchingTar);
+        }
+        foreach (glob("{$pkgDir}/{$revokeExt}-*-keys.tar") as $matchingTar) {
+            @unlink($matchingTar);
+        }
+        foreach (glob("{$pkgDir}/keys_{$revokeExt}_*.tar") as $matchingTar) {
             @unlink($matchingTar);
         }
 
@@ -369,11 +387,64 @@ if (isset($_GET['revoke_ext'])) {
 }
 
 // 6. Handle Package Deletion
+// 6. Handle Package Deletion & Key Revocation
 if (isset($_GET['delete_pkg'])) {
     $targetPkg = basename($_GET['delete_pkg']);
-    $fullPath = "{$baseDir}/{$targetPkg}";
-    if (file_exists($fullPath) && strpos($targetPkg, 'keys_') === 0) {
+    $fullPath = "{$pkgDir}/{$targetPkg}";
+
+    if (file_exists($fullPath) && (strpos($targetPkg, '_ovpn.tar') !== false || strpos($targetPkg, '_keys.tar') !== false || strpos($targetPkg, '-keys.tar') !== false || strpos($targetPkg, 'keys_') === 0)) {
+        $revokeExt = '';
+
+        // Extract extension from {mac}_{ext}_ovpn.tar or {mac}_{ext}_keys.tar
+        if (preg_match('/^[a-f0-9]+_(\d+)_(ovpn|keys)\.tar$/i', $targetPkg, $m)) {
+            $revokeExt = $m[1];
+        } 
+        // Extract extension from legacy formats (keys_{ext}_{mac}.tar or {ext}-{mac}-keys.tar)
+        elseif (preg_match('/^keys_(\d+)_/i', $targetPkg, $m) || preg_match('/^(\d+)-/i', $targetPkg, $m)) {
+            $revokeExt = $m[1];
+        }
+
+        // Delete the archive file first
         @unlink($fullPath);
+
+        // If an extension was matched, perform full OpenSSL revocation
+        if (!empty($revokeExt)) {
+            $targetCrt = "{$pkiDir}/issued/{$revokeExt}.crt";
+            $targetKey = "{$pkiDir}/private/{$revokeExt}.key";
+
+            if (file_exists($targetCrt)) {
+                $tmpCnf = "{$pkiDir}/crl_openssl.cnf";
+                $cnfData = "[ ca ]\ndefault_ca = CA_default\n\n[ CA_default ]\ndir = {$pkiDir}\ndefault_md = sha256\n";
+                @file_put_contents($tmpCnf, $cnfData);
+
+                if (!file_exists("{$pkiDir}/index.txt")) { touch("{$pkiDir}/index.txt"); }
+                if (!file_exists("{$pkiDir}/crlnumber")) { @file_put_contents("{$pkiDir}/crlnumber", "01\n"); }
+
+                exec("OPENSSL_CONF={$tmpCnf} openssl ca -revoke {$targetCrt} -keyfile {$pkiDir}/private/ca.key -cert {$pkiDir}/ca.crt -config {$tmpCnf} 2>&1");
+                exec("OPENSSL_CONF={$tmpCnf} openssl ca -gencrl -keyfile {$pkiDir}/private/ca.key -cert {$pkiDir}/ca.crt -out {$crlFile} -config {$tmpCnf} 2>&1");
+
+                @unlink($tmpCnf);
+
+                $confContent = (string)@file_get_contents($serverConf);
+                if (strpos($confContent, 'crl-verify') === false) {
+                    $confContent .= "\ncrl-verify {$crlFile}\n";
+                    @file_put_contents($serverConf, $confContent);
+                }
+
+                @unlink($targetCrt);
+                @unlink($targetKey);
+
+                // Clean up any remaining archive instances for this extension
+                foreach (glob("{$pkgDir}/*_{$revokeExt}_ovpn.tar") as $matchingTar) { @unlink($matchingTar); }
+                foreach (glob("{$pkgDir}/*_{$revokeExt}_keys.tar") as $matchingTar) { @unlink($matchingTar); }
+                foreach (glob("{$pkgDir}/{$revokeExt}-*-keys.tar") as $matchingTar) { @unlink($matchingTar); }
+                foreach (glob("{$pkgDir}/keys_{$revokeExt}_*.tar") as $matchingTar) { @unlink($matchingTar); }
+
+                stopOpenVpnServer($pidFile);
+                sleep(1);
+                startOpenVpnServer($serverConf, $baseDir, $serverKey);
+            }
+        }
     }
     header("Location: config.php?display=ovpn_mgr");
     exit();
@@ -435,7 +506,7 @@ $isRunning = !empty($pids) && !$hasTunError;
 exec("sudo -n /usr/sbin/openvpn --version 2>&1", $sudoCheckOut, $sudoCheckCode);
 $hasSudoRule = ($sudoCheckCode === 0 || strpos(implode(' ', $sudoCheckOut), 'OpenVPN') !== false);
 
-$createdPackages = glob("{$baseDir}/keys_*.tar");
+$createdPackages = glob("{$pkgDir}/*.tar");
 $issuedCertFiles = glob("{$pkiDir}/issued/*.crt");
 
 // Active Client & Cipher Parser
@@ -649,27 +720,35 @@ if (file_exists($logFile)) {
                     <?php if (empty($createdPackages)): ?>
                         <div style="padding: 20px; text-align: center;" class="text-muted">No provisioning packages have been generated yet.</div>
                     <?php else: ?>
-                        <table class="table table-striped table-bordered" style="margin-bottom: 0;">
+                        <table class="table table-striped table-bordered" style="margin-bottom: 0; table-layout: fixed; width: 100%;">
                             <thead>
                                 <tr>
-                                    <th>Package Name</th>
-                                    <th>Size</th>
-                                    <th>Date Created</th>
-                                    <th style="width: 100px; text-align: center;">Actions</th>
+                                    <th style="width: 220px;">Package Name</th>
+                                    <th style="width: 55px; text-align: center;">Size</th>
+                                    <th style="width: auto; text-align: center;">Date Created</th>
+                                    <th style="width: 140px; text-align: center;">Actions</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 <?php foreach ($createdPackages as $pkgPath): 
                                     $filename = basename($pkgPath);
-                                    $downloadUrl = "/PhoneSettings/openvpn/" . $filename;
+                                    $downloadUrl = "/PhoneSettings/vpnkeys/" . $filename;
                                 ?>
                                     <tr>
-                                        <td><code><?php echo htmlspecialchars($filename); ?></code></td>
-                                        <td><?php echo round(filesize($pkgPath) / 1024, 1); ?> KB</td>
-                                        <td><?php echo date("Y-m-d H:i", filemtime($pkgPath)); ?></td>
-                                        <td style="text-align: center;">
-                                            <a href="<?php echo $downloadUrl; ?>" class="btn btn-xs btn-primary" download><i class="fa fa-download"></i></a>
-                                            <a href="config.php?display=ovpn_mgr&delete_pkg=<?php echo urlencode($filename); ?>" class="btn btn-xs btn-danger" onclick="return confirm('Delete this key package?');"><i class="fa fa-trash"></i></a>
+                                        <td style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle;">
+                                            <code style="color: #08096e; font-size: 14px; font-weight: 500; vertical-align: middle;"><?php echo htmlspecialchars($filename); ?></code>
+                                        </td>
+                                        <td style="text-align: center; white-space: nowrap; vertical-align: middle; font-size: 12px;"><?php echo round(filesize($pkgPath) / 1024, 0); ?> KB</td>
+                                        <td style="text-align: center; white-space: nowrap; vertical-align: middle; font-size: 12px;"><?php echo date("Y-m-d H:i", filemtime($pkgPath)); ?></td>
+                                        <td style="text-align: center; white-space: nowrap; vertical-align: middle; padding: 4px 2px;">
+                                            <div style="display: flex; justify-content: center; align-items: center; gap: 3px;">
+                                                <a href="<?php echo $downloadUrl; ?>" class="btn btn-xs btn-primary" download title="Download Package" style="padding: 2px 6px; font-size: 18px;">
+                                                    <i class="fa fa-download"></i>
+                                                </a>
+                                                <a href="config.php?display=ovpn_mgr&delete_pkg=<?php echo urlencode($filename); ?>" class="btn btn-xs btn-danger" onclick="return confirm('Delete this key package?');" title="Delete Package" style="padding: 2px 6px; font-size: 18px;">
+                                                    <i class="fa fa-trash"></i>
+                                                </a>
+                                            </div>
                                         </td>
                                     </tr>
                                 <?php endforeach; ?>

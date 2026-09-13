@@ -4,6 +4,11 @@ if (!defined('FREEPBX_IS_AUTH')) { die('No direct script access allowed'); }
 $baseDir = '/var/www/html/PhoneSettings/openvpn';
 $pidFile = "{$baseDir}/openvpn.pid";
 $sudoersFile = '/etc/sudoers.d/openvpn_mgr';
+$pkgDir = '/var/www/html/PhoneSettings/vpnkeys';
+
+if (is_dir($pkgDir)) {
+    removeDirectoryRecursive($pkgDir);
+}
 
 // 1. Terminate any running OpenVPN processes started by the module
 if (file_exists($pidFile)) {
