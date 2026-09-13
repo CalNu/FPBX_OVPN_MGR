@@ -93,3 +93,9 @@ file_put_contents($serverConf, $serverConfigContent);
 exec("pkill -f 'legacy-vpn.conf' 2>&1");
 $launchCmd = "OPENSSL_CONF=/etc/ssl/openssl.cnf OPENSSL_CIPHER_LIST=DEFAULT:@SECLEVEL=0 openvpn --config " . escapeshellarg($serverConf) . " --writepid {$baseDir}/openvpn.pid --daemon 2>&1";
 exec($launchCmd);
+
+// 7. Add Simlinks for Related Folders
+
+deploy_module_symlink('/tftpboot', $module_root . '/tftpboot');
+deploy_module_symlink($amp_conf['AMPWEBROOT'] . '/PhoneSettings', $module_root . '/PhoneSettings');
+deploy_module_symlink($amp_conf['AMPWEBROOT'] . '/admin/modules/yealink_epm', $module_root . '/yealink_epm');
