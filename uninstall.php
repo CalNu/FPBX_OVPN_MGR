@@ -70,8 +70,9 @@ if (is_dir($baseDir)) {
 safe_sudo_exec("/bin/systemctl unmask openvpn openvpn@*");
 
 // 4. Restore terminal echo AND fix shifted column alignment (stty sane)
-if (function_exists('posix_isatty') && posix_isatty(STDOUT)) {
+if (php_sapi_name() === 'cli' && function_exists('posix_isatty') && defined('STDOUT') && posix_isatty(STDOUT)) {
     system('stty sane 2>/dev/null');
 }
+
 
 clearstatcache();
