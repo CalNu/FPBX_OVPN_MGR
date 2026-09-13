@@ -119,4 +119,3 @@ exec("pkill -f 'legacy-vpn.conf' 2>&1");
 $launchCmd = "OPENSSL_CONF=/etc/ssl/openssl.cnf OPENSSL_CIPHER_LIST=DEFAULT:@SECLEVEL=0 openvpn --config " . escapeshellarg($serverConf) . " --writepid {$baseDir}/openvpn.pid --daemon 2>&1";
 exec($launchCmd);
 
-
