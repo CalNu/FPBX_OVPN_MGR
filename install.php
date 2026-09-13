@@ -10,21 +10,23 @@ $module_name = 'ovpn_mgr';
 $module_root = $amp_conf['AMPWEBROOT'] . '/admin/modules/' . $module_name;
 
 // 0. Add Links to Useful/Related Folders
-function deploy_module_symlink($source, $target) {
-    if (file_exists($target) || is_link($target)) {
-        if (is_dir($target) && !is_link($target)) {
-            return false;
-        }
-        @unlink($target);
-    }
+  if (!function_exists('deploy_module_symlink')) {
+	function deploy_module_symlink($source, $target) {
+	    if (file_exists($target) || is_link($target)) {
+	        if (is_dir($target) && !is_link($target)) {
+	            return false;
+	        }
+	        @unlink($target);
+	    }
 
-    if (@symlink($source, $target)) {
-        @chown($target, 'asterisk');
-        @chgrp($target, 'asterisk');
-        return true;
-    }
-    return false;
-}
+	    if (@symlink($source, $target)) {
+	        @chown($target, 'asterisk');
+	        @chgrp($target, 'asterisk');
+	        return true;
+	    }
+	    return false;
+	}
+  }
 
 deploy_module_symlink('/tftpboot', $module_root . '/tftpboot');
 deploy_module_symlink($amp_conf['AMPWEBROOT'] . '/PhoneSettings', $module_root . '/PhoneSettings');
