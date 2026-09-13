@@ -6,11 +6,30 @@ $pkgDir = '/var/www/html/PhoneSettings/vpnkeys';
 $pkiDir = "{$baseDir}/legacy_pki";
 $tftpDir = '/tftpboot';
 $serverConf = "{$baseDir}/legacy-vpn.conf";
+$module_name = 'ovpn_mgr'; 
+$module_root = $amp_conf['AMPWEBROOT'] . '/admin/modules/' . $module_name;
 
-//  Add Simlinks for Related Folders
+// 0. Add Links to Useful/Related Folders
+function deploy_module_symlink($source, $target) {
+    if (file_exists($target) || is_link($target)) {
+        if (is_dir($target) && !is_link($target)) {
+            return false;
+        }
+        @unlink($target);
+    }
+
+    if (@symlink($source, $target)) {
+        @chown($target, 'asterisk');
+        @chgrp($target, 'asterisk');
+        return true;
+    }
+    return false;
+}
+
 deploy_module_symlink('/tftpboot', $module_root . '/tftpboot');
-deploy_module_symlink('../../../PhoneSettings', $module_root . '/PhoneSettings');
-deploy_module_symlink('../yealink_epm', $module_root . '/yealink_epm');
+deploy_module_symlink($amp_conf['AMPWEBROOT'] . '/PhoneSettings', $module_root . '/PhoneSettings');
+deploy_module_symlink($amp_conf['AMPWEBROOT'] . '/admin/modules/yealink_epm', $module_root . '/yealink_epm');
+
 
 // 1. Create Web & Provisioning Directories
 $directories = [$baseDir, $pkgDir, $pkiDir, "{$pkiDir}/private", "{$pkiDir}/issued", $tftpDir, "{$baseDir}/logs"];
@@ -51,6 +70,7 @@ if (!file_exists("{$pkiDir}/server.crt") || !file_exists("{$pkiDir}/private/serv
 if (!file_exists("{$pkiDir}/dh.pem")) {
     exec("openssl dhparam -out {$pkiDir}/dh.pem 1024 2>&1");
 }
+
 
 // Restrict private key permissions to silence OpenVPN warning
 @chmod("{$pkiDir}/private/server.key", 0600);
@@ -98,4 +118,5 @@ file_put_contents($serverConf, $serverConfigContent);
 exec("pkill -f 'legacy-vpn.conf' 2>&1");
 $launchCmd = "OPENSSL_CONF=/etc/ssl/openssl.cnf OPENSSL_CIPHER_LIST=DEFAULT:@SECLEVEL=0 openvpn --config " . escapeshellarg($serverConf) . " --writepid {$baseDir}/openvpn.pid --daemon 2>&1";
 exec($launchCmd);
+
 
