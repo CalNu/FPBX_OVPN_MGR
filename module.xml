@@ -1,0 +1,13 @@
+<module>
+    <rawname>ovpn_mgr</rawname>
+    <name>OpenVPN Manager</name>
+    <version>1.0.4</version>
+    <publisher>HG</publisher>
+    <license>GPLv3+</license>
+    <category>Connectivity</category>
+    <menuitems>
+        <ovpn_mgr>OpenVPN Manager</ovpn_mgr>
+    </menuitems>
+    <location>local</location>
+    <populatesysadmin>true</populatesysadmin>
+</module>
