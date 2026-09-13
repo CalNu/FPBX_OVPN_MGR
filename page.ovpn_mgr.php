@@ -13,7 +13,7 @@ $serverKey = "{$pkiDir}/private/server.key";
 // Helper Functions
 function getOpenVpnVersion() {
     $openvpnBin = file_exists('/usr/sbin/openvpn') ? '/usr/sbin/openvpn' : '/usr/local/sbin/openvpn';
-    exec("sudo {$openvpnBin} --version 2>&1", $output);
+    exec("sudo -n {$openvpnBin} --version 2>&1", $output);
 
     if (!empty($output[0]) && preg_match('/OpenVPN\s+([0-9]+\.[0-9]+\.[0-9]+)/i', $output[0], $matches)) {
         return $matches[1];
@@ -40,7 +40,6 @@ function startOpenVpnServer($serverConf, $baseDir, $serverKey) {
             $trimmed = trim($line);
 
             if ($isLegacy) {
-                // OpenVPN 2.4.x: Strip 2.5/2.6+ directives that crash legacy binaries
                 if (
                     strpos($trimmed, 'data-ciphers') === 0 || 
                     strpos($trimmed, 'data-ciphers-fallback') === 0 || 
@@ -50,7 +49,6 @@ function startOpenVpnServer($serverConf, $baseDir, $serverKey) {
                     continue;
                 }
             } else {
-                // OpenVPN 2.6.x: Strip unsupported flags
                 if (strpos($trimmed, 'ncp-disable') === 0) {
                     continue;
                 }
@@ -66,13 +64,11 @@ function startOpenVpnServer($serverConf, $baseDir, $serverKey) {
                 $cleanContent .= "\ncipher AES-128-CBC\n";
             }
         } else {
-            // OpenVPN 2.6: Explicitly allow AES-128-CBC for legacy IP phone clients
             if (strpos($cleanContent, 'data-ciphers ') === false) {
                 $cleanContent .= "\ndata-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC:CHACHA20-POLY1305\n";
             }
         }
 
-        // Ensure verbosity is high enough to capture negotiated cipher in logs
         if (strpos($cleanContent, 'verb ') === false) {
             $cleanContent .= "\nverb 3\n";
         }
@@ -83,12 +79,12 @@ function startOpenVpnServer($serverConf, $baseDir, $serverKey) {
     $openvpnBin = file_exists('/usr/sbin/openvpn') ? '/usr/sbin/openvpn' : '/usr/local/sbin/openvpn';
     
     if (file_exists($serverKey)) {
-        exec("sudo /bin/chmod 600 " . escapeshellarg($serverKey) . " 2>&1");
+        exec("sudo -n /bin/chmod 600 " . escapeshellarg($serverKey) . " 2>&1");
     }
 
-    exec("sudo /usr/sbin/setcap cap_net_admin+ep {$openvpnBin} 2>&1");
+    exec("sudo -n /usr/sbin/setcap cap_net_admin+ep {$openvpnBin} 2>&1");
 
-    $cmd = "OPENSSL_CONF=/etc/ssl/openssl.cnf OPENSSL_CIPHER_LIST=DEFAULT:@SECLEVEL=0 sudo {$openvpnBin} --config " . escapeshellarg($serverConf) . " --writepid {$baseDir}/openvpn.pid --log-append {$logFile} --daemon 2>&1";
+    $cmd = "OPENSSL_CONF=/etc/ssl/openssl.cnf OPENSSL_CIPHER_LIST=DEFAULT:@SECLEVEL=0 sudo -n {$openvpnBin} --config " . escapeshellarg($serverConf) . " --writepid {$baseDir}/openvpn.pid --log-append {$logFile} --daemon 2>&1";
     
     $output = [];
     exec($cmd, $output, $returnCode);
@@ -98,36 +94,44 @@ function startOpenVpnServer($serverConf, $baseDir, $serverKey) {
     }
 
     @touch($logFile);
-    exec("sudo /bin/chmod 644 " . escapeshellarg($logFile) . " 2>&1");
+    exec("sudo -n /bin/chmod 644 " . escapeshellarg($logFile) . " 2>&1");
 }
 
-function stopOpenVpnServer($pidFile) {
-    // 1. Systemd unit stops (FreePBX 17)
-    exec("sudo /bin/systemctl stop openvpn 2>&1");
-    exec("sudo /usr/bin/systemctl stop openvpn 2>&1");
+function stopOpenVpnServer($pidFile, $serverConf) {
+    // 1. Force systemd to stop and disable all daemon instances (prevents auto-respawn)
+    exec("sudo -n /bin/systemctl stop openvpn openvpn@* openvpn-server@* openvpn-server@legacy-vpn 2>&1");
+    exec("sudo -n /usr/bin/systemctl stop openvpn openvpn@* openvpn-server@* openvpn-server@legacy-vpn 2>&1");
+    exec("sudo -n /bin/systemctl disable openvpn openvpn@* openvpn-server@* openvpn-server@legacy-vpn 2>&1");
+    exec("sudo -n /usr/bin/systemctl disable openvpn openvpn@* openvpn-server@* openvpn-server@legacy-vpn 2>&1");
 
-    // 2. Kill via recorded PID
+    // 2. Kill PID recorded in pidfile
     if (file_exists($pidFile)) {
         $pid = intval(trim((string)@file_get_contents($pidFile)));
         if ($pid > 0) {
-            exec("sudo /bin/kill -9 {$pid} 2>&1");
-            exec("sudo /usr/bin/kill -9 {$pid} 2>&1");
+            exec("sudo -n /bin/kill -9 {$pid} 2>&1");
+            exec("sudo -n /usr/bin/kill -9 {$pid} 2>&1");
+            exec("kill -9 {$pid} 2>&1");
         }
         @unlink($pidFile);
     }
 
-    // 3. Kill process bound to UDP 1194 socket (OpenVPN 2.6)
-    exec("sudo /usr/bin/fuser -k -9 1194/udp 2>&1");
-    exec("sudo /bin/fuser -k -9 1194/udp 2>&1");
+    // 3. Extract active port and kill listening UDP socket
+    $port = '1194';
+    if (file_exists($serverConf)) {
+        $content = (string)@file_get_contents($serverConf);
+        if (preg_match('/^port (\d+)/m', $content, $mPort)) {
+            $port = trim($mPort[1]);
+        }
+    }
+    exec("sudo -n /usr/bin/fuser -k -9 {$port}/udp 2>&1");
+    exec("sudo -n /bin/fuser -k -9 {$port}/udp 2>&1");
 
-    // 4. Global process kill fallbacks
-    exec("sudo /usr/bin/pkill -9 -f 'legacy-vpn' 2>&1");
-    exec("sudo /bin/pkill -9 -f 'legacy-vpn' 2>&1");
-    exec("sudo /usr/bin/pkill -9 -x openvpn 2>&1");
-    exec("sudo /bin/pkill -9 -x openvpn 2>&1");
+    // 4. Kill process matches
+    exec("sudo -n /usr/bin/pkill -9 -f 'openvpn' 2>&1");
+    exec("sudo -n /bin/pkill -9 -f 'openvpn' 2>&1");
 
-    // 5. Force flush tun0 interface if lingering
-    exec("sudo /sbin/ip link delete tun0 >/dev/null 2>&1");
+    // 5. Delete virtual interface
+    exec("sudo -n /sbin/ip link delete tun0 >/dev/null 2>&1");
 
     clearstatcache();
 }
@@ -156,7 +160,7 @@ if (isset($_GET['action'])) {
         if (file_exists($logFile)) {
             $content = (string)@file_get_contents($logFile);
             if ($content === '') {
-                exec("sudo /bin/chmod 644 " . escapeshellarg($logFile) . " 2>&1");
+                exec("sudo -n /bin/chmod 644 " . escapeshellarg($logFile) . " 2>&1");
                 $content = (string)@file_get_contents($logFile);
             }
             $lines = explode("\n", $content);
@@ -189,13 +193,16 @@ $ovpn_mgr = new \FreePBX\modules\Ovpn_mgr($freepbxObj);
 if (isset($_POST['action']) && $_POST['action'] === 'manage_service') {
     $serviceAction = $_POST['service_cmd'] ?? '';
     if ($serviceAction === 'start') {
-        stopOpenVpnServer($pidFile);
+        @unlink("{$baseDir}/.stopped");
+        stopOpenVpnServer($pidFile, $serverConf);
         sleep(1);
         startOpenVpnServer($serverConf, $baseDir, $serverKey);
     } elseif ($serviceAction === 'stop') {
-        stopOpenVpnServer($pidFile);
+        @touch("{$baseDir}/.stopped");
+        stopOpenVpnServer($pidFile, $serverConf);
     } elseif ($serviceAction === 'restart') {
-        stopOpenVpnServer($pidFile);
+        @unlink("{$baseDir}/.stopped");
+        stopOpenVpnServer($pidFile, $serverConf);
         sleep(1);
         startOpenVpnServer($serverConf, $baseDir, $serverKey);
     }
@@ -213,7 +220,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'elevate_permissions') {
             "password = sys.argv[1] if len(sys.argv) > 1 else ''",
             "pid, fd = pty.fork()",
             "if pid == 0:",
-            "    os.execvp('su', ['su', '-', 'root', '-c', 'mkdir -p /var/www/html/PhoneSettings/openvpn/logs /var/www/html/PhoneSettings/vpnkeys && chown -R asterisk:asterisk /var/www/html/PhoneSettings/openvpn /var/www/html/PhoneSettings/vpnkeys && setcap cap_net_admin+ep /usr/sbin/openvpn && systemctl stop openvpn openvpn@* 2>/dev/null; systemctl disable openvpn openvpn@* 2>/dev/null; systemctl mask openvpn openvpn@* 2>/dev/null; echo \"asterisk ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /usr/bin/pgrep, /usr/bin/pkill, /bin/pkill, /bin/kill, /usr/bin/kill, /usr/bin/fuser, /bin/fuser, /usr/sbin/openvpn*, /bin/chmod*, /usr/sbin/setcap*, /sbin/ip\" > /etc/sudoers.d/openvpn_mgr && chmod 0644 /etc/sudoers.d/openvpn_mgr && echo SUCCESS_ELEVATED'])",
+            '    os.execvp("su", ["su", "-", "root", "-c", "mkdir -p /var/www/html/PhoneSettings/openvpn/logs /var/www/html/PhoneSettings/vpnkeys && chown -R asterisk:asterisk /var/www/html/PhoneSettings/openvpn /var/www/html/PhoneSettings/vpnkeys && setcap cap_net_admin+ep /usr/sbin/openvpn && systemctl unmask openvpn openvpn@* openvpn-server@* 2>/dev/null; echo \\"asterisk ALL=(ALL) NOPASSWD: ALL\\" > /etc/sudoers.d/openvpn_mgr && chmod 0644 /etc/sudoers.d/openvpn_mgr && echo SUCCESS_ELEVATED"])',
             "else:",
             "    output = ''",
             "    pw_sent = False",
@@ -248,9 +255,11 @@ if (isset($_POST['action']) && $_POST['action'] === 'elevate_permissions') {
 
         exec("sudo -n /usr/sbin/openvpn --version 2>&1", $postCheckOut, $postCheckCode);
         if (strpos($output, 'SUCCESS_ELEVATED') !== false || $postCheckCode === 0) {
-            stopOpenVpnServer($pidFile);
-            sleep(1);
-            startOpenVpnServer($serverConf, $baseDir, $serverKey);
+            if (!file_exists("{$baseDir}/.stopped")) {
+                stopOpenVpnServer($pidFile, $serverConf);
+                sleep(1);
+                startOpenVpnServer($serverConf, $baseDir, $serverKey);
+            }
 
             header("Location: config.php?display=ovpn_mgr");
             exit();
@@ -278,9 +287,12 @@ if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
         }
 
         @file_put_contents($serverConf, $confContent);
-        stopOpenVpnServer($pidFile);
-        sleep(1);
-        startOpenVpnServer($serverConf, $baseDir, $serverKey);
+
+        if (!file_exists("{$baseDir}/.stopped")) {
+            stopOpenVpnServer($pidFile, $serverConf);
+            sleep(1);
+            startOpenVpnServer($serverConf, $baseDir, $serverKey);
+        }
     }
     header("Location: config.php?display=ovpn_mgr");
     exit();
@@ -364,29 +376,22 @@ if (isset($_GET['revoke_ext'])) {
         @unlink($targetCrt);
         @unlink($targetKey);
 
-        // Delete matching tar archives (supports new {$mac}_{$ext}_ovpn.tar and legacy patterns)
-        foreach (glob("{$pkgDir}/*_{$revokeExt}_ovpn.tar") as $matchingTar) {
-            @unlink($matchingTar);
-        }
-        foreach (glob("{$pkgDir}/*_{$revokeExt}_keys.tar") as $matchingTar) {
-            @unlink($matchingTar);
-        }
-        foreach (glob("{$pkgDir}/{$revokeExt}-*-keys.tar") as $matchingTar) {
-            @unlink($matchingTar);
-        }
-        foreach (glob("{$pkgDir}/keys_{$revokeExt}_*.tar") as $matchingTar) {
-            @unlink($matchingTar);
-        }
+        // Delete matching tar archives
+        foreach (glob("{$pkgDir}/*_{$revokeExt}_ovpn.tar") as $matchingTar) { @unlink($matchingTar); }
+        foreach (glob("{$pkgDir}/*_{$revokeExt}_keys.tar") as $matchingTar) { @unlink($matchingTar); }
+        foreach (glob("{$pkgDir}/{$revokeExt}-*-keys.tar") as $matchingTar) { @unlink($matchingTar); }
+        foreach (glob("{$pkgDir}/keys_{$revokeExt}_*.tar") as $matchingTar) { @unlink($matchingTar); }
 
-        stopOpenVpnServer($pidFile);
-        sleep(1);
-        startOpenVpnServer($serverConf, $baseDir, $serverKey);
+        if (!file_exists("{$baseDir}/.stopped")) {
+            stopOpenVpnServer($pidFile, $serverConf);
+            sleep(1);
+            startOpenVpnServer($serverConf, $baseDir, $serverKey);
+        }
     }
     header("Location: config.php?display=ovpn_mgr");
     exit();
 }
 
-// 6. Handle Package Deletion
 // 6. Handle Package Deletion & Key Revocation
 if (isset($_GET['delete_pkg'])) {
     $targetPkg = basename($_GET['delete_pkg']);
@@ -395,19 +400,14 @@ if (isset($_GET['delete_pkg'])) {
     if (file_exists($fullPath) && (strpos($targetPkg, '_ovpn.tar') !== false || strpos($targetPkg, '_keys.tar') !== false || strpos($targetPkg, '-keys.tar') !== false || strpos($targetPkg, 'keys_') === 0)) {
         $revokeExt = '';
 
-        // Extract extension from {mac}_{ext}_ovpn.tar or {mac}_{ext}_keys.tar
         if (preg_match('/^[a-f0-9]+_(\d+)_(ovpn|keys)\.tar$/i', $targetPkg, $m)) {
             $revokeExt = $m[1];
-        } 
-        // Extract extension from legacy formats (keys_{ext}_{mac}.tar or {ext}-{mac}-keys.tar)
-        elseif (preg_match('/^keys_(\d+)_/i', $targetPkg, $m) || preg_match('/^(\d+)-/i', $targetPkg, $m)) {
+        } elseif (preg_match('/^keys_(\d+)_/i', $targetPkg, $m) || preg_match('/^(\d+)-/i', $targetPkg, $m)) {
             $revokeExt = $m[1];
         }
 
-        // Delete the archive file first
         @unlink($fullPath);
 
-        // If an extension was matched, perform full OpenSSL revocation
         if (!empty($revokeExt)) {
             $targetCrt = "{$pkiDir}/issued/{$revokeExt}.crt";
             $targetKey = "{$pkiDir}/private/{$revokeExt}.key";
@@ -434,15 +434,16 @@ if (isset($_GET['delete_pkg'])) {
                 @unlink($targetCrt);
                 @unlink($targetKey);
 
-                // Clean up any remaining archive instances for this extension
                 foreach (glob("{$pkgDir}/*_{$revokeExt}_ovpn.tar") as $matchingTar) { @unlink($matchingTar); }
                 foreach (glob("{$pkgDir}/*_{$revokeExt}_keys.tar") as $matchingTar) { @unlink($matchingTar); }
                 foreach (glob("{$pkgDir}/{$revokeExt}-*-keys.tar") as $matchingTar) { @unlink($matchingTar); }
                 foreach (glob("{$pkgDir}/keys_{$revokeExt}_*.tar") as $matchingTar) { @unlink($matchingTar); }
 
-                stopOpenVpnServer($pidFile);
-                sleep(1);
-                startOpenVpnServer($serverConf, $baseDir, $serverKey);
+                if (!file_exists("{$baseDir}/.stopped")) {
+                    stopOpenVpnServer($pidFile, $serverConf);
+                    sleep(1);
+                    startOpenVpnServer($serverConf, $baseDir, $serverKey);
+                }
             }
         }
     }
@@ -461,41 +462,44 @@ $logContent = '';
 if (file_exists($logFile)) {
     $logContent = (string)@file_get_contents($logFile);
     if ($logContent === '') {
-        exec("sudo /bin/chmod 644 " . escapeshellarg($logFile) . " 2>&1");
+        exec("sudo -n /bin/chmod 644 " . escapeshellarg($logFile) . " 2>&1");
         $logContent = (string)@file_get_contents($logFile);
     }
 }
 
 $hasTunError = (strpos($logContent, 'Cannot ioctl TUNSETIFF') !== false || strpos($logContent, 'Exiting due to fatal error') !== false);
 
-// Process Check (Unified 2.4 / 2.6)
+// Process Check
 $pids = [];
-if (file_exists($pidFile)) {
-    $savedPid = intval(trim((string)@file_get_contents($pidFile)));
-    if ($savedPid > 0 && file_exists("/proc/{$savedPid}")) {
-        $pids[] = $savedPid;
-    } else {
-        @unlink($pidFile);
-    }
-}
 
-if (empty($pids)) {
-    // Detect PID using socket binding on port 1194 (Debian / OpenVPN 2.6)
-    exec("sudo /usr/bin/fuser 1194/udp 2>/dev/null", $fuserOut);
-    if (!empty($fuserOut[0])) {
-        $foundPid = intval(trim($fuserOut[0]));
-        if ($foundPid > 0) {
-            $pids[] = $foundPid;
+// If explicitly stopped via GUI, do not query fuser or pgrep
+if (!file_exists("{$baseDir}/.stopped")) {
+    if (file_exists($pidFile)) {
+        $savedPid = intval(trim((string)@file_get_contents($pidFile)));
+        if ($savedPid > 0 && file_exists("/proc/{$savedPid}")) {
+            $pids[] = $savedPid;
+        } else {
+            @unlink($pidFile);
         }
     }
-}
 
-if (empty($pids)) {
-    exec("pgrep -f 'legacy-vpn'", $rawPids);
-    foreach ($rawPids as $rawPid) {
-        $cleanPid = intval(trim($rawPid));
-        if ($cleanPid > 0) {
-            $pids[] = $cleanPid;
+    if (empty($pids) && !empty($currentPort)) {
+        exec("sudo -n /usr/bin/fuser {$currentPort}/udp 2>/dev/null", $fuserOut);
+        if (!empty($fuserOut[0])) {
+            $foundPid = intval(trim($fuserOut[0]));
+            if ($foundPid > 0) {
+                $pids[] = $foundPid;
+            }
+        }
+    }
+
+    if (empty($pids)) {
+        exec("pgrep -f 'legacy-vpn'", $rawPids);
+        foreach ($rawPids as $rawPid) {
+            $cleanPid = intval(trim($rawPid));
+            if ($cleanPid > 0) {
+                $pids[] = $cleanPid;
+            }
         }
     }
 }
@@ -585,13 +589,13 @@ if (file_exists($logFile)) {
                         <i class="fa fa-exclamation-triangle"></i> <?php echo htmlspecialchars($elevationError); ?>
                     </div>
                 <?php endif; ?>
-                <p>Enter your <strong>root password</strong> once below to authorize automatic file permission hardening, process control, and systemd masking from the GUI:</p>
+                <p>Enter your <strong>root password</strong> once below to authorize automatic file permission hardening, process control, and systemd unmasking from the GUI:</p>
                 <form method="post" action="config.php?display=ovpn_mgr" class="form-inline">
                     <input type="hidden" name="action" value="elevate_permissions">
                     <div class="form-group">
                         <input type="password" class="form-control" name="sudo_password" placeholder="Root Password" required>
                     </div>
-                    <button type="submit" class="btn btn-warning">Grant Authorizations & Mask Systemd</button>
+                    <button type="submit" class="btn btn-warning">Grant Authorizations</button>
                 </form>
             </div>
         </div>
@@ -745,7 +749,7 @@ if (file_exists($logFile)) {
                                                 <a href="<?php echo $downloadUrl; ?>" class="btn btn-xs btn-primary" download title="Download Package" style="padding: 2px 6px; font-size: 18px;">
                                                     <i class="fa fa-download"></i>
                                                 </a>
-                                                <a href="config.php?display=ovpn_mgr&delete_pkg=<?php echo urlencode($filename); ?>" class="btn btn-xs btn-danger" onclick="return confirm('Delete this key package?');" title="Delete Package" style="padding: 2px 6px; font-size: 18px;">
+                                                <a href="config.php?display=ovpn_mgr&delete_pkg=<?php echo urlencode($filename); ?>" class="btn btn-xs btn-danger" onclick="return confirm('Delete package and REVOKE extension keys? This action cannot be undone.');" title="Delete Package & Revoke Keys" style="padding: 2px 6px; font-size: 18px;">
                                                     <i class="fa fa-trash"></i>
                                                 </a>
                                             </div>
