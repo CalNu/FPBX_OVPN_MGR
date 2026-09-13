@@ -24,9 +24,32 @@ function getOpenVpnVersion() {
 function startOpenVpnServer($serverConf, $baseDir, $serverKey) {
     $logDir = "{$baseDir}/logs";
     $logFile = "{$logDir}/openvpn.log";
+    $pkiDir = "{$baseDir}/legacy_pki";
+    $crlFile = "{$pkiDir}/crl.pem";
 
     if (!file_exists($logDir)) {
         @mkdir($logDir, 0775, true);
+    }
+
+    // Auto-truncate log if it exceeds 5 MB (keeps last 2000 lines)
+    if (file_exists($logFile) && filesize($logFile) > 5242880) {
+        exec("sudo -n /usr/bin/tail -n 2000 " . escapeshellarg($logFile) . " > " . escapeshellarg("{$logFile}.tmp"));
+        @rename("{$logFile}.tmp", $logFile);
+        exec("sudo -n /bin/chmod 644 " . escapeshellarg($logFile));
+    }
+
+    if (!file_exists($crlFile)) {
+        if (file_exists("{$pkiDir}/ca.crt") && file_exists("{$pkiDir}/private/ca.key")) {
+            if (!file_exists("{$pkiDir}/index.txt")) { @touch("{$pkiDir}/index.txt"); }
+            if (!file_exists("{$pkiDir}/crlnumber")) { @file_put_contents("{$pkiDir}/crlnumber", "01\n"); }
+
+            $tmpCnf = "{$pkiDir}/crl_openssl.cnf";
+            $cnfData = "[ ca ]\ndefault_ca = CA_default\n\n[ CA_default ]\ndir = {$pkiDir}\ndefault_md = sha256\n";
+            @file_put_contents($tmpCnf, $cnfData);
+
+            exec("OPENSSL_CONF={$tmpCnf} openssl ca -gencrl -keyfile {$pkiDir}/private/ca.key -cert {$pkiDir}/ca.crt -out {$crlFile} -config {$tmpCnf} 2>&1");
+            @unlink($tmpCnf);
+        }
     }
 
     $installedVersion = getOpenVpnVersion();
@@ -38,6 +61,9 @@ function startOpenVpnServer($serverConf, $baseDir, $serverKey) {
 
         foreach ($lines as $line) {
             $trimmed = trim($line);
+            if (strpos($trimmed, 'crl-verify') === 0 && !file_exists($crlFile)) {
+                continue;
+            }
 
             if ($isLegacy) {
                 if (
@@ -84,27 +110,24 @@ function startOpenVpnServer($serverConf, $baseDir, $serverKey) {
 
     exec("sudo -n /usr/sbin/setcap cap_net_admin+ep {$openvpnBin} 2>&1");
 
-    $cmd = "OPENSSL_CONF=/etc/ssl/openssl.cnf OPENSSL_CIPHER_LIST=DEFAULT:@SECLEVEL=0 sudo -n {$openvpnBin} --config " . escapeshellarg($serverConf) . " --writepid {$baseDir}/openvpn.pid --log-append {$logFile} --daemon 2>&1";
+    $cmd = "OPENSSL_CONF=/etc/ssl/openssl.cnf OPENSSL_CIPHER_LIST=DEFAULT:@SECLEVEL=0 sudo -n {$openvpnBin} --config " . escapeshellarg($serverConf) . " --writepid {$baseDir}/openvpn.pid --log-append " . escapeshellarg($logFile) . " --daemon";
     
     $output = [];
     exec($cmd, $output, $returnCode);
 
-    if (!empty($output)) {
+    if ($returnCode !== 0 && !empty($output)) {
         @file_put_contents($logFile, "\n[GUI START ATTEMPT Exit Code: {$returnCode}]\n" . implode("\n", $output) . "\n", FILE_APPEND);
     }
 
-    @touch($logFile);
     exec("sudo -n /bin/chmod 644 " . escapeshellarg($logFile) . " 2>&1");
 }
 
 function stopOpenVpnServer($pidFile, $serverConf) {
-    // 1. Force systemd to stop and disable all daemon instances (prevents auto-respawn)
     exec("sudo -n /bin/systemctl stop openvpn openvpn@* openvpn-server@* openvpn-server@legacy-vpn 2>&1");
     exec("sudo -n /usr/bin/systemctl stop openvpn openvpn@* openvpn-server@* openvpn-server@legacy-vpn 2>&1");
     exec("sudo -n /bin/systemctl disable openvpn openvpn@* openvpn-server@* openvpn-server@legacy-vpn 2>&1");
     exec("sudo -n /usr/bin/systemctl disable openvpn openvpn@* openvpn-server@* openvpn-server@legacy-vpn 2>&1");
 
-    // 2. Kill PID recorded in pidfile
     if (file_exists($pidFile)) {
         $pid = intval(trim((string)@file_get_contents($pidFile)));
         if ($pid > 0) {
@@ -115,7 +138,6 @@ function stopOpenVpnServer($pidFile, $serverConf) {
         @unlink($pidFile);
     }
 
-    // 3. Extract active port and kill listening UDP socket
     $port = '1194';
     if (file_exists($serverConf)) {
         $content = (string)@file_get_contents($serverConf);
@@ -126,11 +148,8 @@ function stopOpenVpnServer($pidFile, $serverConf) {
     exec("sudo -n /usr/bin/fuser -k -9 {$port}/udp 2>&1");
     exec("sudo -n /bin/fuser -k -9 {$port}/udp 2>&1");
 
-    // 4. Kill process matches
     exec("sudo -n /usr/bin/pkill -9 -f 'openvpn' 2>&1");
     exec("sudo -n /bin/pkill -9 -f 'openvpn' 2>&1");
-
-    // 5. Delete virtual interface
     exec("sudo -n /sbin/ip link delete tun0 >/dev/null 2>&1");
 
     clearstatcache();
@@ -152,18 +171,14 @@ function getActiveServerSettings($serverConf) {
     return ['ip' => $ip, 'port' => $port];
 }
 
-// 0. Live Log Endpoint & Public IP Endpoint
-if (isset($_GET['action'])) {
-    if ($_GET['action'] === 'fetch_log') {
+// 0. Live Log Endpoint, Line Break Endpoint & Public IP Endpoint
+if (isset($_REQUEST['action'])) {
+    if ($_REQUEST['action'] === 'fetch_log') {
         if (ob_get_level()) { ob_end_clean(); }
         header('Content-Type: text/plain; charset=utf-8');
         if (file_exists($logFile)) {
-            $content = (string)@file_get_contents($logFile);
-            if ($content === '') {
-                exec("sudo -n /bin/chmod 644 " . escapeshellarg($logFile) . " 2>&1");
-                $content = (string)@file_get_contents($logFile);
-            }
-            $lines = explode("\n", $content);
+            $rawContent = shell_exec("sudo -n /usr/bin/tail -n 200 " . escapeshellarg($logFile) . " 2>&1");
+            $lines = explode("\n", $rawContent);
             $cleanLines = [];
             foreach ($lines as $line) {
                 if (strpos($line, 'global-message-banner') === false && strpos($line, 'Unsigned Module') === false) {
@@ -176,7 +191,27 @@ if (isset($_GET['action'])) {
         }
         exit();
     }
-    if ($_GET['action'] === 'fetch_public_ip') {
+    if ($_REQUEST['action'] === 'add_page_break') {
+        if (ob_get_level()) { ob_end_clean(); }
+        if (file_exists($logFile)) {
+            $dividerText = "\n#############################################\n--- SEPARATOR (" . date('Y-m-d H:i:s') . ") ---\n#############################################\n";
+            
+            // Append directly using native PHP (since directory/file permissions are owned by asterisk)
+            $written = @file_put_contents($logFile, $dividerText, FILE_APPEND);
+            exec("sudo -n /bin/chmod 644 " . escapeshellarg($logFile) . " 2>&1");
+            
+            if ($written !== false) {
+                echo "success";
+            } else {
+                echo "error_write";
+            }
+        } else {
+            echo "error_nofile";
+        }
+        exit();
+    }
+
+    if ($_REQUEST['action'] === 'fetch_public_ip') {
         if (ob_get_level()) { ob_end_clean(); }
         header('Content-Type: text/plain; charset=utf-8');
         $publicIp = @file_get_contents('https://api.ipify.org');
@@ -210,7 +245,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'manage_service') {
     exit();
 }
 
-// 2. Full Elevation & System Auto-Hardening via GUI
+// 2. Full Elevation & System Auto-Hardening via GUI (Includes /bin/bash and /usr/bin/printf permissions)
 $elevationError = '';
 if (isset($_POST['action']) && $_POST['action'] === 'elevate_permissions') {
     $rootPass = $_POST['sudo_password'] ?? '';
@@ -220,7 +255,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'elevate_permissions') {
             "password = sys.argv[1] if len(sys.argv) > 1 else ''",
             "pid, fd = pty.fork()",
             "if pid == 0:",
-            '    os.execvp("su", ["su", "-", "root", "-c", "mkdir -p /var/www/html/PhoneSettings/openvpn/logs /var/www/html/PhoneSettings/vpnkeys && chown -R asterisk:asterisk /var/www/html/PhoneSettings/openvpn /var/www/html/PhoneSettings/vpnkeys && setcap cap_net_admin+ep /usr/sbin/openvpn && systemctl unmask openvpn openvpn@* openvpn-server@* 2>/dev/null; echo \\"asterisk ALL=(ALL) NOPASSWD: ALL\\" > /etc/sudoers.d/openvpn_mgr && chmod 0644 /etc/sudoers.d/openvpn_mgr && echo SUCCESS_ELEVATED"])',
+            '    os.execvp("su", ["su", "-", "root", "-c", "mkdir -p /var/www/html/PhoneSettings/openvpn/logs /var/www/html/PhoneSettings/vpnkeys && chown -R asterisk:asterisk /var/www/html/PhoneSettings/openvpn /var/www/html/PhoneSettings/vpnkeys && setcap cap_net_admin+ep /usr/sbin/openvpn && systemctl unmask openvpn openvpn@* openvpn-server@* 2>/dev/null; echo \\"asterisk ALL=(ALL) NOPASSWD: /usr/sbin/openvpn, /bin/kill, /usr/bin/pkill, /bin/chmod, /usr/sbin/setcap, /usr/bin/tail, /bin/bash, /usr/bin/printf\\" > /etc/sudoers.d/openvpn_mgr && chmod 0644 /etc/sudoers.d/openvpn_mgr && echo SUCCESS_ELEVATED"])',
             "else:",
             "    output = ''",
             "    pw_sent = False",
@@ -249,8 +284,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'elevate_permissions') {
         }
 
         $output = shell_exec($cmd);
-
-        @unlink($logFile);
         clearstatcache();
 
         exec("sudo -n /usr/sbin/openvpn --version 2>&1", $postCheckOut, $postCheckCode);
@@ -337,7 +370,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'generate_package') {
         $vpnCnf = "client\nnobind\nremote {$serverIp} {$port}\nproto udp\ndev tun\nca /config/openvpn/keys/ca.crt\ncert /config/openvpn/keys/client.crt\nkey /config/openvpn/keys/client.key\ncipher AES-128-CBC\nauth SHA1\nverb 3\n";
         @file_put_contents("{$buildDir}/vpn.cnf", $vpnCnf);
 
-        // Naming Structure: {$mac}_{$ext}_ovpn.tar
         $tarPath = "{$pkgDir}/{$mac}_{$ext}_ovpn.tar";
         exec("tar -cvf {$tarPath} -C {$buildDir} ca.crt client.crt client.key keys vpn.cnf 2>&1");
         exec("chmod 644 " . escapeshellarg($tarPath) . " 2>&1");
@@ -376,7 +408,6 @@ if (isset($_GET['revoke_ext'])) {
         @unlink($targetCrt);
         @unlink($targetKey);
 
-        // Delete matching tar archives
         foreach (glob("{$pkgDir}/*_{$revokeExt}_ovpn.tar") as $matchingTar) { @unlink($matchingTar); }
         foreach (glob("{$pkgDir}/*_{$revokeExt}_keys.tar") as $matchingTar) { @unlink($matchingTar); }
         foreach (glob("{$pkgDir}/{$revokeExt}-*-keys.tar") as $matchingTar) { @unlink($matchingTar); }
@@ -457,22 +488,16 @@ $activeSettings = getActiveServerSettings($serverConf);
 $currentPort = $activeSettings['port'];
 $currentServerIp = $activeSettings['ip'];
 
-// Safe Log Reader
+// Safe Log Reader (Last 200 lines for initial page load)
 $logContent = '';
 if (file_exists($logFile)) {
-    $logContent = (string)@file_get_contents($logFile);
-    if ($logContent === '') {
-        exec("sudo -n /bin/chmod 644 " . escapeshellarg($logFile) . " 2>&1");
-        $logContent = (string)@file_get_contents($logFile);
-    }
+    $logContent = (string)@shell_exec("sudo -n /usr/bin/tail -n 200 " . escapeshellarg($logFile) . " 2>&1");
 }
 
 $hasTunError = (strpos($logContent, 'Cannot ioctl TUNSETIFF') !== false || strpos($logContent, 'Exiting due to fatal error') !== false);
 
 // Process Check
 $pids = [];
-
-// If explicitly stopped via GUI, do not query fuser or pgrep
 if (!file_exists("{$baseDir}/.stopped")) {
     if (file_exists($pidFile)) {
         $savedPid = intval(trim((string)@file_get_contents($pidFile)));
@@ -506,7 +531,6 @@ if (!file_exists("{$baseDir}/.stopped")) {
 
 $isRunning = !empty($pids) && !$hasTunError;
 
-// Verify Passwordless Execution via sudo -n
 exec("sudo -n /usr/sbin/openvpn --version 2>&1", $sudoCheckOut, $sudoCheckCode);
 $hasSudoRule = ($sudoCheckCode === 0 || strpos(implode(' ', $sudoCheckOut), 'OpenVPN') !== false);
 
@@ -515,7 +539,6 @@ $issuedCertFiles = glob("{$pkiDir}/issued/*.crt");
 
 // Active Client & Cipher Parser
 $connectedClients = [];
-
 if (file_exists($logFile)) {
     $logData = (string)@file_get_contents($logFile);
     exec("ip neighbor show dev tun0 2>/dev/null", $neighOutput);
@@ -821,16 +844,21 @@ if (file_exists($logFile)) {
         <div class="modal-content">
             <div class="modal-header">
                 <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
-                <h4 class="modal-title" id="logModalLabel"><i class="fa fa-terminal"></i> OpenVPN Live Log Output</h4>
+                <h4 class="modal-title" id="logModalLabel"><i class="fa fa-terminal"></i> OpenVPN Live Log Output (Last 200 Lines)</h4>
             </div>
             <div class="modal-body">
                 <textarea id="logModalPre" readonly style="width: 100%; height: 350px; min-height: 200px; resize: both; overflow: auto; background: #f4f4f4; color: #111111; font-family: monospace; font-size: 12px; border: 1px solid #ccc; border-radius: 4px; padding: 10px; user-select: text; -webkit-user-select: text; -moz-user-select: text; -ms-user-select: text;"><?php echo !empty($logContent) ? htmlspecialchars($logContent) : 'No log output available.'; ?></textarea>
             </div>
-            <div class="modal-footer" style="display: flex; justify-content: space-between; align-items: center;">
-                <button type="button" class="btn btn-primary btn-sm" onclick="copyLogContent()">
-                    <i class="fa fa-copy"></i> Copy Log to Clipboard
-                </button>
-                <button type="button" class="btn btn-default" data-dismiss="modal">Close</button>
+            <div class="modal-footer" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 5px;">
+                <div style="display: flex; gap: 5px;">
+                    <button type="button" class="btn btn-primary btn-sm" onclick="copyLogContent()">
+                        <i class="fa fa-copy"></i> Copy Log
+                    </button>
+                    <button type="button" class="btn btn-info btn-sm" onclick="addLogPageBreak()">
+                        <i class="fa fa-minus"></i> Add Line Break
+                    </button>
+                </div>
+                <button type="button" class="btn btn-default btn-sm" data-dismiss="modal">Close</button>
             </div>
         </div>
     </div>
@@ -878,35 +906,66 @@ function fallbackCopy(element) {
     }
 }
 
-var logTimer = null;
-var userIsSelecting = false;
-
-$('#logModalPre').on('mousedown', function() { userIsSelecting = true; });
-$(document).on('mouseup', function() { userIsSelecting = false; });
+let logInterval = null;
+let isInitialOpen = false;
 
 function fetchOpenVPNLog() {
-    if (userIsSelecting) return;
+    $.ajax({
+        url: 'config.php',
+        type: 'GET',
+        data: {
+            display: 'ovpn_mgr',
+            action: 'fetch_log'
+        },
+        success: function(response) {
+            const $textarea = $('#logModalPre');
+            const elem = $textarea[0];
+            
+            const isAtBottom = (elem.scrollHeight - elem.clientHeight - elem.scrollTop) <= 40;
 
-    $.get('config.php?display=ovpn_mgr&action=fetch_log', function(data) {
-        var $textarea = $('#logModalPre');
-        var isAtBottom = ($textarea[0].scrollHeight - $textarea.scrollTop() - $textarea.outerHeight() < 50);
+            $textarea.val(response);
 
-        $textarea.val(data);
-
-        if (isAtBottom) {
-            $textarea.scrollTop($textarea[0].scrollHeight);
+            if (isInitialOpen || isAtBottom) {
+                elem.scrollTop = elem.scrollHeight;
+                isInitialOpen = false;
+            }
         }
     });
 }
 
+function addLogPageBreak() {
+    $.ajax({
+        url: 'config.php',
+        type: 'POST',
+        data: {
+            display: 'ovpn_mgr',
+            action: 'add_page_break'
+        },
+        success: function(response) {
+            if (response.trim() === 'success') {
+                isInitialOpen = true;
+                fetchOpenVPNLog();
+            } else {
+                alert("Failed to add line break. Check file permissions or re-authorize credentials.");
+            }
+        }
+    });
+}
+
+// When the log modal opens, flag initial open, fetch fresh logs, and scroll to bottom once
 $('#logModal').on('shown.bs.modal', function () {
+    isInitialOpen = true;
     fetchOpenVPNLog();
-    logTimer = setInterval(fetchOpenVPNLog, 2000);
+
+    if (logInterval) clearInterval(logInterval);
+    logInterval = setInterval(fetchOpenVPNLog, 2000);
 });
 
+// When the log modal closes, clear the background interval
 $('#logModal').on('hidden.bs.modal', function () {
-    if (logTimer) {
-        clearInterval(logTimer);
+    if (logInterval) {
+        clearInterval(logInterval);
+        logInterval = null;
     }
 });
 </script>
