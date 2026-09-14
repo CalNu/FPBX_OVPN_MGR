@@ -4,7 +4,7 @@
     <version>1.0.5</version>
     <publisher>HG</publisher>
     <license>GPLv3+</license>
-    <category>Connectivity</category>
+    <category>Custom</category>
     <menuitems>
         <ovpn_mgr>OpenVPN Manager</ovpn_mgr>
     </menuitems>

@@ -1,6 +1,74 @@
 <?php
 if (!defined('FREEPBX_IS_AUTH')) { die('No direct script access allowed'); }
 
+// ============================================================================
+// SYSTEM SIGN, DEVTOOLS INSTALL & DEBUG LOGIC
+// ============================================================================
+$signError = '';
+$debugOutput = '';
+
+// Sign Custom Module Action Handler
+if (isset($_POST['action']) && $_POST['action'] === 'resign_custom_module_with_pass') {
+    $rootPass = $_POST['sudo_password'] ?? '';
+    $moduleDir = '/var/www/html/admin/modules/ovpn_mgr';
+    $signerScript = "{$moduleDir}/devtools/signer.php";
+
+    if (!empty($rootPass)) {
+        $pyScript = implode("\n", [
+            "import pty, os, sys, time, select",
+            "password = sys.argv[1] if len(sys.argv) > 1 else ''",
+            "module_path = sys.argv[2] if len(sys.argv) > 2 else ''",
+            "signer_path = sys.argv[3] if len(sys.argv) > 3 else ''",
+            "pid, fd = pty.fork()",
+            "if pid == 0:",
+            '    cmd_chain = (',
+            '        "chown -R asterisk:asterisk " + module_path + "; "',
+            '        "chmod +x " + signer_path + "; "',
+            '        "php " + signer_path + " " + module_path + " 2>&1; "',
+            '        "echo \'SUCCESS_NATIVE_SIGNED\'"',
+            '    )',
+            '    os.execvp("su", ["su", "-", "root", "-c", cmd_chain])',
+            "else:",
+            "    output = ''",
+            "    pw_sent = False",
+            "    start_time = time.time()",
+            "    while time.time() - start_time < 30.0:",
+            "        r, _, _ = select.select([fd], [], [], 0.2)",
+            "        if r:",
+            "            try:",
+            "                data = os.read(fd, 1024).decode('utf-8', errors='ignore')",
+            "                if not data: break",
+            "                output += data",
+            "                if 'password' in output.lower() and not pw_sent:",
+            "                    os.write(fd, (password + '\\n').encode())",
+            "                    pw_sent = True",
+            "                if 'SUCCESS_NATIVE_SIGNED' in output or 'incorrect' in output.lower() or 'failure' in output.lower():",
+            "                    break",
+            "            except Exception:",
+            "                break",
+            "    print(output.strip())"
+        ]);
+
+        $cmd = "python3 -c " . escapeshellarg($pyScript) . " " . escapeshellarg($rootPass) . " " . escapeshellarg($moduleDir) . " " . escapeshellarg($signerScript) . " 2>&1";
+        exec("which python3", $py3Check);
+        if (empty($py3Check)) {
+            $cmd = "python -c " . escapeshellarg($pyScript) . " " . escapeshellarg($rootPass) . " " . escapeshellarg($moduleDir) . " " . escapeshellarg($signerScript) . " 2>&1";
+        }
+
+        $debugOutput = shell_exec($cmd);
+        clearstatcache();
+
+        if (strpos($debugOutput, 'SUCCESS_NATIVE_SIGNED') !== false) {
+            header("Location: config.php?display=ovpn_mgr");
+            exit();
+        } else {
+            $signError = "Signing failed. Check output logs below.";
+        }
+    } else {
+        $signError = "Root password is required.";
+    }
+}
+
 $baseDir = '/var/www/html/PhoneSettings/openvpn';
 $pkgDir = '/var/www/html/PhoneSettings/vpnkeys';
 $pkiDir = "{$baseDir}/legacy_pki";
@@ -10,7 +78,6 @@ $crlFile = "{$pkiDir}/crl.pem";
 $pidFile = "{$baseDir}/openvpn.pid";
 $serverKey = "{$pkiDir}/private/server.key";
 
-// Helper Functions
 if (!function_exists('getOpenVpnVersion')) {
     function getOpenVpnVersion() {
         $openvpnBin = file_exists('/usr/sbin/openvpn') ? '/usr/sbin/openvpn' : '/usr/local/sbin/openvpn';
@@ -56,8 +123,6 @@ if (!function_exists('getActiveServerSettings')) {
                 $netIp = ip2long(trim($mSubnet[1]));
                 $maskStr = trim($mSubnet[2]);
                 $cidr = netmaskToCidr($maskStr);
-                
-                // Server host IP is network IP + 1 by default
                 $hostIp = long2ip($netIp + 1);
             }
         }
@@ -75,7 +140,6 @@ function startOpenVpnServer($serverConf, $baseDir, $serverKey) {
         @mkdir($logDir, 0775, true);
     }
 
-    // Auto-truncate log if it exceeds 5 MB (keeps last 2000 lines)
     if (file_exists($logFile) && filesize($logFile) > 5242880) {
         exec("sudo -n /usr/bin/tail -n 2000 " . escapeshellarg($logFile) . " > " . escapeshellarg("{$logFile}.tmp"));
         @rename("{$logFile}.tmp", $logFile);
@@ -223,21 +287,12 @@ if (isset($_REQUEST['action'])) {
         if (ob_get_level()) { ob_end_clean(); }
         if (file_exists($logFile)) {
             $dividerText = "\n#############################################\n--- SEPARATOR (" . date('Y-m-d H:i:s') . ") ---\n#############################################\n";
-            
             $written = @file_put_contents($logFile, $dividerText, FILE_APPEND);
             exec("sudo -n /bin/chmod 644 " . escapeshellarg($logFile) . " 2>&1");
-            
-            if ($written !== false) {
-                echo "success";
-            } else {
-                echo "error_write";
-            }
-        } else {
-            echo "error_nofile";
-        }
+            if ($written !== false) { echo "success"; } else { echo "error_write"; }
+        } else { echo "error_nofile"; }
         exit();
     }
-
     if ($_REQUEST['action'] === 'fetch_public_ip') {
         if (ob_get_level()) { ob_end_clean(); }
         header('Content-Type: text/plain; charset=utf-8');
@@ -272,62 +327,16 @@ if (isset($_POST['action']) && $_POST['action'] === 'manage_service') {
     exit();
 }
 
-// 2. Full Elevation & System Auto-Hardening via GUI
-$elevationError = '';
-if (isset($_POST['action']) && $_POST['action'] === 'elevate_permissions') {
-    $rootPass = $_POST['sudo_password'] ?? '';
-    if (!empty($rootPass)) {
-        $pyScript = implode("\n", [
-            "import pty, os, sys, time, select",
-            "password = sys.argv[1] if len(sys.argv) > 1 else ''",
-            "pid, fd = pty.fork()",
-            "if pid == 0:",
-            '    os.execvp("su", ["su", "-", "root", "-c", "mkdir -p /var/www/html/PhoneSettings/openvpn/logs /var/www/html/PhoneSettings/vpnkeys && chown -R asterisk:asterisk /var/www/html/PhoneSettings/openvpn /var/www/html/PhoneSettings/vpnkeys && setcap cap_net_admin+ep /usr/sbin/openvpn && systemctl unmask openvpn openvpn@* openvpn-server@* 2>/dev/null; echo \\"asterisk ALL=(ALL) NOPASSWD: /usr/sbin/openvpn, /bin/kill, /usr/bin/pkill, /bin/chmod, /usr/sbin/setcap, /usr/bin/tail, /bin/bash, /usr/bin/printf\\" > /etc/sudoers.d/openvpn_mgr && chmod 0644 /etc/sudoers.d/openvpn_mgr && echo SUCCESS_ELEVATED"])',
-            "else:",
-            "    output = ''",
-            "    pw_sent = False",
-            "    start_time = time.time()",
-            "    while time.time() - start_time < 5.0:",
-            "        r, _, _ = select.select([fd], [], [], 0.2)",
-            "        if r:",
-            "            try:",
-            "                data = os.read(fd, 1024).decode('utf-8', errors='ignore')",
-            "                if not data: break",
-            "                output += data",
-            "                if 'password' in output.lower() and not pw_sent:",
-            "                    os.write(fd, (password + '\\n').encode())",
-            "                    pw_sent = True",
-            "                if 'SUCCESS_ELEVATED' in output or 'incorrect' in output.lower() or 'failure' in output.lower():",
-            "                    break",
-            "            except Exception:",
-            "                break",
-            "    print(output.strip())"
-        ]);
-
-        $cmd = "python3 -c " . escapeshellarg($pyScript) . " " . escapeshellarg($rootPass) . " 2>&1";
-        exec("which python3", $py3Check);
-        if (empty($py3Check)) {
-            $cmd = "python -c " . escapeshellarg($pyScript) . " " . escapeshellarg($rootPass) . " 2>&1";
-        }
-
-        $output = shell_exec($cmd);
-        clearstatcache();
-
-        exec("sudo -n /usr/sbin/openvpn --version 2>&1", $postCheckOut, $postCheckCode);
-        if (strpos($output, 'SUCCESS_ELEVATED') !== false || $postCheckCode === 0) {
-            if (!file_exists("{$baseDir}/.stopped")) {
-                stopOpenVpnServer($pidFile, $serverConf);
-                sleep(1);
-                startOpenVpnServer($serverConf, $baseDir, $serverKey);
-            }
-
-            header("Location: config.php?display=ovpn_mgr");
-            exit();
-        } else {
-            $elevationError = "Authentication failed. Incorrect root password.";
-        }
-    } else {
-        $elevationError = "Password cannot be empty.";
+// Check for Sign Module Button Visibility
+$show_ovpn_resign_button = false;
+if (class_exists('FreePBX')) {
+    $notifications = \FreePBX::Notifications();
+    if (
+        $notifications->exists('core', 'SIGNATURE_NOT_VALID') || 
+        $notifications->exists('framework', 'TAMPERED_FILES') ||
+        (function_exists('posix_getpwuid') && !file_exists('/var/www/html/admin/modules/ovpn_mgr/module.sig'))
+    ) {
+        $show_ovpn_resign_button = true;
     }
 }
 
@@ -340,17 +349,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
 
     if ($newPort > 0 && $newPort < 65535 && !empty($newIp) && filter_var($hostIpStr, FILTER_VALIDATE_IP) && $cidr >= 8 && $cidr <= 30) {
         $netmask = cidrToNetmask($cidr);
-        
         $hostIpLong = ip2long($hostIpStr);
         $maskLong = ip2long($netmask);
-        
         $networkIpLong = $hostIpLong & $maskLong;
         $broadcastIpLong = $networkIpLong | (~$maskLong & 0xFFFFFFFF);
 
-        // Ensure host IP is neither the Network ID nor Broadcast IP
         if ($hostIpLong !== $networkIpLong && $hostIpLong !== $broadcastIpLong) {
             $networkIp = long2ip($networkIpLong);
-
             $confContent = (string)@file_get_contents($serverConf);
             $confContent = preg_replace('/^port \d+/m', "port {$newPort}", $confContent);
             
@@ -536,7 +541,6 @@ $activeSettings = getActiveServerSettings($serverConf);
 $currentPort = $activeSettings['port'];
 $currentServerIp = $activeSettings['ip'];
 
-// Safe Log Reader (Last 200 lines for initial page load)
 $logContent = '';
 if (file_exists($logFile)) {
     $logContent = (string)@shell_exec("sudo -n /usr/bin/tail -n 200 " . escapeshellarg($logFile) . " 2>&1");
@@ -544,7 +548,6 @@ if (file_exists($logFile)) {
 
 $hasTunError = (strpos($logContent, 'Cannot ioctl TUNSETIFF') !== false || strpos($logContent, 'Exiting due to fatal error') !== false);
 
-// Process Check
 $pids = [];
 if (!file_exists("{$baseDir}/.stopped")) {
     if (file_exists($pidFile)) {
@@ -585,7 +588,6 @@ $hasSudoRule = ($sudoCheckCode === 0 || strpos(implode(' ', $sudoCheckOut), 'Ope
 $createdPackages = glob("{$pkgDir}/*.tar");
 $issuedCertFiles = glob("{$pkiDir}/issued/*.crt");
 
-// Active Client & Cipher Parser
 $connectedClients = [];
 if (file_exists($logFile)) {
     $logData = (string)@file_get_contents($logFile);
@@ -619,8 +621,22 @@ if (file_exists($logFile)) {
 
 <div class="container-fluid">
     <h1>OpenVPN Manager</h1>
-    <p>Manage OpenVPN server configuration and provisioning packages.</p>
     <hr>
+
+    <?php if (!empty($debugOutput)): ?>
+        <div class="panel panel-info">
+            <div class="panel-heading"><h3 class="panel-title"><i class="fa fa-terminal"></i> Execution Debug Output</h3></div>
+            <div class="panel-body">
+                <textarea readonly style="width: 100%; height: 250px; font-family: monospace; font-size: 11px; background: #222; color: #00ff00; padding: 10px; border-radius: 4px;"><?php echo htmlspecialchars($debugOutput); ?></textarea>
+            </div>
+        </div>
+    <?php endif; ?>
+
+    <?php if (!empty($signError)): ?>
+        <div class="alert alert-danger">
+            <i class="fa fa-exclamation-triangle"></i> <?php echo htmlspecialchars($signError); ?>
+        </div>
+    <?php endif; ?>
 
     <!-- Status Banner -->
     <div class="alert alert-<?php echo $isRunning ? 'success' : 'danger'; ?>" style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
@@ -632,7 +648,7 @@ if (file_exists($logFile)) {
             <form method="post" action="config.php?display=ovpn_mgr" style="display: inline-block; margin: 0;">
                 <input type="hidden" name="action" value="manage_service">
                 <?php if ($isRunning): ?>
-                    <button type="submit" name="service_cmd" value="stop" class="btn btn-danger btn-sm" onclick="return confirm('Stop OpenVPN service? Remote clients will disconnect.');">
+                    <button type="submit" name="service_cmd" value="stop" class="btn btn-danger btn-sm" style="background-color: #db001a; border-color: #6b000d;" onclick="return confirm('Stop OpenVPN service? Remote clients will disconnect.');">
                         <i class="fa fa-stop"></i> Stop
                     </button>
                     <button type="submit" name="service_cmd" value="restart" class="btn btn-warning btn-sm">
@@ -647,30 +663,14 @@ if (file_exists($logFile)) {
             <button type="button" class="btn btn-info btn-sm" data-toggle="modal" data-target="#logModal">
                 <i class="fa fa-file-text-o"></i> View Live Logs
             </button>
+
+            <?php if ($show_ovpn_resign_button): ?>
+                <button type="button" class="btn btn-danger btn-sm" style="margin: 0; font-weight: bold; background-color: #db001a; border-color: #6b000d; box-shadow: 0 0 6px rgba(220,53,69,0.4);" data-toggle="modal" data-target="#signModal">
+                    <i class="fa fa-key"></i> Sign Module
+                </button>
+            <?php endif; ?>
         </div>
     </div>
-
-    <!-- Self-Service Permission Panel -->
-    <?php if (!$hasSudoRule): ?>
-        <div class="panel panel-warning">
-            <div class="panel-heading"><h3 class="panel-title"><i class="fa fa-lock"></i> Authorize GUI Service Control</h3></div>
-            <div class="panel-body">
-                <?php if (!empty($elevationError)): ?>
-                    <div class="alert alert-danger" style="padding: 8px; margin-bottom: 10px; font-size: 12px;">
-                        <i class="fa fa-exclamation-triangle"></i> <?php echo htmlspecialchars($elevationError); ?>
-                    </div>
-                <?php endif; ?>
-                <p>Enter your <strong>root password</strong> once below to authorize automatic file permission hardening, process control, and systemd unmasking from the GUI:</p>
-                <form method="post" action="config.php?display=ovpn_mgr" class="form-inline">
-                    <input type="hidden" name="action" value="elevate_permissions">
-                    <div class="form-group">
-                        <input type="password" class="form-control" name="sudo_password" placeholder="Root Password" required>
-                    </div>
-                    <button type="submit" class="btn btn-warning">Grant Authorizations</button>
-                </form>
-            </div>
-        </div>
-    <?php endif; ?>
 
     <!-- Top Layout Grid: Server Settings & Connected Clients -->
     <div class="row">
@@ -718,12 +718,12 @@ if (file_exists($logFile)) {
                                 </div>
                             </div>
                             <div class="form-group" style="margin-bottom: 0; align-self: center;">
-				    <label style="font-size: 11px; display: block; margin-bottom: 2px;">
-				        Client IP Range <span id="ip_count_display" style="font-weight: normal; color: #666; margin-left: 4px;"></span>
-				    </label>
-				    <span id="ip_range_display" class="label label-info" style="font-size: 12px; padding: 6px 10px; display: inline-block;">Calculating...</span>
-				    <div id="ip_warning_display" style="font-size: 11px; color: #a94442; margin-top: 3px; display: none;"></div>
-			    </div>
+                                <label style="font-size: 11px; display: block; margin-bottom: 2px;">
+                                    Client IP Range <span id="ip_count_display" style="font-weight: normal; color: #666; margin-left: 4px;"></span>
+                                </label>
+                                <span id="ip_range_display" class="label label-info" style="font-size: 12px; padding: 6px 10px; display: inline-block;">Calculating...</span>
+                                <div id="ip_warning_display" style="font-size: 11px; color: #a94442; margin-top: 3px; display: none;"></div>
+                            </div>
                         </div>
 
                         <button type="submit" class="btn btn-primary btn-block" style="max-width: 420px;">
@@ -734,12 +734,10 @@ if (file_exists($logFile)) {
             </div>
         </div>
 
-        <!-- Right Column: Connected Clients Status Panel -->
+        <!-- Right Column: Connected Clients Panel -->
         <div class="col-md-6">
             <div class="panel panel-default">
-                <div class="panel-heading">
-                    <h3 class="panel-title"><i class="fa fa-users"></i> Connected OpenVPN Clients</h3>
-                </div>
+                <div class="panel-heading"><h3 class="panel-title"><i class="fa fa-users"></i> Connected OpenVPN Clients</h3></div>
                 <div class="panel-body" style="padding: 0; max-height: 160px; overflow-y: auto;">
                     <table class="table table-striped table-bordered" style="margin-bottom: 0; font-size: 12px;">
                         <thead>
@@ -770,16 +768,15 @@ if (file_exists($logFile)) {
         </div>
     </div>
 
-    <!-- Bottom Layout Grid: Package Builder & Archives -->
+    <!-- Bottom Grid: Package Builder & Archives -->
     <div class="row">
-        <!-- Left Column: Package Builder -->
+        <!-- Package Builder -->
         <div class="col-md-6">
             <div class="panel panel-default">
                 <div class="panel-heading"><h3 class="panel-title"><i class="fa fa-cube"></i> Build Provisioning Package (vpn.tar)</h3></div>
                 <div class="panel-body">
                     <form method="post" action="config.php?display=ovpn_mgr">
                         <input type="hidden" name="action" value="generate_package">
-                        
                         <div style="display: flex; align-items: flex-end; gap: 30px; margin-bottom: 10px; flex-wrap: wrap;">
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 11px; display: block; margin-bottom: 5px;">Extension</label>
@@ -790,11 +787,9 @@ if (file_exists($logFile)) {
                                 <input type="text" name="mac" class="form-control" placeholder="00155D010203" required style="width: 190px; height: 34px;">
                             </div>
                         </div>
-
                         <div class="well well-sm" style="font-size: 11px; margin-bottom: 10px; padding: 5px; color: #555; max-width: 350px;">
                             Package will use active target: <strong><?php echo htmlspecialchars($currentServerIp); ?>:<?php echo htmlspecialchars($currentPort); ?></strong>
                         </div>
-
                         <button type="submit" class="btn btn-success btn-block" style="max-width: 350px;">
                             <i class="fa fa-plus"></i> Generate Keys & Build Package
                         </button>
@@ -803,7 +798,7 @@ if (file_exists($logFile)) {
             </div>
         </div>
 
-        <!-- Right Column: Provisioning Archives Table -->
+        <!-- Provisioning Archives -->
         <div class="col-md-6">
             <div class="panel panel-default">
                 <div class="panel-heading" style="display: flex; align-items: center; justify-content: space-between;">
@@ -857,6 +852,41 @@ if (file_exists($logFile)) {
     </div>
 </div>
 
+<!-- Modal: Sign Module Prompt -->
+<div class="modal fade" id="signModal" tabindex="-1" role="dialog" aria-labelledby="signModalLabel">
+    <div class="modal-dialog" role="document">
+        <div class="modal-content">
+            <form method="post" action="config.php?display=ovpn_mgr" id="signModalForm">
+                <input type="hidden" name="action" value="resign_custom_module_with_pass">
+                <div class="modal-header">
+                    <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+                    <h4 class="modal-title" id="signModalLabel"><i class="fa fa-key"></i> Sign Module</h4>
+                </div>
+                <div class="modal-body">
+                    <p>Enter your <strong>root password</strong> below. The system will run the local module signer and clear signature alerts for <code>ovpn_mgr</code>.</p>
+                    <div class="form-group">
+                        <label>Root Password <span class="text-danger">*</span></label>
+                        <input type="password" name="sudo_password" class="form-control" placeholder="Root Password" required>
+                    </div>
+
+                    <!-- Progress Loading Container (Hidden by default) -->
+                    <div id="signProgressContainer" style="display: none; margin-top: 15px;">
+                        <label><i class="fa fa-spinner fa-spin"></i> Signing module and reloading framework... Please wait.</label>
+                        <div class="progress progress-striped active" style="margin-bottom: 0;">
+                            <div class="progress-bar progress-bar-danger" role="progressbar" style="width: 100%;"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-default" data-dismiss="modal" id="signCancelBtn">Cancel</button>
+                    <button type="submit" class="btn btn-danger" style="margin: 0; font-weight: bold; background-color: #db001a; border-color: #6b000d; box-shadow: 0 0 6px rgba(220,53,69,0.4);"id="signSubmitBtn"><i class="fa fa-key"></i> Sign Module</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+
 <!-- Modal 1: Revocation Window -->
 <div class="modal fade" id="revokeModal" tabindex="-1" role="dialog" aria-labelledby="revokeModalLabel">
     <div class="modal-dialog modal-lg" role="document">
@@ -885,8 +915,6 @@ if (file_exists($logFile)) {
                                 $parsedCert = openssl_x509_parse((string)@file_get_contents($crtPath));
                                 $serial = $parsedCert['serialNumberHex'] ?? $parsedCert['serialNumber'] ?? 'N/A';
                                 $validFrom = date("Y-m-d H:i", $parsedCert['validFrom_time_t'] ?? filemtime($crtPath));
-
-                                // Extract target host/port from generated package archive or active server defaults
                                 $targetHostPort = "{$currentServerIp}:{$currentPort}";
                                 $matchingTars = glob("{$pkgDir}/*_{$extName}_ovpn.tar");
 
@@ -947,6 +975,15 @@ if (file_exists($logFile)) {
 </div>
 
 <script>
+$('#signModalForm').on('submit', function() {
+    // Show animated progress bar
+    $('#signProgressContainer').show();
+    
+    // Disable submit and cancel buttons to prevent duplicate requests
+    $('#signSubmitBtn').prop('disabled', true).html('<i class="fa fa-spinner fa-spin"></i> Signing...');
+    $('#signCancelBtn').prop('disabled', true);
+});
+
 function setPrivateIp() {
     $('#server_ip').val('<?php echo $_SERVER['SERVER_ADDR']; ?>');
 }
@@ -995,18 +1032,12 @@ function fetchOpenVPNLog() {
     $.ajax({
         url: 'config.php',
         type: 'GET',
-        data: {
-            display: 'ovpn_mgr',
-            action: 'fetch_log'
-        },
+        data: { display: 'ovpn_mgr', action: 'fetch_log' },
         success: function(response) {
             const $textarea = $('#logModalPre');
             const elem = $textarea[0];
-            
             const isAtBottom = (elem.scrollHeight - elem.clientHeight - elem.scrollTop) <= 40;
-
             $textarea.val(response);
-
             if (isInitialOpen || isAtBottom) {
                 elem.scrollTop = elem.scrollHeight;
                 isInitialOpen = false;
@@ -1019,10 +1050,7 @@ function addLogPageBreak() {
     $.ajax({
         url: 'config.php',
         type: 'POST',
-        data: {
-            display: 'ovpn_mgr',
-            action: 'add_page_break'
-        },
+        data: { display: 'ovpn_mgr', action: 'add_page_break' },
         success: function(response) {
             if (response.trim() === 'success') {
                 isInitialOpen = true;
@@ -1034,16 +1062,13 @@ function addLogPageBreak() {
     });
 }
 
-// When the log modal opens, flag initial open, fetch fresh logs, and scroll to bottom once
 $('#logModal').on('shown.bs.modal', function () {
     isInitialOpen = true;
     fetchOpenVPNLog();
-
     if (logInterval) clearInterval(logInterval);
     logInterval = setInterval(fetchOpenVPNLog, 2000);
 });
 
-// When the log modal closes, clear the background interval
 $('#logModal').on('hidden.bs.modal', function () {
     if (logInterval) {
         clearInterval(logInterval);
@@ -1083,7 +1108,6 @@ function calculateIpRange() {
         const firstUsable = intToIp(netInt + 1);
         const lastUsable = intToIp(broadcastInt - 1);
 
-        // Check Network ID boundary -> suggest last usable IP in lower block or first usable in current block
         if (hostIpInt === netInt) {
             const lowerUsable = intToIp(netInt - 2);
             display.text(`Invalid Host. Use ${lowerUsable} or ${firstUsable}`)
@@ -1092,7 +1116,6 @@ function calculateIpRange() {
             return;
         }
 
-        // Check Broadcast IP boundary -> suggest last usable in current block or first usable in upper block
         if (hostIpInt === broadcastInt) {
             const upperUsable = intToIp(broadcastInt + 2);
             display.text(`Invalid Host. Use ${lastUsable} or ${upperUsable}`)
@@ -1102,7 +1125,6 @@ function calculateIpRange() {
         }
 
         const totalUsableIps = (broadcastInt - netInt - 1);
-
         countDisplay.text(`(${totalUsableIps} total IPs)`);
 
         if (hostIpStr !== firstUsable) {

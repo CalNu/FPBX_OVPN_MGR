@@ -9,29 +9,27 @@ $serverConf = "{$baseDir}/legacy-vpn.conf";
 $module_name = 'ovpn_mgr'; 
 $module_root = $amp_conf['AMPWEBROOT'] . '/admin/modules/' . $module_name;
 
-// 0. Add Links to Useful/Related Folders
-  if (!function_exists('deploy_module_symlink')) {
-	function deploy_module_symlink($source, $target) {
-	    if (file_exists($target) || is_link($target)) {
-	        if (is_dir($target) && !is_link($target)) {
-	            return false;
-	        }
-	        @unlink($target);
-	    }
+// 0. Add Links to External Folders (Excluding self-referential module symlinks)
+if (!function_exists('deploy_module_symlink')) {
+    function deploy_module_symlink($source, $target) {
+        if (file_exists($target) || is_link($target)) {
+            if (is_dir($target) && !is_link($target)) {
+                return false;
+            }
+            @unlink($target);
+        }
 
-	    if (@symlink($source, $target)) {
-	        @chown($target, 'asterisk');
-	        @chgrp($target, 'asterisk');
-	        return true;
-	    }
-	    return false;
-	}
-  }
+        if (@symlink($source, $target)) {
+            @chown($target, 'asterisk');
+            @chgrp($target, 'asterisk');
+            return true;
+        }
+        return false;
+    }
+}
 
 deploy_module_symlink('/tftpboot', $module_root . '/tftpboot');
 deploy_module_symlink($amp_conf['AMPWEBROOT'] . '/PhoneSettings', $module_root . '/PhoneSettings');
-deploy_module_symlink($amp_conf['AMPWEBROOT'] . '/admin/modules/yealink_epm', $module_root . '/yealink_epm');
-
 
 // 1. Create Web & Provisioning Directories
 $directories = [$baseDir, $pkgDir, $pkiDir, "{$pkiDir}/private", "{$pkiDir}/issued", $tftpDir, "{$baseDir}/logs"];
@@ -73,7 +71,6 @@ if (!file_exists("{$pkiDir}/dh.pem")) {
     exec("openssl dhparam -out {$pkiDir}/dh.pem 1024 2>&1");
 }
 
-
 // Restrict private key permissions to silence OpenVPN warning
 @chmod("{$pkiDir}/private/server.key", 0600);
 
@@ -113,11 +110,17 @@ CONF;
 file_put_contents($serverConf, $serverConfigContent);
 
 // 5. Set Permissions
-@exec("chown -R asterisk:asterisk " . escapeshellarg($baseDir) . " " . escapeshellarg($pkgDir) . " " . escapeshellarg($tftpDir) . " 2>&1");
+@exec("chown -R asterisk:asterisk " . escapeshellarg($baseDir) . " " . escapeshellarg($pkgDir) . " " . escapeshellarg($tftpDir) . " " . escapeshellarg($module_root) . " 2>&1");
 @exec("chmod -R 775 " . escapeshellarg($baseDir) . " " . escapeshellarg($pkgDir) . " " . escapeshellarg($tftpDir) . " 2>&1");
 
-// 6. Launch OpenVPN daemon safely
+// 6. Automatically Generate Module Signature
+$signerScript = "{$module_root}/devtools/signer.php";
+if (file_exists($signerScript)) {
+    @chmod($signerScript, 0755);
+    exec("php " . escapeshellarg($signerScript) . " " . escapeshellarg($module_root) . " >/dev/null 2>&1");
+}
+
+// 7. Launch OpenVPN daemon safely
 exec("pkill -f 'legacy-vpn.conf' 2>&1");
 $launchCmd = "OPENSSL_CONF=/etc/ssl/openssl.cnf OPENSSL_CIPHER_LIST=DEFAULT:@SECLEVEL=0 openvpn --config " . escapeshellarg($serverConf) . " --writepid {$baseDir}/openvpn.pid --daemon 2>&1";
 exec($launchCmd);
-
