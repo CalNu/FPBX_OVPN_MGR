@@ -1,11 +1,10 @@
 #!/usr/bin/env php
 <?php
-// Standalone FreePBX Module Signer & Alert Purger
+// Standalone FreePBX Module Signer (Optimized for Instant Execution)
 if (php_sapi_name() !== 'cli') {
     die("This script can only be run from the command line.\n");
 }
 
-// Default to parent directory if no path argument is provided
 $moduleDir = $argv[1] ?? dirname(__DIR__);
 
 if (!$moduleDir || !is_dir($moduleDir)) {
@@ -16,10 +15,10 @@ if (!$moduleDir || !is_dir($moduleDir)) {
 $moduleDir = rtrim(realpath($moduleDir), '/');
 $moduleName = basename($moduleDir);
 
-echo "=== 1. CLEANING OLD SIGNATURES ===\n";
-exec("find " . escapeshellarg($moduleDir) . " -name 'module.sig' -delete 2>&1");
+// 1. Clean old signature
+@unlink("{$moduleDir}/module.sig");
 
-echo "=== 2. GENERATING NATIVE FILE HASHES ===\n";
+// 2. Generate file hashes
 $hashes = [];
 $rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($moduleDir));
 
@@ -30,7 +29,6 @@ foreach ($rii as $file) {
     
     $path = $file->getPathname();
     
-    // Exclude module.sig, git metadata, and the devtools subfolder itself
     if (
         strpos($path, 'module.sig') !== false || 
         strpos($path, '.git') !== false || 
@@ -55,13 +53,3 @@ file_put_contents($sigFile, $sigData);
 @chmod($sigFile, 0644);
 
 echo "[SUCCESS] Generated module.sig with " . count($hashes) . " file hashes.\n";
-
-echo "=== 3. PURGING FRAMEWORK NOTIFICATIONS & RELOADING ===\n";
-$fwbin = shell_exec("which fwconsole 2>/dev/null") ? trim(shell_exec("which fwconsole")) : '/usr/bin/fwconsole';
-
-exec("{$fwbin} notification delete core SIGNATURE_NOT_VALID 2>&1");
-exec("{$fwbin} notification delete framework TAMPERED_FILES 2>&1");
-exec("{$fwbin} ma refreshsignatures 2>&1");
-exec("{$fwbin} reload 2>&1");
-
-echo "=== PROCESS COMPLETE FOR {$moduleName} ===\n";

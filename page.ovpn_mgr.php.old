@@ -1012,49 +1012,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_packages') {
     exit();
 }
 
-// Same idea as "Rebuild All" above, but scoped to just the checked rows -
-// revokes each selected package's cert and immediately issues a fresh one
-// against the server's current address/port, instead of only deleting.
-if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_rebuild_packages') {
-    csrf_require();
-    $selected = (array)($_POST['pkgs'] ?? []);
-    $settings = getActiveServerSettings($serverConf);
-    $rebuilt = 0;
-
-    foreach ($selected as $name) {
-        $valid = ovpnValidateSelectedPkg($pkgDir, $name);
-        if ($valid === null) { continue; }
-
-        $mac = '';
-        $ext = '';
-        if (preg_match('/^([a-f0-9]+)_(\d+)_[a-f0-9]{8}_ovpn\.tar$/i', $valid, $m)) {
-            $mac = strtolower($m[1]);
-            $ext = $m[2];
-        } elseif (preg_match('/^([a-f0-9]+)_(\d+)_ovpn\.tar$/i', $valid, $m)) {
-            $mac = strtolower($m[1]);
-            $ext = $m[2];
-        }
-        if ($ext === '' || $mac === '') {
-            continue; // can't determine mac/ext from this filename - leave it alone
-        }
-
-        revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $ext);
-        @unlink("{$pkgDir}/{$valid}");
-        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'])) {
-            $rebuilt++;
-        }
-    }
-
-    if ($rebuilt > 0 && !file_exists("{$baseDir}/.stopped")) {
-        stopOpenVpnServer($ovpnctl);
-        sleep(1);
-        startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
-    }
-
-    header("Location: config.php?display=ovpn_mgr");
-    exit();
-}
-
 clearstatcache();
 
 $activeSettings = getActiveServerSettings($serverConf);
@@ -1255,7 +1212,7 @@ if (file_exists($logFile)) {
 
                         <div style="display: flex; align-items: flex-end; gap: 5px; margin-bottom: 15px; flex-wrap: wrap;">
                             <div class="form-group" style="margin-bottom: 0;">
-                                <label for="server_ip" style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 5px;">Server Public IP / Host</label>
+                                <label for="server_ip" style="font-size: 11px; display: block; margin-bottom: 5px;">Server Public IP / Host</label>
                                 <input type="text" class="form-control" id="server_ip" name="server_ip" value="<?php echo htmlspecialchars($currentServerIp); ?>" required style="width: 135px; height: 34px;">
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
@@ -1271,31 +1228,31 @@ if (file_exists($logFile)) {
                                 </button>
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
-                                <label for="ovpn_port" style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 3px;">Port</label>
+                                <label for="ovpn_port" style="font-size: 11px; display: block; margin-bottom: 5px;">Port</label>
                                 <input type="number" class="form-control" id="ovpn_port" name="ovpn_port" value="<?php echo htmlspecialchars($currentPort); ?>" required style="width: 75px; height: 34px; padding: 6px 4px;">
                             </div>
                         </div>
 
                         <div style="display: flex; align-items: flex-end; gap: 10px; margin-bottom: 6px; flex-wrap: wrap;">
                             <div class="form-group" style="margin-bottom: 0;">
-                                <label for="ovpn_host_ip" style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 3px;">VPN Host IP</label>
+                                <label for="ovpn_host_ip" style="font-size: 11px; display: block; margin-bottom: 5px;">VPN Host IP</label>
                                 <input type="text" class="form-control" id="ovpn_host_ip" name="ovpn_host_ip" value="<?php echo htmlspecialchars($currentHostIp); ?>" required style="width: 130px; height: 34px;" oninput="recalculateRange()">
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
-                                <label for="ovpn_cidr" style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 11px;">CIDR</label>
+                                <label for="ovpn_cidr" style="font-size: 11px; display: block; margin-bottom: 5px;">CIDR</label>
                                 <div style="display: flex; align-items: center;">
                                     <span style="padding: 6px 4px 6px 0; font-size: 14px; color: #666;">/</span>
-                                    <input type="number" class="form-control" id="ovpn_cidr" name="ovpn_cidr" value="<?php echo htmlspecialchars($currentCidr); ?>" min="16" max="29" required style="width: 65px; height: 34px; padding: 6px 4px; padding-left: 5px;" oninput="recalculateRange()">
+                                    <input type="number" class="form-control" id="ovpn_cidr" name="ovpn_cidr" value="<?php echo htmlspecialchars($currentCidr); ?>" min="16" max="29" required style="width: 65px; height: 34px; padding: 6px 4px;" oninput="recalculateRange()">
                                 </div>
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
-                                <label style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 4px;">Calculated IP Range</label>
+                                <label style="font-size: 11px; display: block; margin-bottom: 5px;">Calculated IP Range</label>
                                 <div class="well well-sm" id="ip_range_box" style="margin-bottom: 0; padding: 6px 10px; height: 34px; font-size: 11px; font-family: monospace; font-weight: bold; background: #f8f9fa; border-color: #ccc; white-space: nowrap;">
                                     <span id="range_start"><?php echo htmlspecialchars($subnetDetails['range_start']); ?></span> - <span id="range_end"><?php echo htmlspecialchars($subnetDetails['range_end']); ?></span>
                                 </div>
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
-                                <label style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 3px;">Client IPs</label>
+                                <label style="font-size: 11px; display: block; margin-bottom: 5px;">Client IPs</label>
                                 <div class="well well-sm" id="client_ip_count_box" style="margin-bottom: 0; padding: 6px 10px; height: 34px; font-size: 11px; font-family: monospace; font-weight: bold; background: #f8f9fa; border-color: #ccc; white-space: nowrap; text-align: center;" title="Usable client addresses in this block, after the network/broadcast addresses and the one address OpenVPN reserves for itself">
                                     <span id="client_ip_count"><?php echo (int)$currentClientIpCount; ?></span>
                                 </div>
@@ -1310,39 +1267,12 @@ if (file_exists($logFile)) {
                     </form>
                 </div>
             </div>
-
-            <div class="panel panel-default">
-                <div class="panel-heading" style="display: flex; align-items: center; padding: 10px 15px;"><h3 class="panel-title" style="margin: 0;"><i class="fa fa-cube"></i> Build Provisioning Package (vpn.tar)</h3></div>
-                <div class="panel-body">
-                    <form method="post" action="config.php?display=ovpn_mgr">
-                        <input type="hidden" name="action" value="generate_package">
-                        <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
-                        <div style="display: flex; align-items: flex-end; gap: 30px; margin-bottom: 10px; flex-wrap: wrap;">
-                            <div class="form-group" style="margin-bottom: 0;">
-                                <label style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 5px;">Extension</label>
-                                <input type="text" name="ext" class="form-control" placeholder="101" required style="width: 130px; height: 34px;">
-                            </div>
-                            <div class="form-group" style="margin-bottom: 0;">
-                                <label style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 5px;">Phone MAC Address</label>
-                                <input type="text" name="mac" class="form-control" placeholder="00155D010203" required style="width: 190px; height: 34px;">
-                            </div>
-                        </div>
-                        <div class="well well-sm" style="font-size: 11px; margin-bottom: 10px; padding: 5px; color: #555; max-width: 350px;">
-                            Package will target OpenVPN <strong><?php echo htmlspecialchars($currentServerIp); ?>:<?php echo htmlspecialchars($currentPort); ?></strong> and SIP Gateway <strong><?php echo htmlspecialchars($currentHostIp); ?>:5060</strong>
-                        </div>
-                        <button type="submit" class="btn btn-success btn-block" style="max-width: 350px;">
-                            <i class="fa fa-plus"></i> Generate Keys & Build Package
-                        </button>
-                    </form>
-                </div>
-            </div>
         </div>
 
         <div class="col-md-6">
             <div class="panel panel-default">
                 <div class="panel-heading"><h3 class="panel-title"><i class="fa fa-users"></i> Connected OpenVPN Clients</h3></div>
-                <!-- Grows to fit content up to ~20 rows (thead ~41px + 20 * ~42px), then scrolls. -->
-                <div class="panel-body" style="padding: 0; max-height: 300px; overflow-y: auto;">
+                <div class="panel-body" style="padding: 0; max-height: 220px; overflow-y: auto;">
                     <table class="table table-striped table-bordered" style="margin-bottom: 0; font-size: 12px;">
                         <thead>
                             <tr><th>Extension / MAC</th><th>Virtual IP (TUN)</th><th>Real IP / Peer</th><th>Active Cipher</th></tr>
@@ -1362,7 +1292,40 @@ if (file_exists($logFile)) {
                     </table>
                 </div>
             </div>
+        </div>
+    </div>
 
+    <!-- Bottom Layout Grid: Package Builder & Archives -->
+    <div class="row">
+        <div class="col-md-6">
+            <div class="panel panel-default">
+                <div class="panel-heading" style="display: flex; align-items: center; padding: 10px 15px;"><h3 class="panel-title" style="margin: 0;"><i class="fa fa-cube"></i> Build Provisioning Package (vpn.tar)</h3></div>
+                <div class="panel-body">
+                    <form method="post" action="config.php?display=ovpn_mgr">
+                        <input type="hidden" name="action" value="generate_package">
+                        <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
+                        <div style="display: flex; align-items: flex-end; gap: 30px; margin-bottom: 10px; flex-wrap: wrap;">
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="font-size: 11px; display: block; margin-bottom: 5px;">Extension</label>
+                                <input type="text" name="ext" class="form-control" placeholder="101" required style="width: 130px; height: 34px;">
+                            </div>
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="font-size: 11px; display: block; margin-bottom: 5px;">Phone MAC Address</label>
+                                <input type="text" name="mac" class="form-control" placeholder="00155D010203" required style="width: 190px; height: 34px;">
+                            </div>
+                        </div>
+                        <div class="well well-sm" style="font-size: 11px; margin-bottom: 10px; padding: 5px; color: #555; max-width: 350px;">
+                            Package will target OpenVPN <strong><?php echo htmlspecialchars($currentServerIp); ?>:<?php echo htmlspecialchars($currentPort); ?></strong> and SIP Gateway <strong><?php echo htmlspecialchars($currentHostIp); ?>:5060</strong>
+                        </div>
+                        <button type="submit" class="btn btn-success btn-block" style="max-width: 350px;">
+                            <i class="fa fa-plus"></i> Generate Keys & Build Package
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-6">
             <div class="panel panel-default">
                 <div class="panel-heading" style="display: flex; align-items: center; justify-content: space-between; padding: 10px 15px;">
                     <h3 class="panel-title" style="margin: 0;"><i class="fa fa-archive"></i> Created Provisioning Archives</h3>
@@ -1370,82 +1333,47 @@ if (file_exists($logFile)) {
                         <i class="fa fa-key"></i> Manage / Revoke Keys (<?php echo count($issuedCertFiles); ?>)
                     </button>
                 </div>
-                <!-- Grows to fit content up to ~20 rows (thead ~33px + 20 * ~35px), then scrolls. -->
-                <div class="panel-body" style="padding: 0; max-height: 490px; overflow-y: auto;">
+                <div class="panel-body" style="padding: 0; max-height: 190px; overflow-y: auto;">
                     <?php if (empty($createdPackages)): ?>
                         <div style="padding: 20px; text-align: center;" class="text-muted">No provisioning packages have been generated yet.</div>
                     <?php else: ?>
                         <table class="table table-striped table-bordered" style="margin-bottom: 0; table-layout: fixed; width: 100%;">
-
-<colgroup>
-        <col style="width: 100px;"> <!-- Locks Left Cell (Extension) -->
-        <col style="width: 160px;">  <!-- Right Cell fills remaining space (MAC) -->
-        <col style="width: auto;"> <!-- Date Created -->
-        <col style="width: 165px;"> <!-- Actions -->
-    </colgroup>
-
                             <thead>
                                 <tr>
-                                    <th colspan="2" style="text-align: center;">Extension</th>
+                                    <th style="width: 280px;">Package Name</th>
+                                    <th style="width: auto; text-align: center;">Size</th>
                                     <th style="width: auto; text-align: center;">Date Created</th>
                                     <th style="width: 130px; text-align: center;">Actions</th>
                                 </tr>
                             </thead>
                             <tbody>
-<?php foreach ($createdPackages as $pkgPath):
-    $filename = basename($pkgPath);
-    $downloadUrl = "/PhoneSettings/vpnkeys/" . rawurlencode($filename);
-    
-    // Split filename by underscores
-    $parts = explode('_', $filename);
-    $pkgExt = '';
-    $pkgMac = '';
-
-    // Standard naming format: {MAC}_{EXT}_{TOKEN}_ovpn.tar or {MAC}_{EXT}_ovpn.tar
-    if (count($parts) >= 3 && end($parts) === 'ovpn.tar' || strpos($filename, '_ovpn.tar') !== false) {
-        $pkgMac = strtoupper($parts[0]);
-        $pkgExt = $parts[1];
-    } else {
-        // Fallback positional check
-        $pkgMac = !empty($parts[0]) ? strtoupper($parts[0]) : '';
-        $pkgExt = !empty($parts[1]) ? $parts[1] : '';
-    }
-?>
-    <tr>
-        <!-- Left Cell: Extension -->
-        <td style="text-align: left; vertical-align: middle; font-size: 14px; cursor: default; padding-left: 15px; border-right: none;" 
-            title="<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>">
-            <strong>
-                <?php echo !empty($pkgExt) ? 'Ext. ' . htmlspecialchars($pkgExt) : '&mdash;'; ?>
-            </strong>
-        </td>
-
-        <!-- Right Cell: MAC Address (Populates whatever string was saved) -->
-        <td style="text-align: left; vertical-align: middle; font-size: 14px; cursor: default; padding-left: 5px; border-left: none;" 
-            title="<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>">
-            <strong>
-                <?php echo !empty($pkgMac) ? 'MAC: ' . htmlspecialchars($pkgMac) : '&mdash;'; ?>
-            </strong>
-        </td>
-
-        <td style="text-align: center; vertical-align: middle; font-size: 12px;"><?php echo date("Y-m-d H:i", filemtime($pkgPath)); ?></td>
-        <td style="text-align: center; vertical-align: middle; padding: 4px 2px;">
-            <div style="display: flex; justify-content: center; align-items: center; gap: 3px;">
-                <a href="<?php echo htmlspecialchars($downloadUrl); ?>" class="btn btn-xs btn-primary" download title="Download Package">
-                    <i class="fa fa-download"></i>
-                </a>
-                <form method="post" action="config.php?display=ovpn_mgr" style="display:inline;">
-                    <input type="hidden" name="action" value="delete_package">
-                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
-                    <input type="hidden" name="pkg" value="<?php echo htmlspecialchars($filename); ?>">
-                    <button type="submit" class="btn btn-xs btn-danger" title="Delete Package & Revoke Keys" data-confirm-message="Delete package and REVOKE extension keys? This action cannot be undone.">
-                        <i class="fa fa-trash"></i>
-                    </button>
-                </form>
-            </div>
-        </td>
-    </tr>
-<?php endforeach; ?>
+                                <?php foreach ($createdPackages as $pkgPath):
+                                    $filename = basename($pkgPath);
+                                    $downloadUrl = "/PhoneSettings/vpnkeys/" . rawurlencode($filename);
+                                ?>
+                                    <tr>
+                                        <td style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle;">
+                                            <code style="color: #08096e; font-size: 14px; font-weight: 500;"><?php echo htmlspecialchars($filename); ?></code>
+                                        </td>
+                                        <td style="text-align: center; vertical-align: middle; font-size: 12px;"><?php echo round(filesize($pkgPath) / 1024, 0); ?> KB</td>
+                                        <td style="text-align: center; vertical-align: middle; font-size: 12px;"><?php echo date("Y-m-d H:i", filemtime($pkgPath)); ?></td>
+                                        <td style="text-align: center; vertical-align: middle; padding: 4px 2px;">
+                                            <div style="display: flex; justify-content: center; align-items: center; gap: 3px;">
+                                                <a href="<?php echo htmlspecialchars($downloadUrl); ?>" class="btn btn-xs btn-primary" download title="Download Package">
+                                                    <i class="fa fa-download"></i>
+                                                </a>
+                                                <form method="post" action="config.php?display=ovpn_mgr" style="display:inline;">
+                                                    <input type="hidden" name="action" value="delete_package">
+                                                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
+                                                    <input type="hidden" name="pkg" value="<?php echo htmlspecialchars($filename); ?>">
+                                                    <button type="submit" class="btn btn-xs btn-danger" title="Delete Package & Revoke Keys" data-confirm-message="Delete package and REVOKE extension keys? This action cannot be undone.">
+                                                        <i class="fa fa-trash"></i>
+                                                    </button>
+                                                </form>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
                             </tbody>
                         </table>
                     <?php endif; ?>
@@ -1575,15 +1503,19 @@ if (file_exists($logFile)) {
                 <?php endif; ?>
             </div>
             <div class="modal-footer" style="display: flex; justify-content: flex-start; gap: 6px; flex-wrap: wrap;">
-                <button type="button" style="height:30px;" id="pkgDownloadSelectedBtn" class="btn btn-primary btn-sm" disabled onclick="submitOvpnBulkPkgAction('bulk_download_packages')">
+                <button type="button"style="height: 30px;" id="pkgDownloadSelectedBtn" class="btn btn-primary btn-sm" disabled onclick="submitOvpnBulkPkgAction('bulk_download_packages')">
                     <i class="fa fa-download"></i> Download Selected
                 </button>
                 <button type="button" id="pkgRevokeSelectedBtn" class="btn btn-danger btn-sm" disabled onclick="submitOvpnBulkPkgAction('bulk_revoke_packages')">
                     <i class="fa fa-ban"></i> Revoke Selected
                 </button>
-                <button type="button" id="pkgRebuildSelectedBtn" class="btn btn-warning btn-sm" disabled onclick="submitOvpnBulkPkgAction('bulk_revoke_rebuild_packages')">
-                    <i class="fa fa-refresh"></i> Revoke & Rebuild Selected
-                </button>
+                <form method="post" action="config.php?display=ovpn_mgr" style="display: inline; margin: 0;">
+                    <input type="hidden" name="action" value="rebuild_all_packages">
+                    <input type="hidden" style="height: 30px;" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
+                    <button type="submit" style="height: 30px; "class="btn btn-warning btn-sm" data-confirm-message="Revoke and rebuild ALL existing client package(s) with the current server address? Old packages will stop working immediately.">
+                        <i class="fa fa-refresh"></i> Rebuild All
+                    </button>
+                </form>
                 <span style="flex: 1 1 auto;"></span>
                 <button type="button" class="btn btn-default btn-sm" data-dismiss="modal">Close</button>
             </div>
@@ -1898,7 +1830,7 @@ function toggleAllOvpnPkgCheckboxes(source) {
 function updateOvpnPkgSelection() {
     var $checked = $('.ovpn-pkg-checkbox:checked');
     var total = $('.ovpn-pkg-checkbox').length;
-    $('#pkgDownloadSelectedBtn, #pkgRevokeSelectedBtn, #pkgRebuildSelectedBtn').prop('disabled', $checked.length === 0);
+    $('#pkgDownloadSelectedBtn, #pkgRevokeSelectedBtn').prop('disabled', $checked.length === 0);
     $('#pkgSelectedCount').text($checked.length > 0 ? ($checked.length + ' selected') : '');
     $('#pkgSelectAll').prop('checked', total > 0 && $checked.length === total);
 }
@@ -1917,8 +1849,6 @@ function submitOvpnBulkPkgAction(action) {
         $('#bulkPkgAction').val(action);
         if (action === 'bulk_revoke_packages') {
             showOvpnProgress('Revoking ' + selected.length + ' package(s), please wait...');
-        } else if (action === 'bulk_revoke_rebuild_packages') {
-            showOvpnProgress('Revoking and rebuilding ' + selected.length + ' package(s), please wait...');
         }
         document.getElementById('bulkPkgForm').submit();
     };
@@ -1927,12 +1857,6 @@ function submitOvpnBulkPkgAction(action) {
         showOvpnConfirm(
             'REVOKE and delete ' + selected.length + ' selected package(s)? This blocks those phones from ' +
             'connecting to the VPN and cannot be undone.',
-            doSubmit
-        );
-    } else if (action === 'bulk_revoke_rebuild_packages') {
-        showOvpnConfirm(
-            'REVOKE and rebuild ' + selected.length + ' selected package(s) with the current server address? ' +
-            'The old package(s) will stop working immediately and a fresh one will be issued in their place.',
             doSubmit
         );
     } else {

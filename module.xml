@@ -1,13 +1,13 @@
 <module>
     <rawname>ovpn_mgr</rawname>
     <name>OpenVPN Manager</name>
-    <version>1.0.5</version>
+    <version>2.02c</version>
     <publisher>HG</publisher>
     <license>GPLv3+</license>
     <category>Custom</category>
     <menuitems>
         <ovpn_mgr>OpenVPN Manager</ovpn_mgr>
     </menuitems>
-    <location>local</location>
+    <more-info>https://github.com/CalNu/FPBX_OVPN_MGR</more-info>
     <populatesysadmin>true</populatesysadmin>
 </module>
