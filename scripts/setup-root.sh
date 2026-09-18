@@ -13,9 +13,8 @@
 #   2. Installs a sudoers rule letting 'asterisk' run ONLY that exact
 #      script, with no password prompt (NOPASSWD), nothing else.
 #   3. Persists net.ipv4.ip_forward=1 across reboots via sysctl.d.
-#   4. Installs a systemd unit that reapplies the VPN's NAT rule (and, on
-#      standalone/non-Distro systems, its own 'ovpn_mgr' port-accept chain)
-#      at boot - nothing else, it doesn't touch your OS's normal firewall.
+#   4. Installs a systemd unit that reapplies the VPN's NAT rule at boot
+#      (nothing else - it doesn't touch your OS's normal firewall setup).
 #
 # It is written to be distro-agnostic: it doesn't assume the FreePBX
 # Distro, a script-installed Debian box, or Incredible PBX - only that
@@ -81,14 +80,13 @@ chmod 700 "$STATE_DIR"
 if command -v systemctl >/dev/null 2>&1; then
     cat > "$UNIT_FILE" <<EOF
 [Unit]
-Description=Reapply ovpn_mgr VPN NAT rule and (standalone-firewall) port rule
+Description=Reapply ovpn_mgr VPN NAT rule
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=${WRAPPER} nat-restore
-ExecStart=${WRAPPER} port-restore
 RemainAfterExit=no
 
 [Install]
@@ -118,6 +116,6 @@ echo "Done."
 echo "  - ${WRAPPER} is now root:asterisk 0750"
 echo "  - ${SUDOERS_FILE} grants 'asterisk' passwordless sudo on that script only"
 echo "  - net.ipv4.ip_forward=1 persisted in /etc/sysctl.d/99-ovpn-mgr.conf"
-echo "  - ovpn-mgr-nat.service will reapply the VPN's NAT rule (and, on standalone systems, the port-accept rule) on every boot"
+echo "  - ovpn-mgr-nat.service will reapply the VPN's NAT rule on every boot"
 echo "  - OpenVPN daemon restarted"
 echo "Reload the OpenVPN Manager admin page - the setup banner should clear."

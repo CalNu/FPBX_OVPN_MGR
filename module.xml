@@ -1,7 +1,7 @@
 <module>
     <rawname>ovpn_mgr</rawname>
     <name>OpenVPN Manager</name>
-    <version>2.10</version>
+    <version>2.20</version>
     <publisher>HG</publisher>
     <license>GPLv3+</license>
     <category>Custom</category>
@@ -9,5 +9,4 @@
         <ovpn_mgr>OpenVPN Manager</ovpn_mgr>
     </menuitems>
     <more-info>https://github.com/CalNu/FPBX_OVPN_MGR</more-info>
-    <populatesysadmin>true</populatesysadmin>
 </module>

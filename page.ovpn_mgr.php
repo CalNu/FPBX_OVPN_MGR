@@ -28,11 +28,7 @@ if (empty($_SESSION['ovpn_mgr_csrf'])) {
 }
 $csrfToken = $_SESSION['ovpn_mgr_csrf'];
 
-// PHP's date()/time() use whatever date.timezone is set in php.ini - on
-// many boxes that's UTC regardless of the system's actual configured
-// timezone, which is why timestamps (log separators, package/cert dates)
-// could show the wrong local time. Align PHP to the system's real
-// timezone once, so every date() call below is correct.
+// Align PHP to the system's real timezone
 if (!function_exists('ovpn_mgr_detect_system_timezone')) {
     function ovpn_mgr_detect_system_timezone() {
         if (file_exists('/etc/timezone')) {
@@ -63,10 +59,10 @@ function csrf_require() {
 }
 
 // ============================================================================
-// Helper Functions (pure computation - no shell, no privilege)
+// Helper Functions (pure computation)
 // ============================================================================
 function reqIpsToNetmask($reqIps) {
-    $needed = intval($reqIps) + 3; // network, gateway, broadcast
+    $needed = intval($reqIps) + 3;
     $bits = 32 - ceil(log($needed, 2));
     if ($bits < 16) { $bits = 16; }
     if ($bits > 29) { $bits = 29; }
@@ -74,10 +70,6 @@ function reqIpsToNetmask($reqIps) {
     return long2ip($mask);
 }
 
-// Direct CIDR-prefix -> netmask conversion, used by the settings form
-// (which now takes a CIDR prefix directly instead of a "how many IPs do
-// you need" capacity estimate - same clamp range as reqIpsToNetmask so
-// existing saved configs still round-trip the same way).
 function cidrToNetmask($cidr) {
     $cidr = intval($cidr);
     if ($cidr < 16) { $cidr = 16; }
@@ -140,14 +132,9 @@ function calculateSubnetDetails($hostIp, $netmask) {
     ];
 }
 
-// Strict validation for anything that ends up written into the OpenVPN
-// server config file. Rejecting control characters here is what closes
-// the config-injection hole: without this, a newline in a form field
-// could add arbitrary directives to a config that later gets loaded by
-// a root-owned process.
 function isValidHostOrIp($s) {
     if (!is_string($s) || $s === '' || strlen($s) > 253) { return false; }
-    if (preg_match('/[\x00-\x1F\x7F]/', $s)) { return false; } // no control chars/newlines
+    if (preg_match('/[\x00-\x1F\x7F]/', $s)) { return false; }
     if (filter_var($s, FILTER_VALIDATE_IP)) { return true; }
     return (bool) preg_match('/^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$/', $s);
 }
@@ -169,7 +156,6 @@ function tailFile($path, $lines = 200, $maxBytes = 2000000) {
 }
 
 function getOpenVpnVersion() {
-    // Reading --version needs no privilege at all - no sudo here.
     $openvpnBin = file_exists('/usr/sbin/openvpn') ? '/usr/sbin/openvpn' : '/usr/local/sbin/openvpn';
     exec(escapeshellarg($openvpnBin) . " --version 2>&1", $output);
     if (!empty($output[0]) && preg_match('/OpenVPN\s+([0-9]+\.[0-9]+\.[0-9]+)/i', $output[0], $matches)) {
@@ -183,16 +169,6 @@ function hasOvpnctlAccess($ovpnctl) {
     return ($rc === 0);
 }
 
-// ============================================================================
-// Standalone-firewall fallback - used only when FreePBX's Firewall module
-// isn't present (a plain FreePBX-on-Debian/Ubuntu install with nothing
-// but stock iptables, no Sysadmin/Firewall). Delegates to ovpnctl's
-// port-sync subcommand (see scripts/ovpnctl), which maintains a
-// dedicated 'ovpn_mgr' chain jumped from INPUT - it never touches any
-// other chain, rule, or the box's default policy, and doesn't require
-// guessing at nftables/ufw/firewalld conventions on top of iptables.
-// Requires the one-time root setup (scripts/setup-root.sh) that's
-// already required for start/stop/NAT on non-Distro systems.
 function syncOvpnFirewallPortRuleStandalone($port, $logFile, $ovpnctl) {
     $result = ['written' => false, 'reloaded' => false, 'message' => ''];
 
@@ -209,37 +185,12 @@ function syncOvpnFirewallPortRuleStandalone($port, $logFile, $ovpnctl) {
     );
 
     if ($rc !== 0) {
-        $result['message'] = "Could not open UDP/{$port} via the standalone iptables fallback (ovpnctl port-sync exited {$rc}). "
-            . "This needs the one-time root setup: run 'sudo bash " . dirname($ovpnctl) . "/setup-root.sh' once from a root "
-            . "shell, which grants this module narrow, script-scoped sudo access (the same access start/stop/NAT already "
-            . "need on a standalone box). Details logged to the OpenVPN log.";
+        $result['message'] = "Could not open UDP/{$port} via the standalone iptables fallback (ovpnctl port-sync exited {$rc}).";
     }
 
     return $result;
 }
 
-// ============================================================================
-// Firewall port sync - uses FreePBX's own "Custom Services" feature
-// (Connectivity > Firewall > Custom Services), the same mechanism behind
-// the addCustomService()/editCustomService()/getAllCustomServices() methods
-// confirmed in FreePBX/firewall's Firewall.class.php. This replaced an
-// earlier approach that wrote directly into /etc/firewall-4.rules (the
-// file behind Advanced Settings > Custom Firewall Rules) - that file is
-// only consulted when the "Custom Firewall Rules" toggle is turned on,
-// which FreePBX deliberately ships OFF ("This should be Disabled unless
-// you explicitly know why it is enabled"), and there's no confirmed way
-// to flip that toggle from code. Custom Services doesn't have that
-// gate - it's the box checked/visible by default in the Firewall GUI,
-// and does not require the "Custom Firewall Rules" switch at all.
-//
-// On a standalone (non-Distro) system where the Firewall module isn't
-// present at all, this falls back to syncOvpnFirewallPortRuleStandalone()
-// below, which manages a dedicated 'ovpn_mgr' iptables chain instead.
-//
-// This is also why the previous "fwconsole firewall add/del external
-// <port>" calls never worked: that subcommand only adds/removes IP/host/
-// network entries to a zone (see "fwconsole firewall -help") - passing a
-// bare port number to it never opened anything.
 function syncOvpnFirewallPortRule($newPort, $logFile, $ovpnctl) {
     $port = intval($newPort);
     $serviceName = 'OpenVPN Manager';
@@ -252,26 +203,17 @@ function syncOvpnFirewallPortRule($newPort, $logFile, $ovpnctl) {
     try {
         $fw = \FreePBX::Firewall();
     } catch (Throwable $e) {
-        // No Firewall module on this box at all - this is exactly the
-        // "standalone, non-Distro, plain iptables" case, not an error.
-        @file_put_contents(
-            $logFile,
-            "\n[FIREWALL SYNC " . date('Y-m-d H:i:s') . "] FreePBX Firewall module not present - using standalone iptables fallback.\n",
-            FILE_APPEND
-        );
+        @file_put_contents($logFile, "\n[FIREWALL SYNC " . date('Y-m-d H:i:s') . "] FreePBX Firewall module not present - using standalone iptables fallback.\n", FILE_APPEND);
         return syncOvpnFirewallPortRuleStandalone($port, $logFile, $ovpnctl);
     }
 
-    if (!method_exists($fw, 'addCustomService') || !method_exists($fw, 'editCustomService')) {
-        $result['message'] = "This FreePBX version's Firewall module doesn't expose addCustomService()/editCustomService() - "
-            . "open Connectivity > Firewall > Custom Services and add/edit a UDP service on port {$port} manually.";
+    if (!method_exists($fw, 'addCustomService')) {
+        $result['message'] = "This FreePBX version's Firewall module doesn't expose addCustomService().";
         @file_put_contents($logFile, "\n[FIREWALL SYNC " . date('Y-m-d H:i:s') . "] " . $result['message'] . "\n", FILE_APPEND);
         return $result;
     }
 
     try {
-        // Find our own service by name if it already exists, so a port
-        // change edits it in place instead of piling up duplicates.
         $existingId = null;
         if (method_exists($fw, 'getAllCustomServices')) {
             foreach ((array)$fw->getAllCustomServices() as $key => $svc) {
@@ -284,67 +226,74 @@ function syncOvpnFirewallPortRule($newPort, $logFile, $ovpnctl) {
             }
         }
 
-        if ($existingId !== null) {
+        if ($existingId !== null && method_exists($fw, 'editCustomService')) {
             $fw->editCustomService($existingId, $serviceName, 'udp', $port);
         } else {
+            if ($existingId !== null && method_exists($fw, 'deleteCustomService')) {
+                $fw->deleteCustomService($existingId);
+            }
             $fw->addCustomService($serviceName, 'udp', $port);
         }
         $result['written'] = true;
     } catch (Throwable $e) {
-        $result['message'] = "Error calling the Firewall module's Custom Service API: " . $e->getMessage();
+        $result['message'] = "Error calling Firewall API: " . $e->getMessage();
         @file_put_contents($logFile, "\n[FIREWALL SYNC " . date('Y-m-d H:i:s') . "] " . $result['message'] . "\n", FILE_APPEND);
         return $result;
+    }
+
+    if (method_exists($fw, 'setCustomServiceZones') && method_exists($fw, 'getAllCustomServices')) {
+        $zoneTargetId = null;
+        foreach ((array)$fw->getAllCustomServices() as $key => $svc) {
+            $svcArr = (array)$svc;
+            $svcName = $svcArr['name'] ?? $svcArr['n'] ?? '';
+            if ($svcName === $serviceName) {
+                $zoneTargetId = $svcArr['id'] ?? $key;
+                break;
+            }
+        }
+        if ($zoneTargetId !== null) {
+            try {
+                $fw->setCustomServiceZones($zoneTargetId, ['external', 'internal', 'other']);
+            } catch (Throwable $e) {
+                @file_put_contents($logFile, "\n[FIREWALL SYNC " . date('Y-m-d H:i:s') . "] Could not set zones: " . $e->getMessage() . "\n", FILE_APPEND);
+            }
+        }
     }
 
     exec('fwconsole firewall restart 2>&1', $restartOut, $restartRc);
     $result['reloaded'] = ($restartRc === 0);
     @file_put_contents(
         $logFile,
-        "\n[FIREWALL SYNC " . date('Y-m-d H:i:s') . "] Synced Custom Service '{$serviceName}' to UDP/{$port}"
-            . " (existingId=" . var_export($existingId, true) . "), fwconsole firewall restart exit={$restartRc}\n"
+        "\n[FIREWALL SYNC " . date('Y-m-d H:i:s') . "] Synced Custom Service '{$serviceName}' to UDP/{$port}, fwconsole firewall restart exit={$restartRc}\n"
             . implode("\n", $restartOut) . "\n",
         FILE_APPEND
     );
 
     if (!$result['reloaded']) {
-        $result['message'] = "Custom Service '{$serviceName}' was created/updated for UDP/{$port} in Firewall > Custom "
-            . "Services, but 'fwconsole firewall restart' returned a non-zero exit code - it may not be active yet. "
-            . "Check Connectivity > Firewall in the GUI. Details logged to the OpenVPN log.";
-    } else {
-        // Zone assignment (Internet/Local/Other) for a *new* custom service
-        // could not be fully confirmed from source, so it isn't set
-        // programmatically the first time - only surfaced here (not as a
-        // failure banner) so it's not a persistent nag on every save.
-        @file_put_contents(
-            $logFile,
-            "\n[FIREWALL SYNC NOTE] If this is the first time '{$serviceName}' was created, open Firewall > Custom "
-                . "Services once and confirm its Internet/Local/Other zone toggles are set the way you want (same as "
-                . "your existing services) - this module sets the port/protocol but does not assume which zones.\n",
-            FILE_APPEND
-        );
+        $result['message'] = "Custom Service '{$serviceName}' updated, but firewall restart returned a non-zero code.";
     }
 
     return $result;
 }
 
-function applyVpnRoutingAndNat($ovpnctl, $netIp, $cidrBits, $iface) {
-    // Opening/closing the OpenVPN UDP port itself is handled by FreePBX's
-    // own Firewall module (fwconsole firewall add/del external|internet)
-    // at the call site below - that's the FreePBX-native, persistence-
-    // safe way to do it and works the same regardless of host distro.
-    // ovpnctl is only needed here for the two things that module can't
-    // do: enabling IP forwarding and NAT/masquerade for the VPN subnet.
+function applyVpnRoutingAndNat($ovpnctl, $netIp, $cidrBits, $iface, $baseDir) {
     exec('sudo -n ' . escapeshellarg($ovpnctl) . ' ipforward-on 2>&1');
-    // Correct form is "add <zone> <id...>" - the literal word "zone" isn't
-    // part of the syntax (see "fwconsole firewall -help"); the old line
-    // ("add zone trusted tun+") was being silently rejected, so the tun+
-    // interface was never actually placed in the trusted zone.
-    exec('fwconsole firewall add trusted tun+ 2>&1');
-    // "restart" is the documented subcommand that applies rule changes -
-    // "sync" isn't a real fwconsole firewall subcommand and was a no-op.
-    exec('fwconsole firewall restart 2>&1');
-
     $cidr = "{$netIp}/{$cidrBits}";
+
+    if (class_exists('FreePBX')) {
+        exec('fwconsole firewall add trusted tun+ 2>&1');
+
+        $trustedCidrState = "{$baseDir}/.trusted_cidr_state";
+        $prevCidr = file_exists($trustedCidrState) ? trim((string)@file_get_contents($trustedCidrState)) : '';
+
+        if ($prevCidr !== '' && $prevCidr !== $cidr) {
+            exec('fwconsole firewall del trusted ' . escapeshellarg($prevCidr) . ' 2>&1');
+        }
+        exec('fwconsole firewall add trusted ' . escapeshellarg($cidr) . ' 2>&1');
+        @file_put_contents($trustedCidrState, $cidr);
+        exec('fwconsole firewall restart 2>&1');
+    }
+
     $cmd = 'sudo -n ' . escapeshellarg($ovpnctl) . ' nat-sync ' . escapeshellarg($cidr) . ' ' . escapeshellarg($iface);
     exec($cmd . ' 2>&1');
 }
@@ -359,7 +308,6 @@ function startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey) {
         @mkdir($logDir, 0775, true);
     }
 
-    // Log rotation - the file is owned by us (asterisk), so no sudo needed.
     if (file_exists($logFile) && filesize($logFile) > 5242880) {
         $tail = tailFile($logFile, 2000);
         @file_put_contents($logFile, $tail . "\n");
@@ -463,7 +411,7 @@ function getActiveServerSettings($serverConf) {
 }
 
 // ============================================================================
-// Read-only AJAX endpoints (no state change -> no CSRF token required)
+// Read-only AJAX endpoints
 // ============================================================================
 if (isset($_GET['action']) && $_GET['action'] === 'fetch_log') {
     if (ob_get_level()) { ob_end_clean(); }
@@ -492,7 +440,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch_public_ip') {
 }
 
 // ============================================================================
-// Write AJAX endpoint (state change -> CSRF token required)
+// Write AJAX endpoint
 // ============================================================================
 if (isset($_POST['action']) && $_POST['action'] === 'add_page_break') {
     csrf_require();
@@ -512,9 +460,36 @@ $freepbxObj = \FreePBX::create();
 $ovpn_mgr = new \FreePBX\modules\Ovpn_mgr($freepbxObj);
 
 // ============================================================================
-// Sign Module (no root involved - only re-hashes files this module already
-// owns. The old password field here was never even used by the handler;
-// it has been removed.)
+// Gather FreePBX Extensions & Yealink EPM MAC Addresses
+// ============================================================================
+$available_extensions = [];
+if (function_exists('core_users_list')) {
+    $users = core_users_list();
+    foreach ($users as $u) {
+        $available_extensions[$u[0]] = $u[1] . " (" . $u[0] . ")";
+    }
+} elseif (class_exists('FreePBX')) {
+    try {
+        $core = \FreePBX::Core();
+        if (method_exists($core, 'listUsers')) {
+            foreach ($core->listUsers() as $u) {
+                $available_extensions[$u['extension']] = $u['name'] . " (" . $u['extension'] . ")";
+            }
+        }
+    } catch (\Throwable $e) {}
+}
+
+$available_macs = [];
+$tftpDir = "{$ampWebRoot}/tftpboot";
+if (is_dir($tftpDir)) {
+    foreach (glob("{$tftpDir}/[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F].cfg") as $cfgFile) {
+        $mac = strtolower(pathinfo($cfgFile, PATHINFO_FILENAME));
+        $available_macs[$mac] = strtoupper($mac);
+    }
+}
+
+// ============================================================================
+// Sign Module
 // ============================================================================
 if (isset($_POST['action']) && $_POST['action'] === 'resign_custom_module_with_pass') {
     csrf_require();
@@ -608,22 +583,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
         $subnetDetails = calculateSubnetDetails($newHostIp, $newNetmask);
         $newNetIp      = $subnetDetails['net_ip'];
 
-        // OpenVPN's "server" directive always assigns itself the first
-        // usable address of the subnet (network + 1) - it is not
-        // actually configurable to anything else. Rather than silently
-        // accept a value the daemon will never really use, always
-        // correct to that address and tell the admin why, whether their
-        // input was the network/broadcast address or just some other
-        // host in the block.
         $finalHostIp = $subnetDetails['suggested_first'];
         $hostIpWasCorrected = ($finalHostIp !== $newHostIp);
 
-        // Stop the currently-running daemon BEFORE rewriting the config.
-        // ovpnctl matches the process by the config file's live content,
-        // so doing this after the rewrite (the previous order) meant it
-        // was hunting for a process using the *new* port/settings that
-        // didn't exist yet, leaving the real old process (and its tun
-        // interface) running untouched until a manual restart.
         $wasStopped = file_exists("{$baseDir}/.stopped");
         if (!$wasStopped) {
             stopOpenVpnServer($ovpnctl);
@@ -639,9 +601,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
             $confContent .= "\nserver {$newNetIp} {$newNetmask}";
         }
 
-        // newIp/finalHostIp have already been through isValidHostOrIp() /
-        // FILTER_VALIDATE_IP above, so they cannot contain newlines or
-        // other characters that could inject additional config directives.
         if (preg_match('/^# vpn-host-ip .*/m', $confContent)) {
             $confContent = preg_replace('/^# vpn-host-ip .*/m', "# vpn-host-ip {$finalHostIp}", $confContent);
         } else {
@@ -665,25 +624,17 @@ if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
         }
         if ($primaryIf === '') { $primaryIf = 'ens192'; }
 
-        // Open the new port via the same file FreePBX's own "Advanced
-        // Settings > Custom Firewall Rules" GUI reads/writes (see
-        // syncOvpnFirewallPortRule() above for why this replaced the old
-        // "fwconsole firewall add/del external <port>" calls - those never
-        // actually opened anything).
         $fwSyncResult = syncOvpnFirewallPortRule($newPort, $logFile, $ovpnctl);
         if (!$fwSyncResult['written'] || !$fwSyncResult['reloaded']) {
             $_SESSION['ovpn_mgr_fw_warning'] = $fwSyncResult['message'];
         }
 
-        applyVpnRoutingAndNat($ovpnctl, $newNetIp, $subnetDetails['cidr'], $primaryIf);
+        applyVpnRoutingAndNat($ovpnctl, $newNetIp, $subnetDetails['cidr'], $primaryIf, $baseDir);
 
         if (!$wasStopped) {
             startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
         }
 
-        // Flash notice for the next page load: host-ip correction, and/or
-        // an offer to revoke+rebuild existing packages if the address or
-        // port clients connect to actually changed.
         $existingPkgCount = count(glob("{$pkgDir}/*.tar"));
         $addressChanged = ($oldIp !== $newIp) || ($oldPort !== $newPort);
         if ($hostIpWasCorrected || ($addressChanged && $existingPkgCount > 0)) {
@@ -702,9 +653,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
 }
 
 // ============================================================================
-// Client package builder - shared by "Generate Package" and "Revoke &
-// Rebuild All" below. Only ever touches asterisk-owned files under
-// pkiDir/baseDir/pkgDir, so this needs no elevated privilege.
+// Client Package Builder
 // ============================================================================
 function buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $serverIp, $port) {
     if (!file_exists($pkgDir)) {
@@ -744,9 +693,6 @@ function buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $serverIp, $
             . "script-security 2\n";
     @file_put_contents("{$buildDir}/vpn.cnf", $vpnCnf);
 
-    // This module only builds the VPN transport package - it deliberately
-    // does not generate any SIP/account provisioning config (that's a
-    // separate concern for whatever endpoint-manager module you use).
     $members = [];
     foreach (['keys', 'vpn.cnf'] as $member) {
         if (file_exists("{$buildDir}/{$member}")) {
@@ -754,11 +700,13 @@ function buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $serverIp, $
         }
     }
 
-    // A random suffix keeps package filenames from being guessable by
-    // MAC/extension alone, since these packages are served as plain
-    // static files to unauthenticated phones and can't require a login.
-    $pkgToken = bin2hex(random_bytes(4));
-    $tarPath = "{$pkgDir}/{$mac}_{$ext}_{$pkgToken}_ovpn.tar";
+    $tarPath = "{$pkgDir}/{$mac}_{$ext}_ovpn.tar";
+
+    foreach (glob("{$pkgDir}/{$mac}_{$ext}_*_ovpn.tar") as $oldTokenPkg) {
+        if (basename($oldTokenPkg) !== basename($tarPath)) {
+            @unlink($oldTokenPkg);
+        }
+    }
 
     $tarCmd = "tar -cf " . escapeshellarg($tarPath) . " -C " . escapeshellarg($buildDir);
     foreach ($members as $member) {
@@ -777,65 +725,8 @@ function buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $serverIp, $
     return $ok ? $tarPath : null;
 }
 
-if (isset($_POST['action']) && $_POST['action'] === 'generate_package') {
-    csrf_require();
-
-    $ext = preg_replace('/[^0-9]/', '', (string)($_POST['ext'] ?? ''));
-    $mac = strtolower(preg_replace('/[^a-fA-F0-9]/', '', (string)($_POST['mac'] ?? '')));
-
-    if (!empty($ext) && !empty($mac)) {
-        $settings = getActiveServerSettings($serverConf);
-        buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port']);
-    }
-    header("Location: config.php?display=ovpn_mgr");
-    exit();
-}
-
-// Revoke every existing client's cert and rebuild its package against the
-// server's current address/port. Offered to the admin after a settings
-// save that changed the address/port existing packages were built for.
-if (isset($_POST['action']) && $_POST['action'] === 'rebuild_all_packages') {
-    csrf_require();
-
-    $settings = getActiveServerSettings($serverConf);
-    $existingPkgs = glob("{$pkgDir}/*.tar");
-    $rebuilt = 0;
-
-    foreach ($existingPkgs as $pkgPath) {
-        $filename = basename($pkgPath);
-        $mac = '';
-        $ext = '';
-        if (preg_match('/^([a-f0-9]+)_(\d+)_[a-f0-9]{8}_ovpn\.tar$/i', $filename, $m)) {
-            $mac = strtolower($m[1]);
-            $ext = $m[2];
-        } elseif (preg_match('/^([a-f0-9]+)_(\d+)_ovpn\.tar$/i', $filename, $m)) {
-            $mac = strtolower($m[1]);
-            $ext = $m[2];
-        }
-        if ($ext === '' || $mac === '') {
-            continue; // can't determine which extension this belonged to - leave it alone
-        }
-
-        revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $ext);
-        @unlink($pkgPath);
-        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'])) {
-            $rebuilt++;
-        }
-    }
-
-    if (!file_exists("{$baseDir}/.stopped")) {
-        stopOpenVpnServer($ovpnctl);
-        sleep(1);
-        startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
-    }
-
-    unset($_SESSION['ovpn_mgr_flash']);
-    header("Location: config.php?display=ovpn_mgr");
-    exit();
-}
-
 // ============================================================================
-// Certificate revocation helper (shared by the two actions below)
+// Certificate Revocation Helper
 // ============================================================================
 function revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $revokeExt) {
     $targetCrt = "{$pkiDir}/issued/{$revokeExt}.crt";
@@ -866,11 +757,101 @@ function revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $revokeExt) {
     @unlink($targetKey);
 
     foreach (glob("{$pkgDir}/*_{$revokeExt}_*_ovpn.tar") as $matchingTar) { @unlink($matchingTar); }
-    foreach (glob("{$pkgDir}/*_{$revokeExt}_ovpn.tar") as $matchingTar) { @unlink($matchingTar); } // legacy naming
+    foreach (glob("{$pkgDir}/*_{$revokeExt}_ovpn.tar") as $matchingTar) { @unlink($matchingTar); }
 }
 
-// Handle Certificate Revocation (now POST-only - GET requests must never
-// change state, or any link/image tag anywhere could trigger this via CSRF)
+// ============================================================================
+// Edit Package MAC/Extension Action
+// ============================================================================
+if (isset($_POST['action']) && $_POST['action'] === 'edit_package') {
+    csrf_require();
+
+    $oldPkg = basename((string)($_POST['old_pkg'] ?? ''));
+    $newExt = preg_replace('/[^0-9]/', '', (string)($_POST['ext'] ?? ''));
+    $newMac = strtolower(preg_replace('/[^a-fA-F0-9]/', '', (string)($_POST['mac'] ?? '')));
+    $oldPath = "{$pkgDir}/{$oldPkg}";
+
+    if (file_exists($oldPath) && !empty($newExt) && !empty($newMac)) {
+        $oldExt = '';
+        if (preg_match('/^[a-f0-9]+_(\d+)_(ovpn|keys)\.tar$/i', $oldPkg, $m)) {
+            $oldExt = $m[1];
+        } elseif (preg_match('/^[a-f0-9]+_(\d+)_[a-f0-9]{8}_ovpn\.tar$/i', $oldPkg, $m)) {
+            $oldExt = $m[1];
+        }
+
+        if (!empty($oldExt)) {
+            revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $oldExt);
+        }
+
+        @unlink($oldPath);
+
+        $settings = getActiveServerSettings($serverConf);
+        buildClientPackage($pkiDir, $pkgDir, $baseDir, $newExt, $newMac, $settings['ip'], $settings['port']);
+
+        if (!file_exists("{$baseDir}/.stopped")) {
+            stopOpenVpnServer($ovpnctl);
+            sleep(1);
+            startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
+        }
+    }
+    header("Location: config.php?display=ovpn_mgr");
+    exit();
+}
+
+if (isset($_POST['action']) && $_POST['action'] === 'generate_package') {
+    csrf_require();
+
+    $ext = preg_replace('/[^0-9]/', '', (string)($_POST['ext'] ?? ''));
+    $mac = strtolower(preg_replace('/[^a-fA-F0-9]/', '', (string)($_POST['mac'] ?? '')));
+
+    if (!empty($ext) && !empty($mac)) {
+        $settings = getActiveServerSettings($serverConf);
+        buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port']);
+    }
+    header("Location: config.php?display=ovpn_mgr");
+    exit();
+}
+
+if (isset($_POST['action']) && $_POST['action'] === 'rebuild_all_packages') {
+    csrf_require();
+
+    $settings = getActiveServerSettings($serverConf);
+    $existingPkgs = glob("{$pkgDir}/*.tar");
+    $rebuilt = 0;
+
+    foreach ($existingPkgs as $pkgPath) {
+        $filename = basename($pkgPath);
+        $mac = '';
+        $ext = '';
+        if (preg_match('/^([a-f0-9]+)_(\d+)_[a-f0-9]{8}_ovpn\.tar$/i', $filename, $m)) {
+            $mac = strtolower($m[1]);
+            $ext = $m[2];
+        } elseif (preg_match('/^([a-f0-9]+)_(\d+)_ovpn\.tar$/i', $filename, $m)) {
+            $mac = strtolower($m[1]);
+            $ext = $m[2];
+        }
+        if ($ext === '' || $mac === '') {
+            continue;
+        }
+
+        revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $ext);
+        @unlink($pkgPath);
+        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'])) {
+            $rebuilt++;
+        }
+    }
+
+    if (!file_exists("{$baseDir}/.stopped")) {
+        stopOpenVpnServer($ovpnctl);
+        sleep(1);
+        startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
+    }
+
+    unset($_SESSION['ovpn_mgr_flash']);
+    header("Location: config.php?display=ovpn_mgr");
+    exit();
+}
+
 if (isset($_POST['action']) && $_POST['action'] === 'revoke_cert') {
     csrf_require();
     $revokeExt = preg_replace('/[^0-9]/', '', (string)($_POST['revoke_ext'] ?? ''));
@@ -886,7 +867,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'revoke_cert') {
     exit();
 }
 
-// Handle Package Deletion (also POST-only now)
 if (isset($_POST['action']) && $_POST['action'] === 'delete_package') {
     csrf_require();
     $targetPkg = basename((string)($_POST['pkg'] ?? ''));
@@ -897,10 +877,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'delete_package') {
 
     if (file_exists($fullPath) && $looksLikeOurPkg) {
         $revokeExt = '';
-        if (preg_match('/^[a-f0-9]+_(\d+)_[a-f0-9]{8}_ovpn\.tar$/i', $targetPkg, $m)) {
-            $revokeExt = $m[1]; // current naming: mac_ext_token_ovpn.tar
-        } elseif (preg_match('/^[a-f0-9]+_(\d+)_(ovpn|keys)\.tar$/i', $targetPkg, $m)) {
-            $revokeExt = $m[1]; // legacy naming
+        if (preg_match('/^[a-f0-9]+_(\d+)_(ovpn|keys)\.tar$/i', $targetPkg, $m)) {
+            $revokeExt = $m[1];
+        } elseif (preg_match('/^[a-f0-9]+_(\d+)_[a-f0-9]{8}_ovpn\.tar$/i', $targetPkg, $m)) {
+            $revokeExt = $m[1];
         } elseif (preg_match('/^keys_(\d+)_/i', $targetPkg, $m) || preg_match('/^(\d+)-/i', $targetPkg, $m)) {
             $revokeExt = $m[1];
         }
@@ -921,10 +901,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'delete_package') {
 }
 
 // ============================================================================
-// Bulk actions for the "Created Provisioning Archives" table (checkbox
-// selection). Both share the same validation as the single-item
-// delete_package handler above: basename() only, and the filename must
-// look like one of our own package names before it's ever touched.
+// Bulk Actions
 // ============================================================================
 function ovpnValidateSelectedPkg($pkgDir, $name) {
     $name = basename((string)$name);
@@ -946,22 +923,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_download_packages') {
         header("Location: config.php?display=ovpn_mgr");
         exit();
     }
-    // Discard any output buffer(s) FreePBX's own page framework may have
-    // already started before this module's action code ran - e.g. nav
-    // chrome, or (very plausible on a heavily-hand-edited module like
-    // this one) the "module signature invalid / tampered files" warning
-    // banner. If even one byte of that HTML leaks out ahead of the tar
-    // header, the result is a corrupted archive: most tar readers,
-    // including 7-Zip, require the tar header at byte 0 and simply
-    // refuse to open anything else. This has to happen *before* the
-    // header() calls below, and in a loop since the framework may have
-    // nested buffers.
     while (ob_get_level() > 0) {
         ob_end_clean();
     }
 
-    // Bundle the selected .tar packages into one outer .tar so the browser
-    // gets a single "Save As" dialog instead of N simultaneous downloads.
     $bundleName = 'ovpn_packages_' . date('Ymd_His') . '.tar';
     $args = array_map('escapeshellarg', $validFiles);
     header('Content-Description: File Transfer');
@@ -1000,8 +965,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_packages') {
         }
     }
 
-    // One restart at the end (like Revoke & Rebuild All) instead of once
-    // per selected item - the CRL only needs to be picked up once.
     if ($revokedCount > 0 && !file_exists("{$baseDir}/.stopped")) {
         stopOpenVpnServer($ovpnctl);
         sleep(1);
@@ -1012,9 +975,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_packages') {
     exit();
 }
 
-// Same idea as "Rebuild All" above, but scoped to just the checked rows -
-// revokes each selected package's cert and immediately issues a fresh one
-// against the server's current address/port, instead of only deleting.
 if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_rebuild_packages') {
     csrf_require();
     $selected = (array)($_POST['pkgs'] ?? []);
@@ -1035,7 +995,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_rebuild_package
             $ext = $m[2];
         }
         if ($ext === '' || $mac === '') {
-            continue; // can't determine mac/ext from this filename - leave it alone
+            continue;
         }
 
         revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $ext);
@@ -1065,16 +1025,11 @@ $currentNetMask = $activeSettings['net_mask'];
 
 $subnetDetails = calculateSubnetDetails($currentHostIp, $currentNetMask);
 $currentCidr = $subnetDetails['cidr'];
-// Usable client IPs for this CIDR block: total host addresses minus
-// network + broadcast, minus 1 more for the address OpenVPN's "server"
-// directive always reserves for itself.
 $currentClientIpCount = max(0, (pow(2, 32 - $currentCidr) - 2) - 1);
 
-// Safe log reader - the file is owned by us, no sudo needed.
 $logContent = tailFile($logFile, 200);
 $hasTunError = (strpos($logContent, 'Cannot ioctl TUNSETIFF') !== false || strpos($logContent, 'Exiting due to fatal error') !== false);
 
-// Process check
 $pids = [];
 if (!file_exists("{$baseDir}/.stopped")) {
     if (file_exists($pidFile)) {
@@ -1103,7 +1058,6 @@ $hasSudoRule = hasOvpnctlAccess($ovpnctl);
 $createdPackages = glob("{$pkgDir}/*.tar");
 $issuedCertFiles = glob("{$pkiDir}/issued/*.crt");
 
-// Active Client & Cipher Parser
 $connectedClients = [];
 if (file_exists($logFile)) {
     $logData = (string)@file_get_contents($logFile);
@@ -1142,7 +1096,7 @@ if (file_exists($logFile)) {
     <div class="alert alert-<?php echo ($isRunning && $ip_forward_active) ? 'success' : 'danger'; ?>" style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 15px; padding: 12px 18px;">
         <div style="display: flex; align-items: center; gap: 20px;">
             <div style="font-weight: bold; color: #333; font-size: 13px;">
-                <span title="Checked by looking for a running process whose command line matches this module's OpenVPN config path.">OpenVPN Server Status:</span>
+                <span>OpenVPN Server Status:</span>
                 <?php if ($isRunning): ?>
                     <span class="label label-success" style="font-size: 11px; padding: 4px 8px;" title="PID: <?php echo htmlspecialchars(implode(', ', $pids)); ?>">RUNNING</span>
                 <?php else: ?>
@@ -1150,11 +1104,11 @@ if (file_exists($logFile)) {
                 <?php endif; ?>
             </div>
             <div style="font-weight: bold; color: #333; font-size: 13px;">
-                <span title="Checked by running: sysctl -n net.ipv4.ip_forward (1 = active, 0 = inactive)">Kernel IP Forwarding:</span>
+                <span>Kernel IP Forwarding:</span>
                 <?php if ($ip_forward_active): ?>
-                    <span class="label label-success" style="font-size: 11px; padding: 4px 8px;" title="net.ipv4.ip_forward = 1">ACTIVE</span>
+                    <span class="label label-success" style="font-size: 11px; padding: 4px 8px;">ACTIVE</span>
                 <?php else: ?>
-                    <span class="label label-danger" style="font-size: 11px; padding: 4px 8px;" title="net.ipv4.ip_forward = 0">INACTIVE</span>
+                    <span class="label label-danger" style="font-size: 11px; padding: 4px 8px;">INACTIVE</span>
                 <?php endif; ?>
             </div>
         </div>
@@ -1164,14 +1118,14 @@ if (file_exists($logFile)) {
                 <input type="hidden" name="action" value="manage_service">
                 <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
                 <?php if ($isRunning): ?>
-                    <button type="submit" name="service_cmd" value="stop" class="btn btn-danger btn-sm" style="background-color: #db001a; border-color: #6b000d;" data-confirm-message="Stop OpenVPN service? Remote clients will disconnect." <?php echo !$hasSudoRule ? 'disabled title="This module cannot manage this process yet - see the setup notice below"' : ''; ?>>
+                    <button type="submit" name="service_cmd" value="stop" class="btn btn-danger btn-sm" style="background-color: #db001a; border-color: #6b000d;" data-confirm-message="Stop OpenVPN service? Remote clients will disconnect." <?php echo !$hasSudoRule ? 'disabled' : ''; ?>>
                         <i class="fa fa-stop"></i> Stop
                     </button>
-                    <button type="submit" name="service_cmd" value="restart" class="btn btn-warning btn-sm" <?php echo !$hasSudoRule ? 'disabled title="This module cannot manage this process yet - see the setup notice below"' : ''; ?>>
+                    <button type="submit" name="service_cmd" value="restart" class="btn btn-warning btn-sm" <?php echo !$hasSudoRule ? 'disabled' : ''; ?>>
                         <i class="fa fa-refresh"></i> Restart
                     </button>
                 <?php else: ?>
-                    <button type="submit" name="service_cmd" value="start" class="btn btn-success btn-sm" <?php echo !$hasSudoRule ? 'disabled title="Run the one-time root setup below first"' : ''; ?>>
+                    <button type="submit" name="service_cmd" value="start" class="btn btn-success btn-sm" <?php echo !$hasSudoRule ? 'disabled' : ''; ?>>
                         <i class="fa fa-play"></i> Start
                     </button>
                 <?php endif; ?>
@@ -1187,15 +1141,12 @@ if (file_exists($logFile)) {
         </div>
     </div>
 
-    <!-- One-time root setup notice - replaces the old in-browser root
-         password prompt. No password ever flows through this page. -->
     <?php if (!$hasSudoRule): ?>
         <div class="panel panel-warning" style="margin-bottom: 20px;">
             <div class="panel-heading"><h3 class="panel-title"><i class="fa fa-lock"></i> One-Time Root Setup Required</h3></div>
             <div class="panel-body">
-                <p>This module needs a narrow, one-time root authorization before it can start the OpenVPN daemon, manage firewall rules, or enable IP forwarding. This is done once from an SSH/console session as root - never through this web page - so no root password is ever typed into or transmitted by the browser:</p>
+                <p>This module needs a narrow, one-time root authorization before it can start the OpenVPN daemon, manage firewall rules, or enable IP forwarding.</p>
                 <pre id="setupCmd" title="Click to copy" style="background:#f8f9fa; padding:10px; border:1px solid #ccc; font-size:12px; cursor:pointer;" onclick="copySetupCommand()">sudo bash <?php echo htmlspecialchars($setupScript); ?></pre>
-                <p style="margin-bottom: 0;">That script grants the web server user passwordless <code>sudo</code> on exactly one fixed helper script (<code>scripts/ovpnctl</code>) - nothing else, and restarts the daemon at the end so it comes up with a working <code>tun</code> interface immediately, without a separate manual restart. After running it, reload this page.</p>
             </div>
         </div>
     <?php elseif (!$ip_forward_active): ?>
@@ -1224,18 +1175,17 @@ if (file_exists($logFile)) {
                 <p style="margin-bottom: <?php echo !empty($ovpnFlash['address_changed']) ? '10px' : '0'; ?>;">
                     <i class="fa fa-info-circle"></i>
                     VPN Host IP adjusted from <code><?php echo htmlspecialchars($ovpnFlash['entered_host_ip']); ?></code> to <code><?php echo htmlspecialchars($ovpnFlash['final_host_ip']); ?></code>.
-                    OpenVPN's <code>server</code> directive always assigns itself the first usable address of the subnet - the value you entered was only used to pick which block to use.
                 </p>
             <?php endif; ?>
             <?php if (!empty($ovpnFlash['address_changed']) && $ovpnFlash['pkg_count'] > 0): ?>
                 <p style="margin-bottom: 10px;">
                     <i class="fa fa-exclamation-triangle"></i>
-                    The server address/port changed. <?php echo intval($ovpnFlash['pkg_count']); ?> existing client package(s) still point at the old address and will stop connecting until rebuilt.
+                    The server address/port changed. <?php echo intval($ovpnFlash['pkg_count']); ?> existing client package(s) still point at the old address.
                 </p>
                 <form method="post" action="config.php?display=ovpn_mgr" style="display:inline;">
                     <input type="hidden" name="action" value="rebuild_all_packages">
                     <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
-                    <button type="submit" class="btn btn-warning btn-sm" data-confirm-message="Revoke and rebuild ALL <?php echo intval($ovpnFlash['pkg_count']); ?> existing client package(s) with the new server address? Old packages will stop working immediately.">
+                    <button type="submit" class="btn btn-warning btn-sm" data-confirm-message="Revoke and rebuild ALL <?php echo intval($ovpnFlash['pkg_count']); ?> existing client package(s)?">
                         <i class="fa fa-refresh"></i> Revoke & Rebuild All (<?php echo intval($ovpnFlash['pkg_count']); ?>)
                     </button>
                 </form>
@@ -1243,7 +1193,7 @@ if (file_exists($logFile)) {
         </div>
     <?php endif; ?>
 
-    <!-- Top Layout Grid: Server Settings & Connected Clients -->
+    <!-- Top Layout Grid -->
     <div class="row">
         <div class="col-md-6">
             <div class="panel panel-default">
@@ -1260,13 +1210,13 @@ if (file_exists($logFile)) {
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 11px; visibility: hidden; display: block; margin-bottom: 5px;">Action</label>
-                                <button type="button" class="btn btn-default btn-sm" onclick="setPrivateIp()" style="width: 95px; height: 34px; padding: 4px 6px; font-size: 13px;" title="Auto-fill Local LAN IP">
+                                <button type="button" class="btn btn-default btn-sm" onclick="setPrivateIp()" style="width: 95px; height: 34px; padding: 4px 6px; font-size: 13px;">
                                     <i class="fa fa-sitemap"></i> Private IP
                                 </button>
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 11px; visibility: hidden; display: block; margin-bottom: 5px;">Action</label>
-                                <button type="button" class="btn btn-default btn-sm" onclick="fetchPublicIp()" style="width: 95px; height: 34px; padding: 4px 6px; font-size: 13px;" title="Auto-fill WAN IP">
+                                <button type="button" class="btn btn-default btn-sm" onclick="fetchPublicIp()" style="width: 95px; height: 34px; padding: 4px 6px; font-size: 13px;">
                                     <i class="fa fa-globe"></i> Public IP
                                 </button>
                             </div>
@@ -1296,7 +1246,7 @@ if (file_exists($logFile)) {
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 3px;">Client IPs</label>
-                                <div class="well well-sm" id="client_ip_count_box" style="margin-bottom: 0; padding: 6px 10px; height: 34px; font-size: 11px; font-family: monospace; font-weight: bold; background: #f8f9fa; border-color: #ccc; white-space: nowrap; text-align: center;" title="Usable client addresses in this block, after the network/broadcast addresses and the one address OpenVPN reserves for itself">
+                                <div class="well well-sm" id="client_ip_count_box" style="margin-bottom: 0; padding: 6px 10px; height: 34px; font-size: 11px; font-family: monospace; font-weight: bold; background: #f8f9fa; border-color: #ccc; white-space: nowrap; text-align: center;">
                                     <span id="client_ip_count"><?php echo (int)$currentClientIpCount; ?></span>
                                 </div>
                             </div>
@@ -1311,26 +1261,49 @@ if (file_exists($logFile)) {
                 </div>
             </div>
 
+            <!-- Build Provisioning Package Panel -->
             <div class="panel panel-default">
-                <div class="panel-heading" style="display: flex; align-items: center; padding: 10px 15px;"><h3 class="panel-title" style="margin: 0;"><i class="fa fa-cube"></i> Build Provisioning Package (vpn.tar)</h3></div>
+                <div class="panel-heading" style="display: flex; align-items: center; padding: 10px 15px;">
+                    <h3 class="panel-title" style="margin: 0;"><i class="fa fa-cube"></i> Build Provisioning Package (vpn.tar)</h3>
+                </div>
                 <div class="panel-body">
                     <form method="post" action="config.php?display=ovpn_mgr">
                         <input type="hidden" name="action" value="generate_package">
                         <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
-                        <div style="display: flex; align-items: flex-end; gap: 30px; margin-bottom: 10px; flex-wrap: wrap;">
+                        
+                        <div style="display: flex; align-items: flex-end; gap: 15px; margin-bottom: 10px; flex-wrap: wrap;">
+                            <!-- Extension Input with Icon Overlay -->
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 5px;">Extension</label>
-                                <input type="text" name="ext" class="form-control" placeholder="101" required style="width: 130px; height: 34px;">
+                                <div class="select-input-container">
+                                    <input type="text" name="ext" list="ext_list" class="form-control" placeholder="Select or type..." required autocomplete="off" style="width: 160px; height: 34px;">
+                                </div>
+                                <datalist id="ext_list">
+                                    <?php foreach ($available_extensions as $e_num => $e_label): ?>
+                                        <option value="<?php echo htmlspecialchars($e_num); ?>"><?php echo htmlspecialchars($e_label); ?></option>
+                                    <?php endforeach; ?>
+                                </datalist>
                             </div>
+
+                            <!-- Phone MAC Address Input with Icon Overlay -->
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 5px;">Phone MAC Address</label>
-                                <input type="text" name="mac" class="form-control" placeholder="00155D010203" required style="width: 190px; height: 34px;">
+                                <div class="select-input-container">
+                                    <input type="text" name="mac" list="mac_list" class="form-control" placeholder="Select or type..." required autocomplete="off" style="width: 200px; height: 34px;">
+                                </div>
+                                <datalist id="mac_list">
+                                    <?php foreach ($available_macs as $m_raw => $m_label): ?>
+                                        <option value="<?php echo htmlspecialchars($m_raw); ?>"><?php echo htmlspecialchars($m_label); ?></option>
+                                    <?php endforeach; ?>
+                                </datalist>
                             </div>
                         </div>
-                        <div class="well well-sm" style="font-size: 11px; margin-bottom: 10px; padding: 5px; color: #555; max-width: 350px;">
+
+                        <div class="well well-sm" style="font-size: 11px; margin-bottom: 10px; padding: 5px; color: #555; max-width: 375px;">
                             Package will target OpenVPN <strong><?php echo htmlspecialchars($currentServerIp); ?>:<?php echo htmlspecialchars($currentPort); ?></strong> and SIP Gateway <strong><?php echo htmlspecialchars($currentHostIp); ?>:5060</strong>
                         </div>
-                        <button type="submit" class="btn btn-success btn-block" style="max-width: 350px;">
+                        
+                        <button type="submit" class="btn btn-success btn-block" style="max-width: 375px;">
                             <i class="fa fa-plus"></i> Generate Keys & Build Package
                         </button>
                     </form>
@@ -1341,7 +1314,6 @@ if (file_exists($logFile)) {
         <div class="col-md-6">
             <div class="panel panel-default">
                 <div class="panel-heading"><h3 class="panel-title"><i class="fa fa-users"></i> Connected OpenVPN Clients</h3></div>
-                <!-- Grows to fit content up to ~20 rows (thead ~41px + 20 * ~42px), then scrolls. -->
                 <div class="panel-body" style="padding: 0; max-height: 300px; overflow-y: auto;">
                     <table class="table table-striped table-bordered" style="margin-bottom: 0; font-size: 12px;">
                         <thead>
@@ -1370,25 +1342,23 @@ if (file_exists($logFile)) {
                         <i class="fa fa-key"></i> Manage / Revoke Keys (<?php echo count($issuedCertFiles); ?>)
                     </button>
                 </div>
-                <!-- Grows to fit content up to ~20 rows (thead ~33px + 20 * ~35px), then scrolls. -->
                 <div class="panel-body" style="padding: 0; max-height: 490px; overflow-y: auto;">
                     <?php if (empty($createdPackages)): ?>
                         <div style="padding: 20px; text-align: center;" class="text-muted">No provisioning packages have been generated yet.</div>
                     <?php else: ?>
                         <table class="table table-striped table-bordered" style="margin-bottom: 0; table-layout: fixed; width: 100%;">
-
-<colgroup>
-        <col style="width: 100px;"> <!-- Locks Left Cell (Extension) -->
-        <col style="width: 160px;">  <!-- Right Cell fills remaining space (MAC) -->
-        <col style="width: auto;"> <!-- Date Created -->
-        <col style="width: 165px;"> <!-- Actions -->
-    </colgroup>
+                            <colgroup>
+                                <col style="width: 100px;">
+                                <col style="width: 160px;">
+                                <col style="width: auto;">
+                                <col style="width: 165px;">
+                            </colgroup>
 
                             <thead>
                                 <tr>
                                     <th colspan="2" style="text-align: center;">Extension</th>
                                     <th style="width: auto; text-align: center;">Date Created</th>
-                                    <th style="width: 130px; text-align: center;">Actions</th>
+                                    <th style="width: 165px; text-align: center;">Actions</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -1396,23 +1366,19 @@ if (file_exists($logFile)) {
     $filename = basename($pkgPath);
     $downloadUrl = "/PhoneSettings/vpnkeys/" . rawurlencode($filename);
     
-    // Split filename by underscores
     $parts = explode('_', $filename);
     $pkgExt = '';
     $pkgMac = '';
 
-    // Standard naming format: {MAC}_{EXT}_{TOKEN}_ovpn.tar or {MAC}_{EXT}_ovpn.tar
     if (count($parts) >= 3 && end($parts) === 'ovpn.tar' || strpos($filename, '_ovpn.tar') !== false) {
         $pkgMac = strtoupper($parts[0]);
         $pkgExt = $parts[1];
     } else {
-        // Fallback positional check
         $pkgMac = !empty($parts[0]) ? strtoupper($parts[0]) : '';
         $pkgExt = !empty($parts[1]) ? $parts[1] : '';
     }
 ?>
     <tr>
-        <!-- Left Cell: Extension -->
         <td style="text-align: left; vertical-align: middle; font-size: 14px; cursor: default; padding-left: 15px; border-right: none;" 
             title="<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>">
             <strong>
@@ -1420,7 +1386,6 @@ if (file_exists($logFile)) {
             </strong>
         </td>
 
-        <!-- Right Cell: MAC Address (Populates whatever string was saved) -->
         <td style="text-align: left; vertical-align: middle; font-size: 14px; cursor: default; padding-left: 5px; border-left: none;" 
             title="<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>">
             <strong>
@@ -1431,6 +1396,9 @@ if (file_exists($logFile)) {
         <td style="text-align: center; vertical-align: middle; font-size: 12px;"><?php echo date("Y-m-d H:i", filemtime($pkgPath)); ?></td>
         <td style="text-align: center; vertical-align: middle; padding: 4px 2px;">
             <div style="display: flex; justify-content: center; align-items: center; gap: 3px;">
+                <button type="button" class="btn btn-xs btn-info" title="Edit Package Details" onclick="openEditPackageModal('<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgExt, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgMac, ENT_QUOTES); ?>')">
+                    <i class="fa fa-pencil"></i>
+                </button>
                 <a href="<?php echo htmlspecialchars($downloadUrl); ?>" class="btn btn-xs btn-primary" download title="Download Package">
                     <i class="fa fa-download"></i>
                 </a>
@@ -1455,15 +1423,50 @@ if (file_exists($logFile)) {
     </div>
 </div>
 
+<!-- Modal: Edit Archive -->
+<div class="modal fade" id="editPackageModal" tabindex="-1" role="dialog" aria-labelledby="editPackageModalLabel">
+    <div class="modal-dialog" role="document" style="width: 420px;">
+        <div class="modal-content">
+            <form method="post" action="config.php?display=ovpn_mgr" id="editPackageForm">
+                <input type="hidden" name="action" value="edit_package">
+                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
+                <input type="hidden" name="old_pkg" id="edit_old_pkg" value="">
 
-<!-- Hidden form used by the bulk Download/Revoke Selected buttons above -->
+                <div class="modal-header">
+                    <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+                    <h4 class="modal-title" id="editPackageModalLabel"><i class="fa fa-pencil"></i> Edit Provisioning Archive</h4>
+                </div>
+                <div class="modal-body">
+                    <div class="form-group">
+                        <label for="edit_ext">Extension:</label>
+                        <div class="select-input-container">
+                            <input type="text" name="ext" id="edit_ext" list="ext_list" class="form-control" required autocomplete="off">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="edit_mac">MAC Address:</label>
+                        <div class="select-input-container">
+                            <input type="text" name="mac" id="edit_mac" list="mac_list" class="form-control" required autocomplete="off">
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-default" data-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary"><i class="fa fa-save"></i> Rebuild & Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Hidden form for bulk Download/Revoke -->
 <form id="bulkPkgForm" method="post" action="config.php?display=ovpn_mgr" style="display:none;">
     <input type="hidden" name="action" id="bulkPkgAction" value="">
     <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
     <div id="bulkPkgInputs"></div>
 </form>
 
-<!-- Modal: Sign Module (no password needed - kept only for consistency) -->
+<!-- Modal: Sign Module -->
 <div class="modal fade" id="signModal" tabindex="-1" role="dialog" aria-labelledby="signModalLabel">
     <div class="modal-dialog" role="document">
         <div class="modal-content">
@@ -1475,9 +1478,9 @@ if (file_exists($logFile)) {
                     <h4 class="modal-title" id="signModalLabel"><i class="fa fa-key"></i> Sign Module</h4>
                 </div>
                 <div class="modal-body">
-                    <p>This re-hashes the module's own files and clears the tamper/signature warning for <code>ovpn_mgr</code>. No root privilege is required for this step.</p>
+                    <p>This re-hashes the module's own files and clears the tamper/signature warning for <code>ovpn_mgr</code>.</p>
                     <div id="signProgressContainer" style="display: none; margin-top: 15px;">
-                        <label><i class="fa fa-spinner fa-spin"></i> Signing module and reloading framework... Please wait.</label>
+                        <label><i class="fa fa-spinner fa-spin"></i> Signing module... Please wait.</label>
                         <div class="progress progress-striped active" style="margin-bottom: 0;">
                             <div class="progress-bar progress-bar-danger" role="progressbar" style="width: 100%;"></div>
                         </div>
@@ -1509,15 +1512,12 @@ if (file_exists($logFile)) {
                 <?php if (empty($issuedCertFiles)): ?>
                     <div style="padding: 20px;" class="text-muted">No issued client certificates found in PKI storage.</div>
                 <?php else: ?>
-                    <!-- Fixed to ~10 rows (thead ~41px + 10 * ~42px row height); the
-                         rest scrolls. Header stays pinned via position:sticky so
-                         columns stay labeled while scrolling. -->
                     <div style="max-height: 461px; overflow-y: auto;">
                         <table class="table table-striped table-bordered" style="margin-bottom: 0;">
                             <thead>
                                 <tr>
                                     <th style="width: 26px; text-align: center; position: sticky; top: 0; background: #d6e4dd; z-index: 1;">
-                                        <input type="checkbox" id="pkgSelectAll" title="Select all (rows with a package only)" onchange="toggleAllOvpnPkgCheckboxes(this)">
+                                        <input type="checkbox" id="pkgSelectAll" title="Select all" onchange="toggleAllOvpnPkgCheckboxes(this)">
                                     </th>
                                     <th style="position: sticky; top: 0; background: #d6e4dd; z-index: 1;">Common Name (Ext)</th>
                                     <th style="position: sticky; top: 0; background: #d6e4dd; z-index: 1;">Target (Host:Port)</th>
@@ -1564,7 +1564,7 @@ if (file_exists($logFile)) {
                                                 <input type="hidden" name="action" value="revoke_cert">
                                                 <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
                                                 <input type="hidden" name="revoke_ext" value="<?php echo htmlspecialchars($extName); ?>">
-                                                <button type="submit" class="btn btn-xs btn-danger" data-confirm-message="REVOKE Extension <?php echo htmlspecialchars($extName, ENT_QUOTES); ?>? This will block the phone from connecting and update the CRL."><i class="fa fa-ban"></i> Revoke & Block</button>
+                                                <button type="submit" class="btn btn-xs btn-danger" data-confirm-message="REVOKE Extension <?php echo htmlspecialchars($extName, ENT_QUOTES); ?>?"><i class="fa fa-ban"></i> Revoke & Block</button>
                                             </form>
                                         </td>
                                     </tr>
@@ -1613,11 +1613,7 @@ if (file_exists($logFile)) {
     </div>
 </div>
 
-<!-- Generic "please wait" progress modal for actions that take a few
-     seconds (start/stop/save/revoke/bulk actions). These are plain form
-     POSTs that redirect on completion (no AJAX progress %), so this is
-     shown right before the form submits and stays up until the page
-     navigates away. -->
+<!-- Progress Overlay -->
 <div class="modal fade ovpn-vcenter" id="ovpnProgressModal" tabindex="-1" role="dialog" data-backdrop="static" data-keyboard="false">
     <div class="modal-dialog" role="document" style="width: 360px;">
         <div class="modal-content" style="text-align: center; padding: 28px 24px;">
@@ -1630,9 +1626,26 @@ if (file_exists($logFile)) {
 </div>
 
 <style>
-/* Bootstrap 3 has no built-in vertical centering for modals - this
-   centers the dialog in the viewport instead of it appearing pinned
-   near the top, and applies to the confirm modal + progress modal. */
+/* Styled Combo-Box Appearance for Datalist Inputs */
+.select-input-container {
+    position: relative;
+    display: inline-block;
+}
+.select-input-container .form-control {
+    padding-right: 28px;
+}
+.select-input-container::after {
+    content: "\f0d7"; /* FontAwesome caret-down */
+    font-family: FontAwesome;
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    pointer-events: none;
+    color: #666;
+    font-size: 13px;
+}
+
 .modal.ovpn-vcenter {
     text-align: center;
     padding: 0 !important;
@@ -1650,8 +1663,6 @@ if (file_exists($logFile)) {
     vertical-align: middle;
     margin: 0 auto;
 }
-/* Wider, shorter "16:9-ish" proportions instead of the default narrow/
-   tall modal-sm box, per request. */
 #ovpnConfirmModal .modal-dialog {
     width: 480px;
 }
@@ -1666,6 +1677,13 @@ if (file_exists($logFile)) {
 
 <script>
 var OVPN_CSRF = <?php echo json_encode($csrfToken); ?>;
+
+function openEditPackageModal(filename, currentExt, currentMac) {
+    $('#edit_old_pkg').val(filename);
+    $('#edit_ext').val(currentExt);
+    $('#edit_mac').val(currentMac);
+    $('#editPackageModal').modal('show');
+}
 
 function showOvpnProgress(label) {
     $('#ovpnProgressLabel').text(label || 'Working, please wait...');
@@ -1697,9 +1715,6 @@ function recalculateRange() {
     var longMask = ipToLong(netmask);
     var $notice = $('#host_ip_live_notice');
 
-    // Usable client IPs: total host addresses minus network + broadcast,
-    // minus 1 more for the address OpenVPN's "server" directive always
-    // reserves for itself.
     var clientIpCount = Math.max(0, (Math.pow(2, 32 - cidr) - 2) - 1);
     $('#client_ip_count').text(clientIpCount);
 
@@ -1835,13 +1850,6 @@ function copySetupCommand() {
     }
 }
 
-// Shared confirmation modal for destructive actions. Deliberately not
-// window.confirm(): Chrome (and others) offer a "Don't allow this page
-// to ask again" checkbox on repeated native dialogs, and checking it
-// makes every future confirm() call return false immediately with no
-// visible dialog at all - silently blocking revoke/delete forever until
-// the browser's per-site permission is reset by hand. A modal we render
-// ourselves can't be suppressed that way.
 function showOvpnConfirm(message, onConfirm) {
     var $modal = $('#ovpnConfirmModal');
     if ($modal.length === 0) {
@@ -1880,9 +1888,6 @@ $(document).on('click', 'button[data-confirm-message], a[data-confirm-message]',
     });
 });
 
-// Non-destructive submits (Start/Restart service, Save Settings) don't go
-// through the confirm modal above, but still take a few seconds - show
-// the same progress overlay directly on submit.
 $('#ovpnServiceForm').on('submit', function() {
     showOvpnProgress('Applying service command, please wait...');
 });
@@ -1925,14 +1930,12 @@ function submitOvpnBulkPkgAction(action) {
 
     if (action === 'bulk_revoke_packages') {
         showOvpnConfirm(
-            'REVOKE and delete ' + selected.length + ' selected package(s)? This blocks those phones from ' +
-            'connecting to the VPN and cannot be undone.',
+            'REVOKE and delete ' + selected.length + ' selected package(s)?',
             doSubmit
         );
     } else if (action === 'bulk_revoke_rebuild_packages') {
         showOvpnConfirm(
-            'REVOKE and rebuild ' + selected.length + ' selected package(s) with the current server address? ' +
-            'The old package(s) will stop working immediately and a fresh one will be issued in their place.',
+            'REVOKE and rebuild ' + selected.length + ' selected package(s) with current settings?',
             doSubmit
         );
     } else {
@@ -1958,6 +1961,7 @@ function fetchOpenVPNLog() {
         }
     });
 }
+
 function addLogPageBreak() {
     $.ajax({
         url: 'config.php', type: 'POST',

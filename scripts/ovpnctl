@@ -156,48 +156,8 @@ case "$cmd" in
       || "$IPTABLES_BIN" -t nat -I POSTROUTING 1 -s "$cidr" -o "$iface" -j MASQUERADE -m comment --comment "$NAT_MARK"
     ;;
 
-  port-sync)
-    # port-sync <port>
-    # STANDALONE-FIREWALL FALLBACK ONLY - used when the FreePBX Firewall
-    # module isn't present (a plain FreePBX-on-Debian/Ubuntu box with
-    # nothing but stock iptables, no Sysadmin/Firewall). Creates/maintains
-    # a dedicated 'ovpn_mgr' chain, jumped from INPUT, containing exactly
-    # one ACCEPT rule for the current OpenVPN UDP port. Idempotent: the
-    # chain is flushed and rebuilt rather than accumulating a duplicate
-    # rule every time the port changes. This never touches any other
-    # chain, rule, or the box's default policy - it only ever adds this
-    # one jump + this one rule inside its own chain.
-    [ -n "$IPTABLES_BIN" ] || { echo "iptables not found" >&2; exit 1; }
-    port="${1:?missing port}"
-    is_port "$port" || { echo "invalid port" >&2; exit 1; }
-
-    "$IPTABLES_BIN" -N ovpn_mgr 2>/dev/null || true
-    "$IPTABLES_BIN" -C INPUT -j ovpn_mgr 2>/dev/null || "$IPTABLES_BIN" -I INPUT -j ovpn_mgr
-    "$IPTABLES_BIN" -F ovpn_mgr
-    "$IPTABLES_BIN" -A ovpn_mgr -p udp --dport "$port" -j ACCEPT -m comment --comment "OVPN_MGR_PORT"
-
-    mkdir -p "$STATE_DIR"
-    printf '%s\n' "$port" > "${STATE_DIR}/port-state"
-    chmod 600 "${STATE_DIR}/port-state"
-    ;;
-
-  port-restore)
-    # Run at boot (same service as nat-restore). No-op if port-sync was
-    # never run on this box - i.e. a no-op on any system where FreePBX's
-    # Firewall module handled the port instead.
-    [ -f "${STATE_DIR}/port-state" ] || exit 0
-    [ -n "$IPTABLES_BIN" ] || exit 0
-    read -r port < "${STATE_DIR}/port-state"
-    is_port "$port" || exit 0
-
-    "$IPTABLES_BIN" -N ovpn_mgr 2>/dev/null || true
-    "$IPTABLES_BIN" -C INPUT -j ovpn_mgr 2>/dev/null || "$IPTABLES_BIN" -I INPUT -j ovpn_mgr
-    "$IPTABLES_BIN" -F ovpn_mgr
-    "$IPTABLES_BIN" -A ovpn_mgr -p udp --dport "$port" -j ACCEPT -m comment --comment "OVPN_MGR_PORT"
-    ;;
-
   *)
-    echo "usage: ovpnctl {check|start|stop|ipforward-on|nat-sync|nat-restore|port-sync|port-restore}" >&2
+    echo "usage: ovpnctl {check|start|stop|ipforward-on|nat-sync|nat-restore}" >&2
     exit 1
     ;;
 esac

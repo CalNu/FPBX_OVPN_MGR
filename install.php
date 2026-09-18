@@ -207,17 +207,71 @@ if (file_exists($signerScript)) {
     exec("/usr/bin/php " . escapeshellarg($signerScript) . " " . escapeshellarg($module_root) . " >/dev/null 2>&1");
 }
 
-// 6. Prepare (but do not activate) the privileged helper. The wrapper is
-//    left owned by the web user with mode 0755 so it can be inspected;
-//    it grants nothing until the admin runs setup-root.sh as root, which
-//    re-chowns it to root:asterisk 0750 and installs the matching
-//    sudoers rule. Nothing here writes to /etc/sudoers.d or requires a
-//    root password.
+// 6. Prepare (but do not activate) the privileged helper(s). Left owned
+//    by the web user with mode 0755 so they can be inspected/used
+//    directly as-is (generate_client.sh doesn't itself need elevated
+//    privilege); running setup-root.sh as root additionally re-chowns
+//    them to root:asterisk 0750 and installs a matching sudoers rule,
+//    needed only if an external caller invokes them with "sudo".
+//    Nothing here writes to /etc/sudoers.d or requires a root password.
 $ovpnctl = "{$module_root}/scripts/ovpnctl";
+$genClient = "{$module_root}/scripts/generate_client.sh";
 $setupScript = "{$module_root}/scripts/setup-root.sh";
 if (file_exists($ovpnctl)) {
     @chmod($ovpnctl, 0755);
 }
+if (file_exists($genClient)) {
+    @chmod($genClient, 0755);
+}
 if (file_exists($setupScript)) {
     @chmod($setupScript, 0755);
 }
+
+// ============================================================================
+// 7. Isolated Directory Overrides (Prevents 403 Forbidden)
+// ============================================================================
+// Directory listing is enabled for provisioning/admin convenience on the LAN,
+// but access is restricted to private (RFC1918) address space plus loopback so
+// these folders (which contain MAC-named cfg files with SIP secrets) are never
+// reachable from outside the intranet, even if this host is ever dual-homed or
+// accidentally port-forwarded. Adjust the ranges below if your LAN uses a
+// different scheme (e.g. add more specific subnets, or remove ranges you don't use).
+$htaccess_content = <<<EOT
+Options +Indexes
+DirectoryIndex disabled
+
+<IfModule mod_authz_core.c>
+    Require ip 127.0.0.1
+    Require ip ::1
+    Require ip 10.0.0.0/8
+    Require ip 172.16.0.0/12
+    Require ip 192.168.0.0/16
+    Require ip fc00::/7
+</IfModule>
+<IfModule !mod_authz_core.c>
+    Order deny,allow
+    Deny from all
+    Allow from 127.0.0.1
+    Allow from 10.0.0.0/8
+    Allow from 172.16.0.0/12
+    Allow from 192.168.0.0/16
+</IfModule>
+
+IndexIgnore openvpn ovpn_mgr vpnkeys yealink_epm
+
+EOT;
+
+$target_htaccess_files = [
+    "/var/www/html/PhoneSettings/.htaccess",
+    "/tftpboot/.htaccess"
+];
+
+foreach ($target_htaccess_files as $htaccess_path) {
+    if (!file_exists($htaccess_path) || file_get_contents($htaccess_path) !== $htaccess_content) {
+        @file_put_contents($htaccess_path, $htaccess_content);
+        @chown($htaccess_path, 'asterisk');
+        @chmod($htaccess_path, 0644);
+    }
+}
+
+
