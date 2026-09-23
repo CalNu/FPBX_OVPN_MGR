@@ -94,6 +94,18 @@ case "$cmd" in
     [ -n "$OPENVPN_BIN" ] || { echo "openvpn binary not found" >&2; exit 1; }
     mkdir -p "$LOG_DIR"
     touch "$LOG_FILE"
+
+    # Kernel IP forwarding is otherwise only turned on by setup-root.sh at
+    # initial install and by the GUI when the VPN subnet is changed in
+    # Settings - neither of which runs on a plain Start/Restart, or at boot
+    # (ovpn-mgr-openvpn.service calls this "start" case directly, before
+    # PHP ever runs). If forwarding gets reset by anything outside this
+    # module (a reboot racing the sysctl.d file, a competing sysctl.d entry,
+    # a hardening tool, etc.), the daemon would otherwise come back up
+    # passing no traffic with no obvious error. Cheap and idempotent, so
+    # just ensure it's on every time OpenVPN starts, from any trigger.
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-ovpn-mgr.conf
     if pgrep -f -- "--config ${CONF}\b" >/dev/null 2>&1; then
       echo "already running"
       exit 0

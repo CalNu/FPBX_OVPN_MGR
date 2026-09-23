@@ -118,11 +118,13 @@ fi
 install -m 0644 -o root -g root "$TMP_CHOWN_CONF" "$CHOWN_CONF"
 rm -f "$TMP_CHOWN_CONF"
 echo "==> Registered ${WRAPPER} with fwconsole chown (${CHOWN_CONF})"
-if command -v fwconsole >/dev/null 2>&1; then
-    fwconsole chown >/dev/null 2>&1 || true
-fi
-# Re-apply directly too, in case fwconsole isn't on PATH or the version in
-# use predates [custom] support in freepbx_chown.conf.
+# Apply the perms directly instead of shelling out to `fwconsole chown` here:
+# that command does a full recursive rescan/rechown of admin/modules and can
+# take a minute or more, and it buys us nothing extra right now since the
+# direct chown/chmod below produces the identical end state immediately.
+# The [custom] entry we just wrote is what matters going forward - any
+# *future* fwconsole chown run (cron, GUI actions, or our own
+# ovpn-mgr-fixperms.service at boot) will already honor it.
 chown root:asterisk "$WRAPPER"
 chmod 750 "$WRAPPER"
 

@@ -2,6 +2,7 @@
 • Moved the fwconsole reload to freepbx built in apply config after Save Settings & Restart Daemon to speed up changes.
 • Fixed corrupted text on Cipher selections and notices.
 • Change Local IP and Public IP buttons to pure icons with hoverover text
+• Fixed bug where starting the service wasn't starting Kernel IP Forwarding (net.ipv4.ip_forward) unless you change the host or cidr.
 
 2.50
 • Fixed phones on VPN not accessible using their lan ip, only their OpenVPN IP (push {serverIP} 255.255.255.255).
