@@ -782,9 +782,11 @@ if (isset($_POST['action']) && $_POST['action'] === 'rebuild_all_packages') {
             continue;
         }
 
+        // Read the cipher before revoking - revokeExtension() deletes the package.
+        $pkgCipher = getPackageCipher($pkgPath);
         revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $ext);
         @unlink($pkgPath);
-        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'])) {
+        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], $pkgCipher)) {
             $rebuilt++;
         }
     }
@@ -919,6 +921,26 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_packages') {
     exit();
 }
 
+// Rebuild vpn.cnf only - keeps each phone's existing key/cert and cipher (no revoke).
+if (isset($_POST['action']) && in_array($_POST['action'], ['bulk_rebuild_config_packages', 'rebuild_config_all'], true)) {
+    csrf_require();
+    $settings = getActiveServerSettings($serverConf);
+
+    if ($_POST['action'] === 'rebuild_config_all') {
+        $names = array_map('basename', glob("{$pkgDir}/*_ovpn.tar") ?: []);
+    } else {
+        $names = [];
+        foreach ((array)($_POST['pkgs'] ?? []) as $name) {
+            $valid = ovpnValidateSelectedPkg($pkgDir, $name);
+            if ($valid !== null) { $names[] = $valid; }
+        }
+    }
+
+    $_SESSION['ovpn_mgr_cfg_rebuild'] = rebuildPackagesConfigOnly($pkiDir, $pkgDir, $baseDir, $settings['ip'], $settings['port'], $names);
+    header("Location: config.php?display=ovpn_mgr");
+    exit();
+}
+
 if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_rebuild_packages') {
     csrf_require();
     $selected = (array)($_POST['pkgs'] ?? []);
@@ -942,9 +964,11 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_rebuild_package
             continue;
         }
 
+        // Read the cipher before revoking - revokeExtension() deletes the package.
+        $pkgCipher = getPackageCipher("{$pkgDir}/{$valid}");
         revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $ext);
         @unlink("{$pkgDir}/{$valid}");
-        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'])) {
+        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], $pkgCipher)) {
             $rebuilt++;
         }
     }
@@ -1118,6 +1142,22 @@ if (file_exists($logFile)) {
     <?php endif; ?>
 
     <?php
+    $ovpnCfgRebuild = $_SESSION['ovpn_mgr_cfg_rebuild'] ?? null;
+    unset($_SESSION['ovpn_mgr_cfg_rebuild']);
+    ?>
+    <?php if (is_array($ovpnCfgRebuild)): ?>
+        <div class="alert <?php echo empty($ovpnCfgRebuild['skipped']) ? 'alert-success' : 'alert-warning'; ?>" style="margin-bottom: 20px;">
+            <i class="fa fa-check-circle"></i>
+            Rebuilt the config for <?php echo intval($ovpnCfgRebuild['rebuilt']); ?> package(s); existing keys and ciphers were kept. Phones need to download the updated package.
+            <?php if (!empty($ovpnCfgRebuild['skipped'])): ?>
+                <br><i class="fa fa-exclamation-triangle"></i>
+                Skipped <?php echo count($ovpnCfgRebuild['skipped']); ?> package(s) whose key/certificate is no longer in the PKI (use Revoke &amp; Rebuild for those):
+                <?php echo htmlspecialchars(implode(', ', $ovpnCfgRebuild['skipped'])); ?>
+            <?php endif; ?>
+        </div>
+    <?php endif; ?>
+
+    <?php
     $ovpnFlash = $_SESSION['ovpn_mgr_flash'] ?? null;
     unset($_SESSION['ovpn_mgr_flash']);
     ?>
@@ -1134,6 +1174,13 @@ if (file_exists($logFile)) {
                     <i class="fa fa-exclamation-triangle"></i>
                     The server address/port changed. <?php echo intval($ovpnFlash['pkg_count']); ?> existing client package(s) still point at the old address.
                 </p>
+                <form method="post" action="config.php?display=ovpn_mgr" style="display:inline;">
+                    <input type="hidden" name="action" value="rebuild_config_all">
+                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
+                    <button type="submit" class="btn btn-default btn-sm" data-confirm-message="Rebuild the config of ALL <?php echo intval($ovpnFlash['pkg_count']); ?> existing client package(s), keeping their keys?">
+                        <i class="fa fa-file-text-o"></i> Rebuild Config, Keep Keys (<?php echo intval($ovpnFlash['pkg_count']); ?>)
+                    </button>
+                </form>
                 <form method="post" action="config.php?display=ovpn_mgr" style="display:inline;">
                     <input type="hidden" name="action" value="rebuild_all_packages">
                     <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
@@ -1176,6 +1223,14 @@ if (file_exists($logFile)) {
                                 <label for="ovpn_port" style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 3px;">Port</label>
                                 <input type="number" class="form-control" id="ovpn_port" name="ovpn_port" value="<?php echo htmlspecialchars($currentPort); ?>" required style="width: 75px; height: 34px; padding: 6px 4px;">
                             </div>
+                        </div>
+
+                        <?php
+                        $serverHostIsIp = (bool) filter_var($currentServerIp, FILTER_VALIDATE_IP);
+                        ?>
+                        <div id="fqdnNotice" class="alert alert-warning" style="font-size: 12px; padding: 8px 10px; margin-bottom: 15px;<?php echo $serverHostIsIp ? ' display: none;' : ''; ?>">
+                            <i class="fa fa-exclamation-triangle"></i>
+                            <strong>Hostname entered.</strong> Some Yealink phones get stuck on &ldquo;obtaining IP address&rdquo; when <code>vpn.cnf</code> uses a hostname instead of an IP address, apparently because the phone tries to resolve the name before its DHCP lease is complete. If a phone hangs, use the server&rsquo;s IP address here instead, or set that phone to a static IP rather than DHCP.
                         </div>
 
                         <div style="display: flex; align-items: flex-end; gap: 10px; margin-bottom: 6px; flex-wrap: wrap;">
@@ -1346,18 +1401,7 @@ if (file_exists($logFile)) {
     }
 
     // Read the archive's current cipher so Edit opens with its existing value.
-    $pkgCipher = 'AES-128-CBC';
-    $tarConfig = @shell_exec('tar -xOf ' . escapeshellarg($pkgPath) . ' vpn.cnf 2>/dev/null');
-    if (is_string($tarConfig) && preg_match('/^data-ciphers\s+([^\s]+)/m', $tarConfig, $cm)) {
-        $candidateCipher = trim(explode(':', $cm[1])[0]);
-        if (in_array($candidateCipher, ['AES-128-CBC', 'AES-256-CBC', 'AES-128-GCM', 'AES-256-GCM'], true)) {
-            $pkgCipher = $candidateCipher;
-        }
-    } elseif (is_string($tarConfig) && preg_match('/^cipher\s+([^\s]+)/m', $tarConfig, $cm)) {
-        if (in_array(trim($cm[1]), ['AES-128-CBC', 'AES-256-CBC', 'AES-128-GCM', 'AES-256-GCM'], true)) {
-            $pkgCipher = trim($cm[1]);
-        }
-    }
+    $pkgCipher = getPackageCipher($pkgPath);
 ?>
     <tr>
         <td style="text-align: left; vertical-align: middle; font-size: 14px; cursor: default; padding-left: 15px; border-right: none;" 
@@ -1377,10 +1421,10 @@ if (file_exists($logFile)) {
         <td style="text-align: center; vertical-align: middle; font-size: 12px;"><?php echo date("Y-m-d H:i", filemtime($pkgPath)); ?></td>
         <td style="text-align: center; vertical-align: middle; padding: 4px 2px;">
             <div style="display: flex; justify-content: center; align-items: center; gap: 3px;">
-                <button type="button" class="btn btn-xs btn-info" title="Edit Package Details" onclick="openEditPackageModal('<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgExt, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgMac, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgCipher, ENT_QUOTES); ?>')">
+                <button type="button" class="btn btn-xs btn-info" style="padding: 3px;" title="Edit Package Details" onclick="openEditPackageModal('<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgExt, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgMac, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgCipher, ENT_QUOTES); ?>')">
                     <i class="fa fa-pencil"></i>
                 </button>
-                <a href="<?php echo htmlspecialchars($downloadUrl); ?>" class="btn btn-xs btn-primary" download title="Download Package">
+                <a href="<?php echo htmlspecialchars($downloadUrl); ?>" style="padding: 3px; font-size: 16px;" class="btn btn-xs btn-primary" download title="Download Package">
                     <i class="fa fa-download"></i>
                 </a>
                 <form method="post" action="config.php?display=ovpn_mgr" style="display:inline;">
@@ -1579,6 +1623,9 @@ if (file_exists($logFile)) {
             <div class="modal-footer" style="display: flex; justify-content: flex-start; gap: 6px; flex-wrap: wrap;">
                 <button type="button" style="height:30px;" id="pkgDownloadSelectedBtn" class="btn btn-primary btn-sm" disabled onclick="submitOvpnBulkPkgAction('bulk_download_packages')">
                     <i class="fa fa-download"></i> Download Selected
+                </button>
+                <button type="button" id="pkgRebuildCfgSelectedBtn" class="btn btn-default btn-sm" disabled title="Rewrites vpn.cnf only; keeps each phone's key and cipher" onclick="submitOvpnBulkPkgAction('bulk_rebuild_config_packages')">
+                    <i class="fa fa-file-text-o"></i> Rebuild Config Selected
                 </button>
                 <button type="button" id="pkgRevokeSelectedBtn" class="btn btn-danger btn-sm" disabled onclick="submitOvpnBulkPkgAction('bulk_revoke_packages')">
                     <i class="fa fa-ban"></i> Revoke Selected
@@ -1788,15 +1835,27 @@ $('#signModalForm').on('submit', function(e) {
     });
 });
 
+function updateFqdnNotice() {
+    var v = ($('#server_ip').val() || '').trim();
+    var isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(v) || v.indexOf(':') !== -1;
+    $('#fqdnNotice').toggle(v !== '' && v !== 'Fetching...' && !isIp);
+}
+$(function() {
+    $('#server_ip').on('input change', updateFqdnNotice);
+});
 function setPrivateIp() {
     $('#server_ip').val(<?php echo json_encode($_SERVER['SERVER_ADDR'] ?? ''); ?>);
+    updateFqdnNotice();
 }
 function fetchPublicIp() {
     $('#server_ip').val('Fetching...');
+    updateFqdnNotice();
     $.get('config.php?display=ovpn_mgr&action=fetch_public_ip', function(ip) {
         $('#server_ip').val(ip.trim());
+        updateFqdnNotice();
     }).fail(function() {
         $('#server_ip').val(<?php echo json_encode($_SERVER['SERVER_ADDR'] ?? ''); ?>);
+        updateFqdnNotice();
     });
 }
 function showOvpnToast(message) {
@@ -1907,7 +1966,7 @@ function toggleAllOvpnPkgCheckboxes(source) {
 function updateOvpnPkgSelection() {
     var $checked = $('.ovpn-pkg-checkbox:checked');
     var total = $('.ovpn-pkg-checkbox').length;
-    $('#pkgDownloadSelectedBtn, #pkgRevokeSelectedBtn, #pkgRebuildSelectedBtn').prop('disabled', $checked.length === 0);
+    $('#pkgDownloadSelectedBtn, #pkgRebuildCfgSelectedBtn, #pkgRevokeSelectedBtn, #pkgRebuildSelectedBtn').prop('disabled', $checked.length === 0);
     $('#pkgSelectedCount').text($checked.length > 0 ? ($checked.length + ' selected') : '');
     $('#pkgSelectAll').prop('checked', total > 0 && $checked.length === total);
 }
@@ -1935,6 +1994,11 @@ function submitOvpnBulkPkgAction(action) {
     if (action === 'bulk_revoke_packages') {
         showOvpnConfirm(
             'REVOKE and delete ' + selected.length + ' selected package(s)?',
+            doSubmit
+        );
+    } else if (action === 'bulk_rebuild_config_packages') {
+        showOvpnConfirm(
+            'Rebuild the config for ' + selected.length + ' selected package(s)? Existing keys and ciphers are kept; the phones just need to download the updated package.',
             doSubmit
         );
     } else if (action === 'bulk_revoke_rebuild_packages') {

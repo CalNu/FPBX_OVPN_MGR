@@ -151,6 +151,13 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
         @copy($clientCrt, "{$keysSubDir}/client.crt");
         @copy($clientKey, "{$keysSubDir}/client.key");
 
+        // Legacy phones (AES-128-CBC) run an OpenVPN build that predates
+        // data-ciphers / data-ciphers-fallback and rejects them as unknown
+        // options, so those two lines are only emitted for other ciphers.
+        $dataCipherLines = ($cipher === "AES-128-CBC")
+            ? ""
+            : "data-ciphers {$cipher}\n" . "data-ciphers-fallback {$cipher}\n";
+
         $vpnCnf = "client\n"
                 . "nobind\n"
                 . "remote {$serverIp} {$port}\n"
@@ -160,8 +167,7 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
                 . "cert /config/openvpn/keys/client.crt\n"
                 . "key /config/openvpn/keys/client.key\n"
                 . "cipher {$cipher}\n"
-                . "data-ciphers {$cipher}\n"
-                . "data-ciphers-fallback {$cipher}\n"
+                . $dataCipherLines
                 . "auth SHA1\n"
                 . "verb 3\n"
                 . "explicit-exit-notify 0\n"
@@ -344,5 +350,79 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
             stopOpenVpnServer($paths['ovpnctl']);
             startOpenVpnServer($paths['ovpnctl'], $paths['serverConf'], $paths['baseDir'], $paths['serverKey']);
         }
+    }
+
+    /**
+     * Extracts [mac, ext] from a generated client package filename
+     * (<mac>_<ext>_ovpn.tar or the older <mac>_<ext>_<8hex>_ovpn.tar).
+     * Returns null for anything else.
+     */
+    function ovpnParsePackageName($filename) {
+        $filename = basename((string)$filename);
+        if (preg_match('/^([a-f0-9]+)_(\d+)_[a-f0-9]{8}_ovpn\.tar$/i', $filename, $m)
+            || preg_match('/^([a-f0-9]+)_(\d+)_ovpn\.tar$/i', $filename, $m)) {
+            return ['mac' => strtolower($m[1]), 'ext' => $m[2]];
+        }
+        return null;
+    }
+
+    /**
+     * Reads the cipher a package's vpn.cnf currently uses. Falls back to
+     * AES-128-CBC if it can't be read or isn't one of the allowed ciphers.
+     */
+    function getPackageCipher($pkgPath) {
+        $allowed = ['AES-128-CBC', 'AES-256-CBC', 'AES-128-GCM', 'AES-256-GCM'];
+        $cnf = @shell_exec('tar -xOf ' . escapeshellarg($pkgPath) . ' vpn.cnf 2>/dev/null');
+        if (is_string($cnf)) {
+            if (preg_match('/^cipher\s+([^\s]+)/m', $cnf, $m) && in_array(trim($m[1]), $allowed, true)) {
+                return trim($m[1]);
+            }
+            if (preg_match('/^data-ciphers\s+([^\s]+)/m', $cnf, $m)) {
+                $first = trim(explode(':', $m[1])[0]);
+                if (in_array($first, $allowed, true)) {
+                    return $first;
+                }
+            }
+        }
+        return 'AES-128-CBC';
+    }
+
+    /**
+     * Rewrites vpn.cnf and re-tars existing client packages WITHOUT revoking
+     * anything: each phone keeps its current key and certificate, and keeps
+     * the cipher its package already uses. Only the server address/port and
+     * the config template change. Packages whose key/cert are no longer in
+     * the PKI are skipped (rebuilding them would silently issue a new key).
+     * Returns ['rebuilt' => int, 'skipped' => [package filenames]].
+     */
+    function rebuildPackagesConfigOnly($pkiDir, $pkgDir, $baseDir, $serverIp, $port, array $pkgFilenames) {
+        $rebuilt = 0;
+        $skipped = [];
+        $seen = [];
+        foreach ($pkgFilenames as $name) {
+            $name = basename((string)$name);
+            $id = ovpnParsePackageName($name);
+            $pkgPath = "{$pkgDir}/{$name}";
+            if ($id === null || !file_exists($pkgPath)) {
+                continue;
+            }
+            $key = $id['mac'] . '_' . $id['ext'];
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
+
+            if (!file_exists("{$pkiDir}/issued/{$id['ext']}.crt") || !file_exists("{$pkiDir}/private/{$id['ext']}.key")) {
+                $skipped[] = $name;
+                continue;
+            }
+            $cipher = getPackageCipher($pkgPath);
+            if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $id['ext'], $id['mac'], $serverIp, $port, $cipher)) {
+                $rebuilt++;
+            } else {
+                $skipped[] = $name;
+            }
+        }
+        return ['rebuilt' => $rebuilt, 'skipped' => $skipped];
     }
 }
