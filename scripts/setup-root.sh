@@ -188,8 +188,19 @@ fi
 # generated sip.conf/pjsip.conf. The helper preserves existing Local Networks.
 SIP_LOCALNET_HELPER="${MODULE_DIR}/scripts/sip-localnet-sync.php"
 if [ -f "$OPENVPN_CONF" ] && [ -f "$SIP_LOCALNET_HELPER" ] && command -v php >/dev/null 2>&1; then
-    SIP_SYNC_OUTPUT="$(php "$SIP_LOCALNET_HELPER" "$OPENVPN_CONF" 2>&1)"
-    SIP_SYNC_RC=$?
+    # The php helper can legitimately exit non-zero even after it already
+    # succeeded (e.g. a FreePBX shutdown-function warning fired after
+    # setConfig/reload went through) - that's exactly why the
+    # SIP_LOCALNET_SYNC_OK marker check below exists. But a plain
+    # VAR="$(cmd)" assignment where cmd exits non-zero trips `set -e`
+    # immediately, killing the whole script right here - before the marker
+    # check ever runs, and silently (nothing printed, since the output is
+    # inside the command substitution). That silently skipped every step
+    # after this one on every run where the helper returned non-zero,
+    # including persisting net.ipv4.ip_forward and installing/starting the
+    # systemd units. Capture the exit code without letting it abort us.
+    SIP_SYNC_RC=0
+    SIP_SYNC_OUTPUT="$(php "$SIP_LOCALNET_HELPER" "$OPENVPN_CONF" 2>&1)" || SIP_SYNC_RC=$?
     # Print helper output without interpreting its status as the sole signal:
     # FreePBX may emit a shutdown warning after setConfig/reload succeeded.
     printf '%s\n' "$SIP_SYNC_OUTPUT" | sed '/^SIP_LOCALNET_SYNC_OK$/d'
