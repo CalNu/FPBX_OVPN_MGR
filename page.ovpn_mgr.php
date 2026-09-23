@@ -5,8 +5,18 @@ if (!defined('FREEPBX_IS_AUTH')) { die('No direct script access allowed'); }
 // Paths
 // ============================================================================
 $ampWebRoot  = rtrim($amp_conf['AMPWEBROOT'] ?? '/var/www/html', '/');
-$baseDir     = "{$ampWebRoot}/PhoneSettings/openvpn";
-$pkgDir      = "{$ampWebRoot}/PhoneSettings/vpnkeys";
+$tftpDir     = '/tftpboot';
+$phoneSettingsDir = "{$ampWebRoot}/PhoneSettings";
+// VPN state lives under the real web-root PhoneSettings directory.
+// Refuse a symlink here so private keys cannot be read/written in /tftpboot.
+if (is_link($phoneSettingsDir)) {
+    die('ovpn_mgr: PhoneSettings must be a real directory, not a symlink to /tftpboot. Migrate VPN data to the canonical web-root PhoneSettings/openvpn path first.');
+}
+$baseDir     = "{$phoneSettingsDir}/openvpn";
+if (is_dir("/tftpboot/openvpn") && !is_dir($baseDir)) {
+    die('ovpn_mgr: Legacy VPN data was found at /tftpboot/openvpn. Back it up and migrate it to ' . htmlspecialchars($baseDir) . ' before using this module.');
+}
+$pkgDir      = "{$phoneSettingsDir}/vpnkeys";
 $pkiDir      = "{$baseDir}/legacy_pki";
 $logFile     = "{$baseDir}/logs/openvpn.log";
 $serverConf  = "{$baseDir}/legacy-vpn.conf";
@@ -16,6 +26,14 @@ $serverKey   = "{$pkiDir}/private/server.key";
 $moduleRoot  = __DIR__;
 $ovpnctl     = "{$moduleRoot}/scripts/ovpnctl";
 $setupScript = "{$moduleRoot}/scripts/setup-root.sh";
+
+// buildClientPackage(), revokeExtension(), startOpenVpnServer(),
+// stopOpenVpnServer(), getActiveServerSettings(), getOpenVpnVersion()
+// and tailFile() now live in lib/client_ops.php, shared with any other
+// module (e.g. yealink_epm) that wants to generate/revoke an OpenVPN
+// client package through this module's own PKI instead of reimplementing
+// it themselves.
+require_once "{$moduleRoot}/lib/client_ops.php";
 
 // ============================================================================
 // CSRF token - one per session, required on every state-changing request.
@@ -139,31 +157,6 @@ function isValidHostOrIp($s) {
     return (bool) preg_match('/^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$/', $s);
 }
 
-function tailFile($path, $lines = 200, $maxBytes = 2000000) {
-    if (!file_exists($path)) { return ''; }
-    $size = filesize($path);
-    if ($size <= $maxBytes) {
-        $content = (string)@file_get_contents($path);
-    } else {
-        $fp = @fopen($path, 'r');
-        if (!$fp) { return ''; }
-        fseek($fp, -$maxBytes, SEEK_END);
-        $content = (string)fread($fp, $maxBytes);
-        fclose($fp);
-    }
-    $arr = explode("\n", $content);
-    return implode("\n", array_slice($arr, -$lines));
-}
-
-function getOpenVpnVersion() {
-    $openvpnBin = file_exists('/usr/sbin/openvpn') ? '/usr/sbin/openvpn' : '/usr/local/sbin/openvpn';
-    exec(escapeshellarg($openvpnBin) . " --version 2>&1", $output);
-    if (!empty($output[0]) && preg_match('/OpenVPN\s+([0-9]+\.[0-9]+\.[0-9]+)/i', $output[0], $matches)) {
-        return $matches[1];
-    }
-    return '2.4.0';
-}
-
 function hasOvpnctlAccess($ovpnctl) {
     exec('sudo -n ' . escapeshellarg($ovpnctl) . ' check 2>&1', $out, $rc);
     return ($rc === 0);
@@ -260,18 +253,19 @@ function syncOvpnFirewallPortRule($newPort, $logFile, $ovpnctl) {
         }
     }
 
-    exec('fwconsole firewall restart 2>&1', $restartOut, $restartRc);
-    $result['reloaded'] = ($restartRc === 0);
+    // NOTE: this used to call 'fwconsole firewall restart' here directly,
+    // and applyVpnRoutingAndNat() below called it again a moment later for
+    // the trusted-zone change. That's two full firewall rebuilds (each can
+    // take several seconds) for one save. The caller now issues a single
+    // combined restart after both updates are made; we just report that one
+    // is needed.
+    $result['reloaded'] = true; // will be finalized by the caller's single restart
+    $result['restart_needed'] = true;
     @file_put_contents(
         $logFile,
-        "\n[FIREWALL SYNC " . date('Y-m-d H:i:s') . "] Synced Custom Service '{$serviceName}' to UDP/{$port}, fwconsole firewall restart exit={$restartRc}\n"
-            . implode("\n", $restartOut) . "\n",
+        "\n[FIREWALL SYNC " . date('Y-m-d H:i:s') . "] Synced Custom Service '{$serviceName}' to UDP/{$port}; firewall restart deferred to caller.\n",
         FILE_APPEND
     );
-
-    if (!$result['reloaded']) {
-        $result['message'] = "Custom Service '{$serviceName}' updated, but firewall restart returned a non-zero code.";
-    }
 
     return $result;
 }
@@ -279,135 +273,32 @@ function syncOvpnFirewallPortRule($newPort, $logFile, $ovpnctl) {
 function applyVpnRoutingAndNat($ovpnctl, $netIp, $cidrBits, $iface, $baseDir) {
     exec('sudo -n ' . escapeshellarg($ovpnctl) . ' ipforward-on 2>&1');
     $cidr = "{$netIp}/{$cidrBits}";
+    $restartNeeded = false;
 
     if (class_exists('FreePBX')) {
-        exec('fwconsole firewall add trusted tun+ 2>&1');
-
         $trustedCidrState = "{$baseDir}/.trusted_cidr_state";
         $prevCidr = file_exists($trustedCidrState) ? trim((string)@file_get_contents($trustedCidrState)) : '';
 
-        if ($prevCidr !== '' && $prevCidr !== $cidr) {
-            exec('fwconsole firewall del trusted ' . escapeshellarg($prevCidr) . ' 2>&1');
+        if ($prevCidr !== $cidr) {
+            // Only touch the trusted-zone rules (and therefore need a
+            // restart) when the CIDR has actually changed. tun+ only needs
+            // adding once; re-running 'add' for an interface/CIDR already
+            // trusted is a harmless no-op for the ruleset but still costs a
+            // process + doesn't need a restart, so skip it entirely here.
+            exec('fwconsole firewall add trusted tun+ 2>&1');
+            if ($prevCidr !== '') {
+                exec('fwconsole firewall del trusted ' . escapeshellarg($prevCidr) . ' 2>&1');
+            }
+            exec('fwconsole firewall add trusted ' . escapeshellarg($cidr) . ' 2>&1');
+            @file_put_contents($trustedCidrState, $cidr);
+            $restartNeeded = true;
         }
-        exec('fwconsole firewall add trusted ' . escapeshellarg($cidr) . ' 2>&1');
-        @file_put_contents($trustedCidrState, $cidr);
-        exec('fwconsole firewall restart 2>&1');
     }
 
     $cmd = 'sudo -n ' . escapeshellarg($ovpnctl) . ' nat-sync ' . escapeshellarg($cidr) . ' ' . escapeshellarg($iface);
     exec($cmd . ' 2>&1');
-}
 
-function startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey) {
-    $logDir = "{$baseDir}/logs";
-    $logFile = "{$logDir}/openvpn.log";
-    $pkiDir = "{$baseDir}/legacy_pki";
-    $crlFile = "{$pkiDir}/crl.pem";
-
-    if (!file_exists($logDir)) {
-        @mkdir($logDir, 0775, true);
-    }
-
-    if (file_exists($logFile) && filesize($logFile) > 5242880) {
-        $tail = tailFile($logFile, 2000);
-        @file_put_contents($logFile, $tail . "\n");
-    }
-
-    if (!file_exists($crlFile) && file_exists("{$pkiDir}/ca.crt") && file_exists("{$pkiDir}/private/ca.key")) {
-        if (!file_exists("{$pkiDir}/index.txt")) { @touch("{$pkiDir}/index.txt"); }
-        if (!file_exists("{$pkiDir}/crlnumber")) { @file_put_contents("{$pkiDir}/crlnumber", "01\n"); }
-
-        $tmpCnf = "{$pkiDir}/crl_openssl.cnf";
-        $cnfData = "[ ca ]\ndefault_ca = CA_default\n\n[ CA_default ]\ndir = {$pkiDir}\ndefault_md = sha256\n";
-        @file_put_contents($tmpCnf, $cnfData);
-
-        exec("OPENSSL_CONF=" . escapeshellarg($tmpCnf) . " openssl ca -gencrl -keyfile " . escapeshellarg("{$pkiDir}/private/ca.key") . " -cert " . escapeshellarg("{$pkiDir}/ca.crt") . " -out " . escapeshellarg($crlFile) . " -config " . escapeshellarg($tmpCnf) . " 2>&1");
-        @unlink($tmpCnf);
-    }
-
-    $installedVersion = getOpenVpnVersion();
-    $isLegacy = version_compare($installedVersion, '2.5.0', '<');
-
-    if (file_exists($serverConf)) {
-        $lines = explode("\n", (string)@file_get_contents($serverConf));
-        $cleanLines = [];
-        foreach ($lines as $line) {
-            $trimmed = trim($line);
-            if (strpos($trimmed, 'crl-verify') === 0 && !file_exists($crlFile)) {
-                continue;
-            }
-            if ($isLegacy) {
-                if (strpos($trimmed, 'data-ciphers') === 0 || strpos($trimmed, 'data-ciphers-fallback') === 0 ||
-                    strpos($trimmed, 'providers') === 0 || strpos($trimmed, 'ignore-unknown-option') === 0) {
-                    continue;
-                }
-            } else {
-                if (strpos($trimmed, 'ncp-disable') === 0) {
-                    continue;
-                }
-            }
-            $cleanLines[] = $line;
-        }
-        $cleanContent = implode("\n", $cleanLines);
-
-        if ($isLegacy) {
-            if (strpos($cleanContent, 'cipher ') === false) {
-                $cleanContent .= "\ncipher AES-128-CBC\n";
-            }
-        } else {
-            if (strpos($cleanContent, 'data-ciphers ') === false) {
-                $cleanContent .= "\ndata-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC:CHACHA20-POLY1305\n";
-            }
-        }
-        if (strpos($cleanContent, 'verb ') === false) {
-            $cleanContent .= "\nverb 3\n";
-        }
-        @file_put_contents($serverConf, $cleanContent);
-    }
-
-    if (file_exists($serverKey)) {
-        @chmod($serverKey, 0600);
-    }
-
-    exec('sudo -n ' . escapeshellarg($ovpnctl) . ' start 2>&1', $output, $returnCode);
-    if ($returnCode !== 0 && !empty($output)) {
-        @file_put_contents($logFile, "\n[GUI START ATTEMPT Exit Code: {$returnCode}]\n" . implode("\n", $output) . "\n", FILE_APPEND);
-    }
-}
-
-function stopOpenVpnServer($ovpnctl) {
-    exec('sudo -n ' . escapeshellarg($ovpnctl) . ' stop 2>&1');
-    clearstatcache();
-}
-
-function getActiveServerSettings($serverConf) {
-    $ip = $_SERVER['SERVER_ADDR'] ?? gethostbyname(gethostname()) ?? '127.0.0.1';
-    $port = '1194';
-    $hostIp = '10.8.0.1';
-    $netMask = '255.255.255.0';
-
-    if (file_exists($serverConf)) {
-        $content = (string)@file_get_contents($serverConf);
-        if (preg_match('/^port (\d+)/m', $content, $mPort)) {
-            $port = trim($mPort[1]);
-        }
-        if (preg_match('/^# client-remote-host (.+)/m', $content, $mIp)) {
-            $ip = trim($mIp[1]);
-        }
-        if (preg_match('/^# vpn-host-ip (.+)/m', $content, $mHost)) {
-            $hostIp = trim($mHost[1]);
-        } elseif (preg_match('/^server\s+([0-9\.]+)\s+([0-9\.]+)/m', $content, $mNet)) {
-            $parsedNet = trim($mNet[1]);
-            $longNet = ip2long($parsedNet);
-            if ($longNet !== false) {
-                $hostIp = long2ip($longNet + 1);
-            }
-        }
-        if (preg_match('/^server\s+([0-9\.]+)\s+([0-9\.]+)/m', $content, $mNet)) {
-            $netMask = trim($mNet[2]);
-        }
-    }
-    return ['ip' => $ip, 'port' => $port, 'host_ip' => $hostIp, 'net_mask' => $netMask];
+    return $restartNeeded;
 }
 
 // ============================================================================
@@ -480,13 +371,35 @@ if (function_exists('core_users_list')) {
 }
 
 $available_macs = [];
-$tftpDir = "{$ampWebRoot}/tftpboot";
+// Uses the top-level $tftpDir (/tftpboot) directly rather than
+// "{$ampWebRoot}/tftpboot" - that path only resolved correctly when
+// yealink_epm's optional convenience-alias symlink happened to exist,
+// and reassigning $tftpDir here would also have clobbered its later use
+// by the restore-from-backup handler below.
 if (is_dir($tftpDir)) {
     foreach (glob("{$tftpDir}/[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F].cfg") as $cfgFile) {
         $mac = strtolower(pathinfo($cfgFile, PATHINFO_FILENAME));
         $available_macs[$mac] = strtoupper($mac);
     }
 }
+
+// Exclude extensions and MAC addresses that already have a provisioning
+// archive. A generated archive reserves both identifiers until it is deleted.
+$used_extensions = [];
+$used_macs = [];
+if (is_dir($pkgDir)) {
+    foreach (glob("{$pkgDir}/*.tar") as $existingPkg) {
+        $existingName = basename($existingPkg);
+        // Current format: MAC_EXT_ovpn.tar. Also recognize older tokenized
+        // archives: MAC_EXT_TOKEN_ovpn.tar (and legacy *_keys.tar archives).
+        if (preg_match('/^([a-f0-9]{12})_(\d+)(?:_[a-f0-9]{8})?_(?:ovpn|keys)\.tar$/i', $existingName, $pkgMatch)) {
+            $used_macs[strtolower($pkgMatch[1])] = true;
+            $used_extensions[(string)$pkgMatch[2]] = true;
+        }
+    }
+}
+$available_extensions = array_diff_key($available_extensions, $used_extensions);
+$available_macs = array_diff_key($available_macs, $used_macs);
 
 // ============================================================================
 // Sign Module
@@ -533,7 +446,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'manage_service') {
     if ($serviceAction === 'start' || $serviceAction === 'restart') {
         @unlink("{$baseDir}/.stopped");
         stopOpenVpnServer($ovpnctl);
-        sleep(1);
         startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
     } elseif ($serviceAction === 'stop') {
         @touch("{$baseDir}/.stopped");
@@ -586,50 +498,156 @@ if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
         $finalHostIp = $subnetDetails['suggested_first'];
         $hostIpWasCorrected = ($finalHostIp !== $newHostIp);
 
-        $wasStopped = file_exists("{$baseDir}/.stopped");
-        if (!$wasStopped) {
-            stopOpenVpnServer($ovpnctl);
-            sleep(1);
-        }
+        // The firewall/NAT/SIP-localnet sync below is only relevant when the
+        // port or the VPN subnet actually changed - re-saving unrelated
+        // settings (e.g. cipher) with the same port/subnet doesn't need any
+        // of it, and each of those steps can cost several seconds.
+        $portChanged   = ($oldPort !== $newPort);
+        $subnetChanged = ($oldSettings['host_ip'] !== $finalHostIp) || ($oldSettings['net_mask'] !== $newNetmask);
 
-        $confContent = (string)@file_get_contents($serverConf);
-        $confContent = preg_replace('/^port \d+/m', "port {$newPort}", $confContent);
-
-        if (preg_match('/^server\s+[0-9\.]+\s+[0-9\.]+/m', $confContent)) {
-            $confContent = preg_replace('/^server\s+[0-9\.]+\s+[0-9\.]+/m', "server {$newNetIp} {$newNetmask}", $confContent);
+        // Read and update the actual active directive, accepting tabs/multiple spaces
+        // and inserting it if missing. Write atomically and verify before restarting;
+        // a silent failed write must never look like a successful port change.
+        $confContent = is_readable($serverConf) ? (string)file_get_contents($serverConf) : '';
+        if ($confContent === '') {
+            $settingsError = 'Unable to read the OpenVPN server configuration.';
         } else {
-            $confContent .= "\nserver {$newNetIp} {$newNetmask}";
-        }
+            $lines = preg_split('/\r?\n/', $confContent);
+            $portWritten = false;
+            $updatedLines = [];
+            foreach ($lines as $line) {
+                if (preg_match('/^[ \t]*port[ \t]+\d+(?:[ \t]+#.*)?[ \t]*$/i', $line)) {
+                    if (!$portWritten) {
+                        $updatedLines[] = "port {$newPort}";
+                        $portWritten = true;
+                    }
+                    continue; // remove duplicate active port directives
+                }
+                $updatedLines[] = $line;
+            }
+            if (!$portWritten) { $updatedLines[] = "port {$newPort}"; }
+            $confContent = implode("\n", $updatedLines);
 
-        if (preg_match('/^# vpn-host-ip .*/m', $confContent)) {
-            $confContent = preg_replace('/^# vpn-host-ip .*/m', "# vpn-host-ip {$finalHostIp}", $confContent);
-        } else {
-            $confContent .= "\n# vpn-host-ip {$finalHostIp}";
-        }
-        if (preg_match('/^# client-remote-host .*/m', $confContent)) {
-            $confContent = preg_replace('/^# client-remote-host .*/m', "# client-remote-host {$newIp}", $confContent);
-        } else {
-            $confContent .= "\n# client-remote-host {$newIp}";
-        }
-        @file_put_contents($serverConf, $confContent);
+            if (preg_match('/^server\s+[0-9\.]+\s+[0-9\.]+/m', $confContent)) {
+                $confContent = preg_replace('/^server\s+[0-9\.]+\s+[0-9\.]+/m', "server {$newNetIp} {$newNetmask}", $confContent, 1);
+            } else {
+                $confContent .= "\nserver {$newNetIp} {$newNetmask}";
+            }
 
-        exec("ip route show default | awk '{print \$5}'", $defaultIfOut);
-        $primaryIf = '';
-        foreach ($defaultIfOut as $ifLine) {
-            $ifLine = trim($ifLine);
-            if ($ifLine !== '' && preg_match('/^[a-zA-Z0-9_.@-]{1,15}$/', $ifLine)) {
-                $primaryIf = $ifLine;
-                break;
+            if (preg_match('/^# vpn-host-ip .*/m', $confContent)) {
+                $confContent = preg_replace('/^# vpn-host-ip .*/m', "# vpn-host-ip {$finalHostIp}", $confContent, 1);
+            } else {
+                $confContent .= "\n# vpn-host-ip {$finalHostIp}";
+            }
+            if (preg_match('/^# client-remote-host .*/m', $confContent)) {
+                $confContent = preg_replace('/^# client-remote-host .*/m', "# client-remote-host {$newIp}", $confContent, 1);
+            } else {
+                $confContent .= "\n# client-remote-host {$newIp}";
+            }
+
+            $tmpConf = $serverConf . '.tmp.' . getmypid();
+            $oldMode = @fileperms($serverConf);
+            $writeOk = (@file_put_contents($tmpConf, rtrim($confContent) . "\n", LOCK_EX) !== false);
+            if ($writeOk) {
+                if ($oldMode !== false) { @chmod($tmpConf, $oldMode & 0777); }
+                $writeOk = @rename($tmpConf, $serverConf);
+            }
+            // Some installations permit writes to the config file but not a
+            // rename in its directory. Fall back to a checked in-place write.
+            if (!$writeOk) {
+                @unlink($tmpConf);
+                $writeOk = (@file_put_contents($serverConf, rtrim($confContent) . "\n", LOCK_EX) !== false);
+            }
+            if (!$writeOk) {
+                $settingsError = 'Could not save the OpenVPN configuration. Check file permissions and try again.';
+            } else {
+                clearstatcache(true, $serverConf);
+                $savedText = (string)@file_get_contents($serverConf);
+                $savedSettings = getActiveServerSettings($serverConf);
+                if ((int)$savedSettings['port'] !== $newPort || !preg_match('/^[ \t]*port[ \t]+' . preg_quote((string)$newPort, '/') . '(?:[ \t]+#.*)?[ \t]*$/mi', $savedText)) {
+                    $settingsError = 'The configuration was written, but the saved port did not verify. OpenVPN was not restarted.';
+                }
             }
         }
-        if ($primaryIf === '') { $primaryIf = 'ens192'; }
 
-        $fwSyncResult = syncOvpnFirewallPortRule($newPort, $logFile, $ovpnctl);
-        if (!$fwSyncResult['written'] || !$fwSyncResult['reloaded']) {
-            $_SESSION['ovpn_mgr_fw_warning'] = $fwSyncResult['message'];
+        if ($settingsError === '') {
+            // Keep FreePBX Asterisk SIP Settings > NAT > Local Networks in sync
+            // with the OpenVPN pool, but only bother calling out to it when
+            // the subnet actually changed. sip-localnet-sync.php itself no
+            // longer calls 'fwconsole reload' - it flags FreePBX via
+            // needreload() (a single fast DB write) so the change shows up
+            // as a normal orange/red "Apply Config" bar, same as any other
+            // module's settings, instead of forcing an expensive reload
+            // inline on every subnet-changing save. That means this call is
+            // now fast enough to just run synchronously like everything else.
+            $sipSyncOut = [];
+            $sipSyncRc = 0;
+            if ($subnetChanged) {
+                exec('sudo -n ' . escapeshellarg($ovpnctl) . ' sip-localnet-sync 2>&1', $sipSyncOut, $sipSyncRc);
+                // FreePBX may emit shutdown noise after the helper's success marker;
+                // trust the explicit marker rather than PHP's final exit status alone.
+                $sipSyncConfirmed = in_array('SIP_LOCALNET_SYNC_OK', $sipSyncOut, true);
+                if (!$sipSyncConfirmed || $sipSyncRc !== 0) {
+                    if ($sipSyncConfirmed) {
+                        unset($_SESSION['ovpn_mgr_sipnat_warning']);
+                    } else {
+                        $_SESSION['ovpn_mgr_sipnat_warning'] = 'VPN settings were saved, but SIP NAT Local Networks could not be synchronized: ' . implode(' ', $sipSyncOut);
+                    }
+                } else {
+                    unset($_SESSION['ovpn_mgr_sipnat_warning']);
+                }
+            }
+            $wasStopped = file_exists("{$baseDir}/.stopped");
+            if (!$wasStopped) {
+                stopOpenVpnServer($ovpnctl);
+            }
+
+        // Firewall custom service (port) and trusted-zone/NAT (subnet) only
+        // need touching when the relevant value changed. When both are
+        // unchanged this whole block - including any fwconsole firewall
+        // restart - is skipped entirely.
+        $fwRestartNeeded = false;
+
+        if ($portChanged) {
+            $fwSyncResult = syncOvpnFirewallPortRule($newPort, $logFile, $ovpnctl);
+            if (!$fwSyncResult['written']) {
+                $_SESSION['ovpn_mgr_fw_warning'] = $fwSyncResult['message'];
+            }
+            $fwRestartNeeded = $fwRestartNeeded || ($fwSyncResult['restart_needed'] ?? false);
         }
 
-        applyVpnRoutingAndNat($ovpnctl, $newNetIp, $subnetDetails['cidr'], $primaryIf, $baseDir);
+        if ($subnetChanged) {
+            exec("ip route show default | awk '{print \$5}'", $defaultIfOut);
+            $primaryIf = '';
+            foreach ($defaultIfOut as $ifLine) {
+                $ifLine = trim($ifLine);
+                if ($ifLine !== '' && preg_match('/^[a-zA-Z0-9_.@-]{1,15}$/', $ifLine)) {
+                    $primaryIf = $ifLine;
+                    break;
+                }
+            }
+            if ($primaryIf === '') { $primaryIf = 'ens192'; }
+
+            $natRestartNeeded = applyVpnRoutingAndNat($ovpnctl, $newNetIp, $subnetDetails['cidr'], $primaryIf, $baseDir);
+            $fwRestartNeeded = $fwRestartNeeded || $natRestartNeeded;
+        }
+
+        if ($fwRestartNeeded) {
+            // Single combined restart for both the custom-service and
+            // trusted-zone changes above, instead of one restart per change.
+            $restartOut = [];
+            $restartRc  = 0;
+            exec('fwconsole firewall restart 2>&1', $restartOut, $restartRc);
+            @file_put_contents(
+                $logFile,
+                "\n[FIREWALL SYNC " . date('Y-m-d H:i:s') . "] Combined fwconsole firewall restart exit={$restartRc}\n"
+                    . implode("\n", $restartOut) . "\n",
+                FILE_APPEND
+            );
+            if ($restartRc !== 0 && empty($_SESSION['ovpn_mgr_fw_warning'])) {
+                $_SESSION['ovpn_mgr_fw_warning'] = 'Firewall settings were updated, but fwconsole firewall restart returned a non-zero code.';
+            }
+        }
 
         if (!$wasStopped) {
             startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
@@ -649,117 +667,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
 
         header("Location: config.php?display=ovpn_mgr");
         exit();
+        } // end verified config save
     }
 }
 
 // ============================================================================
 // Client Package Builder
 // ============================================================================
-function buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $serverIp, $port) {
-    if (!file_exists($pkgDir)) {
-        @mkdir($pkgDir, 0775, true);
-    }
-
-    $clientKey = "{$pkiDir}/private/{$ext}.key";
-    $clientCrt = "{$pkiDir}/issued/{$ext}.crt";
-    $clientCsr = "{$pkiDir}/{$ext}.csr";
-
-    if (!file_exists($clientCrt)) {
-        exec("openssl req -new -nodes -batch -sha1 -newkey rsa:1024 -out " . escapeshellarg($clientCsr) . " -keyout " . escapeshellarg($clientKey) . " -subj " . escapeshellarg("/CN={$ext}/") . " 2>&1");
-        exec("openssl x509 -req -days 3650 -sha1 -in " . escapeshellarg($clientCsr) . " -CA " . escapeshellarg("{$pkiDir}/ca.crt") . " -CAkey " . escapeshellarg("{$pkiDir}/private/ca.key") . " -set_serial " . random_int(100, 99999) . " -out " . escapeshellarg($clientCrt) . " 2>&1");
-        @unlink($clientCsr);
-    }
-
-    $buildDir = "{$baseDir}/build_{$ext}";
-    $keysSubDir = "{$buildDir}/keys";
-    @mkdir($keysSubDir, 0775, true);
-
-    @copy("{$pkiDir}/ca.crt", "{$keysSubDir}/ca.crt");
-    @copy($clientCrt, "{$keysSubDir}/client.crt");
-    @copy($clientKey, "{$keysSubDir}/client.key");
-
-    $vpnCnf = "client\n"
-            . "nobind\n"
-            . "remote {$serverIp} {$port}\n"
-            . "proto udp\n"
-            . "dev tun\n"
-            . "ca /config/openvpn/keys/ca.crt\n"
-            . "cert /config/openvpn/keys/client.crt\n"
-            . "key /config/openvpn/keys/client.key\n"
-            . "cipher AES-128-CBC\n"
-            . "auth SHA1\n"
-            . "verb 3\n"
-            . "explicit-exit-notify 0\n"
-            . "script-security 2\n";
-    @file_put_contents("{$buildDir}/vpn.cnf", $vpnCnf);
-
-    $members = [];
-    foreach (['keys', 'vpn.cnf'] as $member) {
-        if (file_exists("{$buildDir}/{$member}")) {
-            $members[] = $member;
-        }
-    }
-
-    $tarPath = "{$pkgDir}/{$mac}_{$ext}_ovpn.tar";
-
-    foreach (glob("{$pkgDir}/{$mac}_{$ext}_*_ovpn.tar") as $oldTokenPkg) {
-        if (basename($oldTokenPkg) !== basename($tarPath)) {
-            @unlink($oldTokenPkg);
-        }
-    }
-
-    $tarCmd = "tar -cf " . escapeshellarg($tarPath) . " -C " . escapeshellarg($buildDir);
-    foreach ($members as $member) {
-        $tarCmd .= ' ' . escapeshellarg($member);
-    }
-    exec($tarCmd . ' 2>&1', $tarOut, $tarRc);
-
-    $ok = ($tarRc === 0 && file_exists($tarPath));
-    if ($ok) {
-        @chmod($tarPath, 0644);
-    } else {
-        @unlink($tarPath);
-    }
-
-    exec("rm -rf " . escapeshellarg($buildDir));
-    return $ok ? $tarPath : null;
-}
-
-// ============================================================================
-// Certificate Revocation Helper
-// ============================================================================
-function revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $revokeExt) {
-    $targetCrt = "{$pkiDir}/issued/{$revokeExt}.crt";
-    $targetKey = "{$pkiDir}/private/{$revokeExt}.key";
-
-    if (!file_exists($targetCrt)) {
-        return;
-    }
-
-    $tmpCnf = "{$pkiDir}/crl_openssl.cnf";
-    $cnfData = "[ ca ]\ndefault_ca = CA_default\n\n[ CA_default ]\ndir = {$pkiDir}\ndefault_md = sha256\n";
-    @file_put_contents($tmpCnf, $cnfData);
-
-    if (!file_exists("{$pkiDir}/index.txt")) { @touch("{$pkiDir}/index.txt"); }
-    if (!file_exists("{$pkiDir}/crlnumber")) { @file_put_contents("{$pkiDir}/crlnumber", "01\n"); }
-
-    exec("OPENSSL_CONF=" . escapeshellarg($tmpCnf) . " openssl ca -revoke " . escapeshellarg($targetCrt) . " -keyfile " . escapeshellarg("{$pkiDir}/private/ca.key") . " -cert " . escapeshellarg("{$pkiDir}/ca.crt") . " -config " . escapeshellarg($tmpCnf) . " 2>&1");
-    exec("OPENSSL_CONF=" . escapeshellarg($tmpCnf) . " openssl ca -gencrl -keyfile " . escapeshellarg("{$pkiDir}/private/ca.key") . " -cert " . escapeshellarg("{$pkiDir}/ca.crt") . " -out " . escapeshellarg($crlFile) . " -config " . escapeshellarg($tmpCnf) . " 2>&1");
-    @unlink($tmpCnf);
-
-    $confContent = (string)@file_get_contents($serverConf);
-    if (strpos($confContent, 'crl-verify') === false) {
-        $confContent .= "\ncrl-verify {$crlFile}\n";
-        @file_put_contents($serverConf, $confContent);
-    }
-
-    @unlink($targetCrt);
-    @unlink($targetKey);
-
-    foreach (glob("{$pkgDir}/*_{$revokeExt}_*_ovpn.tar") as $matchingTar) { @unlink($matchingTar); }
-    foreach (glob("{$pkgDir}/*_{$revokeExt}_ovpn.tar") as $matchingTar) { @unlink($matchingTar); }
-}
-
 // ============================================================================
 // Edit Package MAC/Extension Action
 // ============================================================================
@@ -786,11 +700,30 @@ if (isset($_POST['action']) && $_POST['action'] === 'edit_package') {
         @unlink($oldPath);
 
         $settings = getActiveServerSettings($serverConf);
-        buildClientPackage($pkiDir, $pkgDir, $baseDir, $newExt, $newMac, $settings['ip'], $settings['port']);
+        $selectedCipher = (string)($_POST['cipher'] ?? 'AES-128-CBC');
+        $allowedCiphers = ['AES-128-CBC', 'AES-256-CBC', 'AES-128-GCM', 'AES-256-GCM'];
+        if (!in_array($selectedCipher, $allowedCiphers, true)) {
+            $selectedCipher = 'AES-128-CBC';
+        }
+
+        // Ensure the server accepts the cipher selected while editing/rebuilding.
+        if (is_readable($serverConf) && is_writable($serverConf)) {
+            $serverText = (string)file_get_contents($serverConf);
+            $serverCipherList = 'AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC';
+            if (preg_match('/^data-ciphers\s+.*$/m', $serverText)) {
+                $serverText = preg_replace('/^data-ciphers\s+.*$/m', 'data-ciphers ' . $serverCipherList, $serverText);
+            } else {
+                $serverText .= "\ndata-ciphers " . $serverCipherList . "\n";
+            }
+            if (!preg_match('/^data-ciphers-fallback\s+/m', $serverText)) {
+                $serverText .= "data-ciphers-fallback AES-128-CBC\n";
+            }
+            file_put_contents($serverConf, $serverText);
+        }
+        buildClientPackage($pkiDir, $pkgDir, $baseDir, $newExt, $newMac, $settings['ip'], $settings['port'], $selectedCipher);
 
         if (!file_exists("{$baseDir}/.stopped")) {
             stopOpenVpnServer($ovpnctl);
-            sleep(1);
             startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
         }
     }
@@ -806,7 +739,22 @@ if (isset($_POST['action']) && $_POST['action'] === 'generate_package') {
 
     if (!empty($ext) && !empty($mac)) {
         $settings = getActiveServerSettings($serverConf);
-        buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port']);
+        // Keep server negotiation compatible with every cipher offered by the UI.
+        // AES-128-CBC remains fallback for legacy phone firmware.
+        $serverCipherList = 'AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC';
+        if (is_readable($serverConf) && is_writable($serverConf)) {
+            $serverText = (string)file_get_contents($serverConf);
+            if (preg_match('/^data-ciphers\\s+.*$/m', $serverText)) {
+                $serverText = preg_replace('/^data-ciphers\\s+.*$/m', 'data-ciphers ' . $serverCipherList, $serverText);
+            } else {
+                $serverText .= "\ndata-ciphers " . $serverCipherList . "\n";
+            }
+            if (!preg_match('/^data-ciphers-fallback\\s+/m', $serverText)) {
+                $serverText .= "data-ciphers-fallback AES-128-CBC\n";
+            }
+            file_put_contents($serverConf, $serverText);
+        }
+        buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], (string)($_POST['cipher'] ?? 'AES-128-CBC'));
     }
     header("Location: config.php?display=ovpn_mgr");
     exit();
@@ -843,7 +791,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'rebuild_all_packages') {
 
     if (!file_exists("{$baseDir}/.stopped")) {
         stopOpenVpnServer($ovpnctl);
-        sleep(1);
         startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
     }
 
@@ -859,7 +806,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'revoke_cert') {
         revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $revokeExt);
         if (!file_exists("{$baseDir}/.stopped")) {
             stopOpenVpnServer($ovpnctl);
-            sleep(1);
             startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
         }
     }
@@ -891,7 +837,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'delete_package') {
             revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $revokeExt);
             if (!file_exists("{$baseDir}/.stopped")) {
                 stopOpenVpnServer($ovpnctl);
-                sleep(1);
                 startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
             }
         }
@@ -967,7 +912,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_packages') {
 
     if ($revokedCount > 0 && !file_exists("{$baseDir}/.stopped")) {
         stopOpenVpnServer($ovpnctl);
-        sleep(1);
         startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
     }
 
@@ -1007,7 +951,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_rebuild_package
 
     if ($rebuilt > 0 && !file_exists("{$baseDir}/.stopped")) {
         stopOpenVpnServer($ovpnctl);
-        sleep(1);
         startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
     }
 
@@ -1164,6 +1107,15 @@ if (file_exists($logFile)) {
             <i class="fa fa-exclamation-triangle"></i> <strong>Firewall port may not be open yet:</strong> <?php echo nl2br(htmlspecialchars($ovpnFwWarning)); ?>
         </div>
     <?php endif; ?>
+    <?php
+    $ovpnSipNatWarning = $_SESSION['ovpn_mgr_sipnat_warning'] ?? null;
+    unset($_SESSION['ovpn_mgr_sipnat_warning']);
+    ?>
+    <?php if ($ovpnSipNatWarning): ?>
+        <div class="alert alert-warning" style="margin-bottom: 20px;">
+            <i class="fa fa-exclamation-triangle"></i> <strong>SIP NAT Local Networks sync warning:</strong> <?php echo htmlspecialchars($ovpnSipNatWarning); ?>
+        </div>
+    <?php endif; ?>
 
     <?php
     $ovpnFlash = $_SESSION['ovpn_mgr_flash'] ?? null;
@@ -1206,18 +1158,18 @@ if (file_exists($logFile)) {
                         <div style="display: flex; align-items: flex-end; gap: 5px; margin-bottom: 15px; flex-wrap: wrap;">
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label for="server_ip" style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 5px;">Server Public IP / Host</label>
-                                <input type="text" class="form-control" id="server_ip" name="server_ip" value="<?php echo htmlspecialchars($currentServerIp); ?>" required style="width: 135px; height: 34px;">
+                                <input type="text" class="form-control" id="server_ip" name="server_ip" value="<?php echo htmlspecialchars($currentServerIp); ?>" required style="width: 242px; height: 34px; padding-left: 2px">
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 11px; visibility: hidden; display: block; margin-bottom: 5px;">Action</label>
-                                <button type="button" class="btn btn-default btn-sm" onclick="setPrivateIp()" style="width: 95px; height: 34px; padding: 4px 6px; font-size: 13px;">
-                                    <i class="fa fa-sitemap"></i> Private IP
+                                <button type="button" class="btn btn-default btn-sm" onclick="setPrivateIp()" title="Private IP"  style="width: 34px; height: 34px; padding: 4px 6px; font-size: 13px;">
+                                    <i class="fa fa-sitemap"></i> 
                                 </button>
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 11px; visibility: hidden; display: block; margin-bottom: 5px;">Action</label>
-                                <button type="button" class="btn btn-default btn-sm" onclick="fetchPublicIp()" style="width: 95px; height: 34px; padding: 4px 6px; font-size: 13px;">
-                                    <i class="fa fa-globe"></i> Public IP
+                                <button type="button" class="btn btn-default btn-sm" onclick="fetchPublicIp()" Title="Public IP" style="width: 34px; height: 34px; padding: 4px 6px; font-size: 13px;">
+                                    <i class="fa fa-globe"></i> 
                                 </button>
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
@@ -1271,12 +1223,12 @@ if (file_exists($logFile)) {
                         <input type="hidden" name="action" value="generate_package">
                         <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
                         
-                        <div style="display: flex; align-items: flex-end; gap: 15px; margin-bottom: 10px; flex-wrap: wrap;">
+                        <div style="display: flex; align-items: flex-end; gap: 10px; margin-bottom: 10px; flex-wrap: wrap;">
                             <!-- Extension Input with Icon Overlay -->
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 5px;">Extension</label>
                                 <div class="select-input-container">
-                                    <input type="text" name="ext" list="ext_list" class="form-control" placeholder="Select or type..." required autocomplete="off" style="width: 160px; height: 34px;">
+                                    <input type="text" name="ext" list="ext_list" class="form-control" placeholder="Select or type..." required autocomplete="off" style="width: 130px; height: 34px;">
                                 </div>
                                 <datalist id="ext_list">
                                     <?php foreach ($available_extensions as $e_num => $e_label): ?>
@@ -1289,7 +1241,7 @@ if (file_exists($logFile)) {
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 5px;">Phone MAC Address</label>
                                 <div class="select-input-container">
-                                    <input type="text" name="mac" list="mac_list" class="form-control" placeholder="Select or type..." required autocomplete="off" style="width: 200px; height: 34px;">
+                                    <input type="text" name="mac" list="mac_list" class="form-control" placeholder="Select or type..." required autocomplete="off" style="width: 165px; height: 34px;">
                                 </div>
                                 <datalist id="mac_list">
                                     <?php foreach ($available_macs as $m_raw => $m_label): ?>
@@ -1297,6 +1249,21 @@ if (file_exists($logFile)) {
                                     <?php endforeach; ?>
                                 </datalist>
                             </div>
+
+                            <!-- Cipher selector ordered weakest to strongest -->
+                            <div class="form-group" style="margin-bottom: 0; min-width: 0;">
+                                <label for="ovpn_cipher" style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 5px;">Phone / Cipher</label>
+                                <select id="ovpn_cipher" name="cipher" class="form-control" style="height: 34px; width: 215px; max-width: 100%;">
+                                    <option value="AES-128-CBC" data-level="legacy" selected>1 &mdash; Weakest / Legacy Compatibility &mdash; AES-128-CBC</option>
+                                    <option value="AES-256-CBC" data-level="caution">2 &mdash; AES-256-CBC (Legacy CBC)</option>
+                                    <option value="AES-128-GCM" data-level="modern">3 &mdash; AES-128-GCM (Modern)</option>
+                                    <option value="AES-256-GCM" data-level="strong">4 &mdash; Strongest &mdash; AES-256-GCM</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div id="ovpn_cipher_notice" role="status" aria-live="polite" style="margin: 0 0 10px; padding: 7px 10px; border: 1px solid #faebcc; border-radius: 4px; background: #fcf8e3; color: #8a6d3b; font-size: 11px; line-height: 1.5;">
+                            <strong>&#9888;&nbsp; Legacy compatibility:</strong> Uses AES-128-CBC and SHA1. Intended for older phones that cannot use modern OpenVPN data ciphers.
                         </div>
 
                         <div class="well well-sm" style="font-size: 11px; margin-bottom: 10px; padding: 5px; color: #555; max-width: 375px;">
@@ -1377,6 +1344,20 @@ if (file_exists($logFile)) {
         $pkgMac = !empty($parts[0]) ? strtoupper($parts[0]) : '';
         $pkgExt = !empty($parts[1]) ? $parts[1] : '';
     }
+
+    // Read the archive's current cipher so Edit opens with its existing value.
+    $pkgCipher = 'AES-128-CBC';
+    $tarConfig = @shell_exec('tar -xOf ' . escapeshellarg($pkgPath) . ' vpn.cnf 2>/dev/null');
+    if (is_string($tarConfig) && preg_match('/^data-ciphers\s+([^\s]+)/m', $tarConfig, $cm)) {
+        $candidateCipher = trim(explode(':', $cm[1])[0]);
+        if (in_array($candidateCipher, ['AES-128-CBC', 'AES-256-CBC', 'AES-128-GCM', 'AES-256-GCM'], true)) {
+            $pkgCipher = $candidateCipher;
+        }
+    } elseif (is_string($tarConfig) && preg_match('/^cipher\s+([^\s]+)/m', $tarConfig, $cm)) {
+        if (in_array(trim($cm[1]), ['AES-128-CBC', 'AES-256-CBC', 'AES-128-GCM', 'AES-256-GCM'], true)) {
+            $pkgCipher = trim($cm[1]);
+        }
+    }
 ?>
     <tr>
         <td style="text-align: left; vertical-align: middle; font-size: 14px; cursor: default; padding-left: 15px; border-right: none;" 
@@ -1396,7 +1377,7 @@ if (file_exists($logFile)) {
         <td style="text-align: center; vertical-align: middle; font-size: 12px;"><?php echo date("Y-m-d H:i", filemtime($pkgPath)); ?></td>
         <td style="text-align: center; vertical-align: middle; padding: 4px 2px;">
             <div style="display: flex; justify-content: center; align-items: center; gap: 3px;">
-                <button type="button" class="btn btn-xs btn-info" title="Edit Package Details" onclick="openEditPackageModal('<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgExt, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgMac, ENT_QUOTES); ?>')">
+                <button type="button" class="btn btn-xs btn-info" title="Edit Package Details" onclick="openEditPackageModal('<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgExt, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgMac, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgCipher, ENT_QUOTES); ?>')">
                     <i class="fa fa-pencil"></i>
                 </button>
                 <a href="<?php echo htmlspecialchars($downloadUrl); ?>" class="btn btn-xs btn-primary" download title="Download Package">
@@ -1425,7 +1406,7 @@ if (file_exists($logFile)) {
 
 <!-- Modal: Edit Archive -->
 <div class="modal fade" id="editPackageModal" tabindex="-1" role="dialog" aria-labelledby="editPackageModalLabel">
-    <div class="modal-dialog" role="document" style="width: 420px;">
+    <div class="modal-dialog" role="document" style="width: 480px; max-width: 96%;">
         <div class="modal-content">
             <form method="post" action="config.php?display=ovpn_mgr" id="editPackageForm">
                 <input type="hidden" name="action" value="edit_package">
@@ -1449,6 +1430,16 @@ if (file_exists($logFile)) {
                             <input type="text" name="mac" id="edit_mac" list="mac_list" class="form-control" required autocomplete="off">
                         </div>
                     </div>
+                    <div class="form-group">
+                        <label for="edit_cipher">Phone / Cipher (weakest to strongest):</label>
+                        <select name="cipher" id="edit_cipher" class="form-control" required>
+                            <option value="AES-128-CBC">1 &mdash; Weakest / Legacy Compatibility &mdash; AES-128-CBC</option>
+                            <option value="AES-256-CBC">2 &mdash; AES-256-CBC (Legacy CBC)</option>
+                            <option value="AES-128-GCM">3 &mdash; AES-128-GCM (Modern)</option>
+                            <option value="AES-256-GCM">4 &mdash; Strongest &mdash; AES-256-GCM</option>
+                        </select>
+                    </div>
+                    <div id="edit_cipher_notice" role="status" aria-live="polite" style="margin: 0; padding: 8px 10px; border: 1px solid #faebcc; border-radius: 4px; background: #fcf8e3; color: #8a6d3b; font-size: 11px; line-height: 1.5;"></div>
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-default" data-dismiss="modal">Cancel</button>
@@ -1537,9 +1528,20 @@ if (file_exists($logFile)) {
                                     $pkgFilename = null;
                                     if (!empty($matchingTars[0]) && file_exists($matchingTars[0])) {
                                         $pkgFilename = basename($matchingTars[0]);
-                                        $cnfOutput = shell_exec("tar -xOf " . escapeshellarg($matchingTars[0]) . " vpn.cnf 2>/dev/null");
-                                        if (!empty($cnfOutput) && preg_match('/^remote\s+([^\s]+)\s+(\d+)/m', $cnfOutput, $mRemote)) {
-                                            $targetHostPort = "{$mRemote[1]}:{$mRemote[2]}";
+                                        // Read vpn.cnf's remote line straight out of the tar via PharData
+                                        // (in-process) instead of forking a 'tar' subprocess per row -
+                                        // this loop runs on every page load and can cover a lot of
+                                        // packages, so N forks here was a real cost.
+                                        try {
+                                            $pharEntry = new PharData($matchingTars[0]);
+                                            if (isset($pharEntry['vpn.cnf'])) {
+                                                $cnfOutput = $pharEntry['vpn.cnf']->getContent();
+                                                if (!empty($cnfOutput) && preg_match('/^remote\s+([^\s]+)\s+(\d+)/m', $cnfOutput, $mRemote)) {
+                                                    $targetHostPort = "{$mRemote[1]}:{$mRemote[2]}";
+                                                }
+                                            }
+                                        } catch (Throwable $e) {
+                                            // Corrupt/unreadable package: fall back to the default host:port above.
                                         }
                                     }
                                 ?>
@@ -1678,10 +1680,12 @@ if (file_exists($logFile)) {
 <script>
 var OVPN_CSRF = <?php echo json_encode($csrfToken); ?>;
 
-function openEditPackageModal(filename, currentExt, currentMac) {
+function openEditPackageModal(filename, currentExt, currentMac, currentCipher) {
     $('#edit_old_pkg').val(filename);
     $('#edit_ext').val(currentExt);
     $('#edit_mac').val(currentMac);
+    $('#edit_cipher').val(currentCipher || 'AES-128-CBC');
+    updateEditCipherNotice();
     $('#editPackageModal').modal('show');
 }
 
@@ -1986,4 +1990,34 @@ $('#logModal').on('shown.bs.modal', function () {
 $('#logModal').on('hidden.bs.modal', function () {
     if (logInterval) { clearInterval(logInterval); logInterval = null; }
 });
+
+// Keep cipher guidance visible and color-coded in both package forms.
+var ovpnCipherGuidance = {
+    'AES-128-CBC': { bg: '#fcf8e3', border: '#faebcc', color: '#8a6d3b', text: '<strong><span style="font-size: 1.5em;">&#9888;</span> Legacy compatibility:</strong> Uses AES-128-CBC and SHA1. Intended for older phones that cannot use modern OpenVPN data ciphers.' },
+    'AES-256-CBC': { bg: '#fcf8e3', border: '#ffeeba', color: '#856404', text: '<strong><span style="font-size: 1.5em;">&#9888;</span> CBC compatibility:</strong> AES-256-CBC is stronger than AES-128-CBC, but remains a legacy mode. Verify the phone firmware supports it before provisioning.' },
+    'AES-128-GCM': { bg: '#d4edda', border: '#c3e6cb', color: '#155724', text: '<strong><span style="font-size: 1.4em;">&#10004;</span> Modern cipher:</strong> AES-128-GCM. Use only with a phone/firmware that supports OpenVPN GCM data ciphers. Older models may fail to connect.' },
+    'AES-256-GCM': { bg: '#d4edda', border: '#c3e6cb', color: '#155724', text: '<strong><span style="font-size: 1.4em;">&#10004;</span> Strong modern cipher:</strong> AES-256-GCM. Strongest option in this list; requires verified GCM support in the phone firmware.' }
+};
+function applyCipherNotice(selectId, noticeId) {
+    var select = document.getElementById(selectId), notice = document.getElementById(noticeId);
+    if (!select || !notice) return;
+    var item = ovpnCipherGuidance[select.value] || ovpnCipherGuidance['AES-128-CBC'];
+    notice.innerHTML = item.text;
+    notice.style.backgroundColor = item.bg;
+    notice.style.borderColor = item.border;
+    notice.style.color = item.color;
+}
+function updateEditCipherNotice() { applyCipherNotice('edit_cipher', 'edit_cipher_notice'); }
+(function () {
+    var mainSelect = document.getElementById('ovpn_cipher');
+    if (mainSelect) {
+        mainSelect.addEventListener('change', function () { applyCipherNotice('ovpn_cipher', 'ovpn_cipher_notice'); });
+        applyCipherNotice('ovpn_cipher', 'ovpn_cipher_notice');
+    }
+    var editSelect = document.getElementById('edit_cipher');
+    if (editSelect) {
+        editSelect.addEventListener('change', updateEditCipherNotice);
+        updateEditCipherNotice();
+    }
+})();
 </script>

@@ -3,6 +3,12 @@ namespace FreePBX\modules;
 
 class Ovpn_mgr implements \BMO {
     public $freepbx;
+    // NOTE: this class's own methods (getServiceStatus, buildYealinkTarball,
+    // deletePackage, getGeneratedPackages) are not currently called anywhere -
+    // page.ovpn_mgr.php reimplements this logic inline instead. This class
+    // exists only to satisfy FreePBX's module convention (every module needs
+    // a <rawname>.class.php implementing BMO). Paths kept in sync with the
+    // rest of the module anyway, in case that ever changes.
     private $pkiDir = '/var/www/html/PhoneSettings/openvpn/legacy_pki';
     private $tftpDir = '/tftpboot';
 

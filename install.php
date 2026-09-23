@@ -2,10 +2,20 @@
 if (!defined('FREEPBX_IS_AUTH')) { die('No direct script access allowed'); }
 
 $ampWebRoot  = rtrim($amp_conf['AMPWEBROOT'] ?? '/var/www/html', '/');
-$baseDir     = "{$ampWebRoot}/PhoneSettings/openvpn";
-$pkgDir      = "{$ampWebRoot}/PhoneSettings/vpnkeys";
-$pkiDir      = "{$baseDir}/legacy_pki";
 $tftpDir     = '/tftpboot';
+$phoneSettingsDir = "{$ampWebRoot}/PhoneSettings";
+// OpenVPN state is deliberately stored in the real web-root PhoneSettings
+// directory. Never alias PhoneSettings to /tftpboot: doing so would put
+// private PKI material in the TFTP tree (e.g. /tftpboot/openvpn).
+if (is_link($phoneSettingsDir)) {
+    die('ovpn_mgr: ' . htmlspecialchars($phoneSettingsDir) . ' is a symlink. This module requires a real PhoneSettings directory so OpenVPN data stays out of /tftpboot. Back up and migrate PhoneSettings/openvpn to the canonical web-root path, convert PhoneSettings to a real directory, then rerun module install.');
+}
+$baseDir     = "{$phoneSettingsDir}/openvpn";
+if (is_dir("{$tftpDir}/openvpn") && !is_dir($baseDir)) {
+    die('ovpn_mgr: Found legacy data at /tftpboot/openvpn but no canonical ' . htmlspecialchars($baseDir) . '. Back up and move the existing openvpn directory to the canonical PhoneSettings path before reinstalling; the installer will not move private keys automatically.');
+}
+$pkgDir      = "{$phoneSettingsDir}/vpnkeys";
+$pkiDir      = "{$baseDir}/legacy_pki";
 $serverConf  = "{$baseDir}/legacy-vpn.conf";
 $logDir      = "{$baseDir}/logs";
 $logFile     = "{$logDir}/openvpn.log";
@@ -23,6 +33,12 @@ $module_root = __DIR__;
 
 // 0. Directory initialization (all owned by the web/asterisk user this
 //    installer itself runs as - no elevated privilege required).
+// deploy_module_symlink() is always non-destructive: if $target already
+// exists as a real (non-symlink) directory, it does nothing and returns
+// false rather than deleting/replacing it. It only ever replaces an
+// existing symlink (with an equivalent or updated one - never touching
+// the real data at whatever that symlink points to) or creates a new
+// symlink where nothing existed before.
 if (!function_exists('deploy_module_symlink')) {
     function deploy_module_symlink($source, $target) {
         if (!file_exists($source) && !is_link($source)) {
@@ -43,7 +59,12 @@ if (!function_exists('deploy_module_symlink')) {
     }
 }
 
-$phoneSettingsDir = $amp_conf['AMPWEBROOT'] . '/PhoneSettings';
+// Ensure PhoneSettings itself is a real directory. Do not create a
+// PhoneSettings -> /tftpboot symlink; VPN private keys must never land
+// in /tftpboot/openvpn.
+if (!is_dir($phoneSettingsDir)) {
+    @mkdir($phoneSettingsDir, 0775, true);
+}
 
 $directories = [
     $phoneSettingsDir,
@@ -71,14 +92,16 @@ if (!file_exists($logFile)) {
 @chgrp($logFile, 'asterisk');
 @chmod($logFile, 0664);
 
-// 0.1 Symlinks strictly within this module's own footprint. (No touching
-//     of other modules' directories - the old code used to hijack
-//     admin/modules/yealink_epm here, which has been removed.)
-deploy_module_symlink($tftpDir, $module_root . '/tftpboot');
-deploy_module_symlink($phoneSettingsDir, $module_root . '/PhoneSettings');
-deploy_module_symlink($module_root, $phoneSettingsDir . '/' . $module_name);
-deploy_module_symlink($tftpDir, $phoneSettingsDir . '/tftpboot');
-deploy_module_symlink($module_root, $tftpDir . '/' . $module_name);
+// 0.1 Convenience cross-links for module access and provisioning. VPN
+//     state itself is not linked into /tftpboot.
+//     No touching of other modules' own directories - the old code used
+//     to hijack admin/modules/yealink_epm here, which has been removed.
+deploy_module_symlink($tftpDir, $module_root . '/tftpboot');            // module/tftpboot -> /tftpboot
+deploy_module_symlink($phoneSettingsDir, $module_root . '/PhoneSettings'); // module/PhoneSettings -> PhoneSettings
+deploy_module_symlink($module_root, $phoneSettingsDir . '/' . $module_name); // PhoneSettings/ovpn_mgr -> module
+deploy_module_symlink($tftpDir, $phoneSettingsDir . '/tftpboot');       // PhoneSettings/tftpboot -> /tftpboot
+deploy_module_symlink($module_root, $tftpDir . '/' . $module_name);    // tftpboot/ovpn_mgr -> module
+deploy_module_symlink($phoneSettingsDir, $tftpDir . '/PhoneSettings'); // tftpboot/PhoneSettings -> PhoneSettings
 
 // 1. Prevent directory browsing of the web-served phone-provisioning dirs.
 foreach ([$baseDir, $pkgDir] as $webDir) {
@@ -172,7 +195,7 @@ cert {$pkiDir}/server.crt
 key {$pkiDir}/private/server.key
 dh {$pkiDir}/dh.pem
 server 10.1.0.0 255.255.255.0
-push "route {$serverLanNet} {$serverSubnet}"
+push "route {$rawServerIp} 255.255.255.255"
 keepalive 10 120
 
 cipher AES-128-CBC
@@ -257,21 +280,17 @@ DirectoryIndex disabled
     Allow from 192.168.0.0/16
 </IfModule>
 
-IndexIgnore openvpn ovpn_mgr vpnkeys yealink_epm
+IndexIgnore openvpn ovpn_mgr vpnkeys yealink_epm ovpn_mgr_backup_*.tar.gz
 
 EOT;
 
-$target_htaccess_files = [
-    "/var/www/html/PhoneSettings/.htaccess",
-    "/tftpboot/.htaccess"
-];
-
-foreach ($target_htaccess_files as $htaccess_path) {
-    if (!file_exists($htaccess_path) || file_get_contents($htaccess_path) !== $htaccess_content) {
-        @file_put_contents($htaccess_path, $htaccess_content);
-        @chown($htaccess_path, 'asterisk');
-        @chmod($htaccess_path, 0644);
-    }
+// Written to the canonical web-root PhoneSettings directory. This is
+// intentionally not /tftpboot and must not be a symlink to it.
+$htaccess_path = "{$phoneSettingsDir}/.htaccess";
+if (!file_exists($htaccess_path) || file_get_contents($htaccess_path) !== $htaccess_content) {
+    @file_put_contents($htaccess_path, $htaccess_content);
+    @chown($htaccess_path, 'asterisk');
+    @chmod($htaccess_path, 0644);
 }
 
 

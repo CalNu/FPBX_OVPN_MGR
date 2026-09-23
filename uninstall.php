@@ -2,8 +2,12 @@
 if (!defined('FREEPBX_IS_AUTH')) { die('No direct script access allowed'); }
 
 $ampWebRoot  = rtrim($amp_conf['AMPWEBROOT'] ?? '/var/www/html', '/');
-$baseDir     = "{$ampWebRoot}/PhoneSettings/openvpn";
-$pkgDir      = "{$ampWebRoot}/PhoneSettings/vpnkeys";
+$phoneSettingsDir = "{$ampWebRoot}/PhoneSettings";
+// Matches install.php: this module's data lives under
+// PhoneSettings/openvpn and PhoneSettings/vpnkeys, wherever
+// PhoneSettings currently resolves to.
+$baseDir     = "{$phoneSettingsDir}/openvpn";
+$pkgDir      = "{$phoneSettingsDir}/vpnkeys";
 $moduleDir   = __DIR__;
 $ovpnctl     = "{$moduleDir}/scripts/ovpnctl";
 $sudoersFile = '/etc/sudoers.d/ovpn_mgr';
@@ -11,27 +15,14 @@ $sysctlFile  = '/etc/sysctl.d/99-ovpn-mgr.conf';
 $natStateDir = '/etc/ovpn_mgr';
 $natUnitFile = '/etc/systemd/system/ovpn-mgr-nat.service';
 
-function removeDirectoryRecursive($dir) {
-    if (!is_dir($dir)) {
-        return;
-    }
-    $items = scandir($dir);
-    if ($items === false) {
-        return;
-    }
-    foreach ($items as $item) {
-        if ($item === '.' || $item === '..') {
-            continue;
-        }
-        $path = $dir . '/' . $item;
-        if (is_dir($path) && !is_link($path)) {
-            removeDirectoryRecursive($path);
-        } else {
-            @unlink($path);
-        }
-    }
-    @rmdir($dir);
-}
+// This uninstaller intentionally never deletes anything under
+// PhoneSettings - not the CA, not client keys, not built packages, not
+// PhoneSettings itself. Uninstalling the module removes the module's
+// own code and its root-level hooks (sudoers rule, systemd unit,
+// module signature); it does not touch data. If you want that data
+// gone, remove it yourself:
+//   rm -rf /var/www/html/PhoneSettings/openvpn
+//   rm -rf /var/www/html/PhoneSettings/vpnkeys
 
 // 1. Stop the daemon via the scoped helper, if it was ever set up. This
 //    only works if the admin ran setup-root.sh; if not, there is nothing
@@ -64,21 +55,12 @@ if (file_exists($pidFile)) {
 //    ($sudoersFile, $sysctlFile, $natUnitFile, $natStateDir above list
 //    the exact paths for reference.)
 
-// 3. Remove generated VPN keys, packages, configs, and logs (all owned
-//    by the web user - no privilege needed).
-if (is_dir($pkgDir)) {
-    removeDirectoryRecursive($pkgDir);
-}
-if (is_dir($baseDir)) {
-    removeDirectoryRecursive($baseDir);
-}
-
-// 4. Remove module signature.
+// 3. Remove module signature.
 if (file_exists("{$moduleDir}/module.sig")) {
     @unlink("{$moduleDir}/module.sig");
 }
 
-// 5. Restore terminal TTY state if uninstalled via CLI/fwconsole.
+// 4. Restore terminal TTY state if uninstalled via CLI/fwconsole.
 if (php_sapi_name() === 'cli' && function_exists('posix_isatty') && defined('STDOUT') && posix_isatty(STDOUT)) {
     system('stty sane 2>/dev/null');
 }

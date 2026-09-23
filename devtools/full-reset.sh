@@ -34,8 +34,16 @@ AMPWEBROOT="$(cd "${MODULE_DIR}/../.." && pwd)"
 if [ ! -d "${AMPWEBROOT}/admin/modules" ]; then
     AMPWEBROOT="/var/www/html"
 fi
-VPN_DATA_DIR="${AMPWEBROOT}/PhoneSettings/openvpn"
-PKG_DIR="${AMPWEBROOT}/PhoneSettings/vpnkeys"
+# Matches install.php, ovpnctl, and setup-root.sh: this module's data
+# lives under PhoneSettings/openvpn and PhoneSettings/vpnkeys, wherever
+# PhoneSettings currently resolves to.
+PHONE_SETTINGS_DIR="${AMPWEBROOT}/PhoneSettings"
+if [ -L "$PHONE_SETTINGS_DIR" ]; then
+    echo "Refusing reset: $PHONE_SETTINGS_DIR is a symlink; resolve the canonical data directory first." >&2
+    exit 1
+fi
+VPN_DATA_DIR="${PHONE_SETTINGS_DIR}/openvpn"
+PKG_DIR="${PHONE_SETTINGS_DIR}/vpnkeys"
 
 SUDOERS_FILE="/etc/sudoers.d/ovpn_mgr"
 SYSCTL_FILE="/etc/sysctl.d/99-ovpn-mgr.conf"

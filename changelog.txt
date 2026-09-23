@@ -1,0 +1,27 @@
+2.60
+• Moved the fwconsole reload to freepbx built in apply config after Save Settings & Restart Daemon to speed up changes.
+• Fixed corrupted text on Cipher selections and notices.
+• Change Local IP and Public IP buttons to pure icons with hoverover text
+
+2.50
+• Fixed phones on VPN not accessible using their lan ip, only their OpenVPN IP (push {serverIP} 255.255.255.255).
+• Fixed reboot bug requiring running setup-root.sh script each reboot.
+• Added permissions in setup-root.sh script to allow yealink_epm module to scan OpenVPN subnets for yealink MAC addresses.
+• Added cipher selection labeling with a warning for phones that don't work with stronger ciphers and using weak ciphers for newer models.
+• Fixed port number change not sticking.
+• OpenVPN server config and PKI are anchored to the real AMPWEBROOT/PhoneSettings/openvpn directory.
+• Installer no longer creates PhoneSettings -> /tftpboot.
+• Admin UI and privileged scripts refuse a symlinked PhoneSettings directory to prevent VPN data from being written under /tftpboot.
+• Existing installations with PhoneSettings symlinked to /tftpboot require a one-time, backed-up migration before reinstalling/restarting the module.
+• Provisioning builder Extension and Phone MAC suggestion lists now exclude identifiers already present in generated OpenVPN/keys archives; displays a helpful note when no unused suggestions remain.
+• Added root-setup integration to derive the OpenVPN client subnet from legacy-vpn.conf and add it idempotently to Fail2Ban [DEFAULT] ignoreip, preserving existing entries. Performs a config test and reloads active Fail2Ban; skips cleanly if Fail2Ban is not installed.
+• Automatically merges the OpenVPN client pool into FreePBX Asterisk SIP Settings > NAT > Local Networks, preserving existing entries and triggering a FreePBX reload. Syncs during root setup and whenever VPN subnet settings are saved.
+• Fixed reboot persistence: setup-root now installs/enables ovpn-mgr-openvpn.service so the OpenVPN daemon starts automatically after boot, ordered after network-online and the VPN NAT restore service. NAT restoration is ordered after common firewall services; setup reports service-start failures with journalctl diagnostics.
+
+
+2.40
+• Fixed PhoneSetting folder getting wiped on install/reinstall
+• Fixed issue with port number not sticking and reverting back to 1194
+• Fixed symlinks not getting created properly
+• Fixed bug from 2.3 that broke signing
+
