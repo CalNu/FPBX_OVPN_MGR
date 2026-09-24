@@ -1,4 +1,5 @@
 2.61
+• setup-root.sh: the Fail2Ban whitelist helper is now PHP (scripts/fail2ban-whitelist.php) instead of Python, so it works on FreePBX 16 systems without python3. A helper failure is now a warning and no longer aborts the rest of setup.
 • Added "Rebuild Config Selected" (package manager) and "Rebuild Config, Keep Keys" (after a server address/port change): rewrites vpn.cnf and re-tars the package without revoking - each phone keeps its key, certificate and cipher.
 • Fixed Rebuild All and Revoke & Rebuild Selected resetting every package's cipher to AES-128-CBC; the package's existing cipher is now preserved.
 • Added a notice under Server Public IP / Host when a hostname is entered: some Yealink phones hang on "obtaining IP address" when vpn.cnf uses a hostname; use an IP or set the phone to a static IP.

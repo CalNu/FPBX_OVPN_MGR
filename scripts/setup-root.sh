@@ -145,9 +145,11 @@ rm -f "$TMP_SUDOERS"
 # This runs only from this root-only setup script, never from a web request.
 # The helper derives the exact pool from legacy-vpn.conf and appends it
 # idempotently to [DEFAULT] ignoreip while preserving existing entries.
-FAIL2BAN_HELPER="${MODULE_DIR}/scripts/fail2ban-whitelist.py"
+FAIL2BAN_HELPER="${MODULE_DIR}/scripts/fail2ban-whitelist.php"
 OPENVPN_CONF="${VPN_DATA_DIR}/legacy-vpn.conf"
-if command -v fail2ban-client >/dev/null 2>&1; then
+if ! command -v php >/dev/null 2>&1; then
+    echo "WARNING: php not found; skipping Fail2Ban whitelist." >&2
+elif command -v fail2ban-client >/dev/null 2>&1; then
     if [ -f "$OPENVPN_CONF" ]; then
         F2B_LOCAL="/etc/fail2ban/jail.local"
         F2B_PREEXISTED=0
@@ -156,9 +158,20 @@ if command -v fail2ban-client >/dev/null 2>&1; then
             F2B_PREEXISTED=1
             cp -p "$F2B_LOCAL" "$F2B_SNAPSHOT"
         fi
-        F2B_OUTPUT="$(python3 "$FAIL2BAN_HELPER" "$OPENVPN_CONF" "$F2B_LOCAL")"
-        echo "$F2B_OUTPUT" | sed '$d'
-        if fail2ban-client -t >/dev/null 2>&1; then
+        # Capture the helper's exit code without letting `set -e` abort the
+        # rest of the setup (SIP sync, ip_forward, systemd units) if it fails.
+        F2B_RC=0
+        F2B_OUTPUT="$(php "$FAIL2BAN_HELPER" "$OPENVPN_CONF" "$F2B_LOCAL" 2>&1)" || F2B_RC=$?
+        if [ "$F2B_RC" -ne 0 ]; then
+            rm -f "$F2B_SNAPSHOT"
+            echo "WARNING: Fail2Ban whitelist helper failed (exit ${F2B_RC}); skipping the whitelist. ${F2B_OUTPUT}" >&2
+            F2B_OUTPUT=""
+        else
+            echo "$F2B_OUTPUT" | sed '$d'
+        fi
+        if [ "$F2B_RC" -ne 0 ]; then
+            :
+        elif fail2ban-client -t >/dev/null 2>&1; then
             rm -f "$F2B_SNAPSHOT"
             if systemctl is-active --quiet fail2ban 2>/dev/null; then
                 if ! fail2ban-client reload; then
