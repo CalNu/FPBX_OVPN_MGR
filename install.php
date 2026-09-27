@@ -19,6 +19,7 @@ $pkiDir      = "{$baseDir}/legacy_pki";
 $serverConf  = "{$baseDir}/legacy-vpn.conf";
 $logDir      = "{$baseDir}/logs";
 $logFile     = "{$logDir}/openvpn.log";
+$statusFile  = "{$logDir}/openvpn-status.log";
 $module_name = 'ovpn_mgr';
 $module_root = __DIR__;
 
@@ -91,6 +92,20 @@ if (!file_exists($logFile)) {
 @chown($logFile, 'asterisk');
 @chgrp($logFile, 'asterisk');
 @chmod($logFile, 0664);
+
+// Same reasoning as $logFile above: OpenVPN's "status" directive reuses
+// this same file/inode across every restart rather than recreating it,
+// so whatever ownership it gets here is permanent short of a manual fix.
+// ovpnctl's "start" case re-asserts this on every start too (belt and
+// suspenders for upgrades where this file already existed before this
+// fix), but pre-creating it correctly here means a first-ever install
+// never hits the bug at all.
+if (!file_exists($statusFile)) {
+    @touch($statusFile);
+}
+@chown($statusFile, 'asterisk');
+@chgrp($statusFile, 'asterisk');
+@chmod($statusFile, 0640);
 
 // 0.1 Convenience cross-links for module access and provisioning. VPN
 //     state itself is not linked into /tftpboot.

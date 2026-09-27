@@ -167,6 +167,27 @@ case "$cmd" in
       chown root:asterisk "$MGMT_SOCK" 2>/dev/null || true
       chmod 660 "$MGMT_SOCK" 2>/dev/null || true
     fi
+
+    # OpenVPN's "status" directive creates $STATUS_FILE itself (root:root,
+    # mode 0600 by default) the same way it would the mgmt socket, but
+    # unlike the socket this is a regular file on persistent disk: once
+    # it's been created once, OpenVPN truncates-and-rewrites the SAME
+    # inode on every subsequent interval and every later restart, rather
+    # than unlinking and recreating it - so whatever ownership/mode it
+    # ends up with here is what the "Connected OpenVPN Clients" table has
+    # to live with until the box is rebuilt from scratch. Fix it up here,
+    # every start, the same way the socket is fixed up above: 0600 root
+    # means the asterisk user Apache/PHP actually runs as can never read
+    # it, which reads to the GUI as "no clients connected" even with a
+    # live session, no matter what the daemon's own status file says.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      [ -f "$STATUS_FILE" ] && break
+      sleep 0.2
+    done
+    if [ -f "$STATUS_FILE" ]; then
+      chown root:asterisk "$STATUS_FILE" 2>/dev/null || true
+      chmod 640 "$STATUS_FILE" 2>/dev/null || true
+    fi
     ;;
 
   stop)

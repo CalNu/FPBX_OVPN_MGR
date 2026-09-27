@@ -5,6 +5,7 @@
 • Added kill/disconnect client button
 • Fixed log line break not sticking.
 • Fixed log clearing every time OpenVPN restarts. Added 5 MB limit to log file before it writes over itself.
+• Fixed permission for openvpn-status.log so the connected client's show up properly
 
 2.63
 • AES-256-CBC packages are now treated as legacy, like AES-128-CBC: their vpn.cnf no longer includes data-ciphers / data-ciphers-fallback (older phone builds reject them). Only the GCM ciphers get those lines.
