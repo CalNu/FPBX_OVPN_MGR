@@ -1,3 +1,26 @@
+2.64
+• Added cipher used column in provisioning archives.
+• Updated setup-root.sh to add a new step that grants asterisk a read-only POSIX ACL on apache2 log directories actually exist, plus a default ACL on the directory so logs recreated later by logrotate inherit the grant automatically. This is to give permission to the Yealink EPM subnet scanner to add a device.
+• Fixed issue where disconnected/dead/stale devices wouldn't clear from the server.
+• Added kill/disconnect client button
+• Fixed log line break not sticking.
+• Fixed log clearing every time OpenVPN restarts. Added 5 MB limit to log file before it writes over itself.
+
+2.63
+• AES-256-CBC packages are now treated as legacy, like AES-128-CBC: their vpn.cnf no longer includes data-ciphers / data-ciphers-fallback (older phone builds reject them). Only the GCM ciphers get those lines.
+• AES-256-CBC is now the initial default cipher (new installs, and installs that have not picked a default). buildClientPackage() called without a cipher now uses the server default instead of AES-128-CBC.
+• Dropdown option 2 is now labelled "Legacy Compatibility — AES-256-CBC" and its notice says so.
+• Added a heads-up in the cipher notice when a chosen legacy (CBC) cipher differs from the CBC ciphers already used by other packages. Older phones can't negotiate, so they all share the server's single fallback cipher.
+• Created Provisioning Archives table can now be sorted by Extension, MAC or Date Created: click a column header (click again to reverse). Extension sorts numerically, Date starts newest-first, and the choice is remembered in the browser.
+• Added "status" subcommand to ovpnctl script to allow yealink_epm module to read status of connected clients
+
+2.62
+• Added a "Default" checkbox next to the Phone / Cipher dropdown. Tick "Make default" on any cipher and Generate to save it as the default: it is pre-selected for new packages and becomes the server's fallback cipher.
+• AES-128-CBC is no longer forced as a fallback. The server's data-ciphers / data-ciphers-fallback / cipher lines now only include AES-128-CBC when it is the default cipher or at least one package uses it (legacy phones can't negotiate, so they still need it).
+• GCM client configs no longer include "auth SHA1" (GCM doesn't use it). CBC ciphers still include it, since the server's HMAC is one server-wide setting.
+• Fixed data-ciphers being appended again on every Generate Package (the old match pattern never matched); duplicates are cleaned up the next time the cipher lines are synced.
+• Generate Package now restarts the daemon when the server's cipher lines changed, so a new cipher takes effect immediately.
+
 2.61
 • setup-root.sh: the Fail2Ban whitelist helper is now PHP (scripts/fail2ban-whitelist.php) instead of Python, so it works on FreePBX 16 systems without python3. A helper failure is now a warning and no longer aborts the rest of setup.
 • Added "Rebuild Config Selected" (package manager) and "Rebuild Config, Keep Keys" (after a server address/port change): rewrites vpn.cnf and re-tars the package without revoking - each phone keeps its key, certificate and cipher.

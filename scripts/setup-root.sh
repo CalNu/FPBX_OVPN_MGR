@@ -16,6 +16,9 @@
 #   4. Adds the OpenVPN client pool to Fail2Ban's DEFAULT ignoreip list.
 #   5. Installs a systemd unit that reapplies the VPN's NAT rule at boot
 #      (nothing else - it doesn't touch your OS's normal firewall setup).
+#   6. Grants 'asterisk' read-only ACL access to the web server's access
+#      log (httpd/apache2/nginx), so the Yealink EPM subnet scanner can
+#      learn MACs of phones behind a routed OpenVPN tunnel.
 #
 # It is written to be distro-agnostic: it doesn't assume the FreePBX
 # Distro, a script-installed Debian box, or Incredible PBX - only that
@@ -228,6 +231,53 @@ else
     echo "WARNING: OpenVPN config or SIP Local Networks helper unavailable; skipping FreePBX SIP Settings sync." >&2
 fi
 
+# --- 3c. Grant 'asterisk' read access to the web server's access log -------
+# A routed OpenVPN tunnel never puts the phone's MAC in the PBX's ARP table,
+# so the Yealink EPM module's subnet scanner learns those MACs the only way
+# it can: by reading the phone's own provisioning request (".../<mac>.cfg")
+# out of the web server's access log. That log is owned by the web server,
+# not 'asterisk', so without an explicit grant is_readable() fails and the
+# scanner reports every routed-tunnel client as unresolved.
+#
+# A POSIX ACL is used instead of `usermod -aG <log-group> asterisk` for two
+# reasons: it takes effect immediately (group membership only applies to
+# processes started after the change, so PHP-FPM/Apache/Nginx would need a
+# restart), and it grants read on just this one log rather than every log
+# owned by that group. A *default* ACL is also set on the directory so
+# logs recreated later by logrotate inherit the same read grant automatically
+# - this script does not need to be rerun after every rotation.
+ACCESS_LOG_DIRS=(/var/log/httpd /var/log/apache2 /var/log/nginx)
+if ! command -v setfacl >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y acl >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y acl >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y acl >/dev/null 2>&1 || true
+    fi
+fi
+if command -v setfacl >/dev/null 2>&1; then
+    ACL_GRANTED=0
+    for dir in "${ACCESS_LOG_DIRS[@]}"; do
+        [ -d "$dir" ] || continue
+        if setfacl -m u:asterisk:rx "$dir" 2>/dev/null && setfacl -d -m u:asterisk:r "$dir" 2>/dev/null; then
+            # Cover logs that already exist (including already-rotated ones),
+            # not just ones logrotate creates from here on.
+            find "$dir" -maxdepth 1 -type f -iname '*access*' -print0 2>/dev/null \
+                | xargs -0 -r setfacl -m u:asterisk:r 2>/dev/null || true
+            ACL_GRANTED=1
+            echo "==> Granted 'asterisk' read access to $dir (ACL; future rotated logs are covered too)"
+        else
+            echo "WARNING: setfacl failed on $dir - the filesystem may not support ACLs (needs the 'acl' mount option, default on modern ext4/xfs). Grant $dir read access to 'asterisk' manually." >&2
+        fi
+    done
+    if [ "$ACL_GRANTED" -eq 0 ]; then
+        echo "WARNING: No web server access log directory found among: ${ACCESS_LOG_DIRS[*]}. The subnet scanner won't resolve phones behind a routed VPN tunnel until one exists; rerun this script once the web server is installed." >&2
+    fi
+else
+    echo "WARNING: 'setfacl' not found and could not be installed automatically (install your distro's 'acl' package, then rerun this script). Until then the subnet scanner can't read the web server's access log, so it won't resolve phones behind a routed VPN tunnel." >&2
+fi
+
 # --- 4. Persist IP forwarding ---
 echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-ovpn-mgr.conf
 sysctl -p /etc/sysctl.d/99-ovpn-mgr.conf >/dev/null
@@ -348,4 +398,7 @@ echo "  - ${SUDOERS_FILE} grants 'asterisk' passwordless sudo on that script onl
 echo "  - net.ipv4.ip_forward=1 persisted in /etc/sysctl.d/99-ovpn-mgr.conf"
 echo "  - ovpn-mgr-nat.service will reapply the VPN's NAT rule on every boot"
 echo "  - ovpn-mgr-openvpn.service is enabled to start OpenVPN on every boot"
+echo "  - 'asterisk' was granted read-only ACL access to the web server's access"
+echo "    log (see warnings above if that could not be completed), so the Yealink"
+echo "    EPM subnet scanner can resolve phones behind a routed VPN tunnel"
 echo "Reload the OpenVPN Manager admin page - the setup banner should clear."

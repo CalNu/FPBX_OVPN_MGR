@@ -186,6 +186,29 @@ if (!file_exists($serverConf)) {
         $legacyTlsLines = "tls-cipher \"DEFAULT\"\n";
     }
 
+    // No "duplicate-cn": each extension's cert should only ever be live
+    // once. Without it, OpenVPN's default behavior is to immediately drop
+    // any existing session for a CN the instant a new one with the same
+    // CN authenticates - i.e. a phone reconnecting (reboot, VPN restart,
+    // roaming to a new IP) replaces its own stale session right away
+    // instead of both lingering side-by-side until --ping-restart times
+    // the old one out several minutes later.
+    //
+    // "status-version 3" + "management ... unix" are what let the GUI's
+    // Connected OpenVPN Clients table read the daemon's own live session
+    // list (which self-corrects the moment a session actually ends)
+    // instead of inferring "still connected" from historical connect
+    // events in the log, and let it send a targeted client-kill for the
+    // "Kill Connection" button. See lib/client_ops.php's
+    // startOpenVpnServer() for the equivalent reconciliation applied to
+    // configs generated before this existed.
+    //
+    // Deliberately no "log <path>" directive here: ovpnctl's "start" case
+    // already passes "--log-append <path>" on the command line, and having
+    // both present truncates the log on every restart instead of
+    // appending to it - whichever of the two actually wins isn't simply
+    // "the last one specified", so this isn't safe to add back even
+    // alongside --log-append.
     $serverConfigContent = <<<CONF
 port 1194
 proto udp
@@ -198,19 +221,20 @@ server 10.1.0.0 255.255.255.0
 push "route {$rawServerIp} 255.255.255.255"
 keepalive 10 120
 
-cipher AES-128-CBC
+cipher AES-256-CBC
 auth SHA1
-data-ciphers AES-128-CBC
-data-ciphers-fallback AES-128-CBC
+data-ciphers AES-256-CBC
+data-ciphers-fallback AES-256-CBC
 
 tls-version-min 1.0
 {$legacyTlsLines}
-duplicate-cn
 topology subnet
 persist-key
 persist-tun
 status {$logDir}/openvpn-status.log 1
-log {$logFile}
+status-version 3
+management /run/ovpn_mgr/mgmt.sock unix
+management-client-user asterisk
 verb 3
 CONF;
     file_put_contents($serverConf, $serverConfigContent);

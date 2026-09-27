@@ -19,6 +19,7 @@ if (is_dir("/tftpboot/openvpn") && !is_dir($baseDir)) {
 $pkgDir      = "{$phoneSettingsDir}/vpnkeys";
 $pkiDir      = "{$baseDir}/legacy_pki";
 $logFile     = "{$baseDir}/logs/openvpn.log";
+$statusFile  = "{$baseDir}/logs/openvpn-status.log";
 $serverConf  = "{$baseDir}/legacy-vpn.conf";
 $crlFile     = "{$pkiDir}/crl.pem";
 $pidFile     = "{$baseDir}/openvpn.pid";
@@ -308,7 +309,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch_log') {
     if (ob_get_level()) { ob_end_clean(); }
     header('Content-Type: text/plain; charset=utf-8');
     if (file_exists($logFile)) {
-        $lines = explode("\n", tailFile($logFile, 200));
+        $breakMarkerFile = "{$baseDir}/logs/.line_break_pos";
+        $breakMarkerPos = file_exists($breakMarkerFile) ? (int)trim((string)@file_get_contents($breakMarkerFile)) : null;
+        $lines = explode("\n", tailFileFromMarker($logFile, $breakMarkerPos, 200));
         $cleanLines = [];
         foreach ($lines as $line) {
             if (strpos($line, 'global-message-banner') === false && strpos($line, 'Unsigned Module') === false) {
@@ -337,8 +340,17 @@ if (isset($_POST['action']) && $_POST['action'] === 'add_page_break') {
     csrf_require();
     if (ob_get_level()) { ob_end_clean(); }
     if (file_exists($logFile)) {
+        // Recorded *before* the append, so the marker points at the start
+        // of the divider itself - fetch_log's tailFileFromMarker() then
+        // always includes the divider line, not just whatever happens to
+        // follow it.
+        $breakMarkerFile = "{$baseDir}/logs/.line_break_pos";
+        $preAppendPos = filesize($logFile);
         $dividerText = "\n#############################################\n--- SEPARATOR (" . date('Y-m-d H:i:s') . ") ---\n#############################################\n";
         $written = @file_put_contents($logFile, $dividerText, FILE_APPEND);
+        if ($written !== false) {
+            @file_put_contents($breakMarkerFile, (string)$preAppendPos);
+        }
         echo $written !== false ? 'success' : 'error_write';
     } else {
         echo 'error_nofile';
@@ -450,6 +462,23 @@ if (isset($_POST['action']) && $_POST['action'] === 'manage_service') {
     } elseif ($serviceAction === 'stop') {
         @touch("{$baseDir}/.stopped");
         stopOpenVpnServer($ovpnctl);
+    }
+    header("Location: config.php?display=ovpn_mgr");
+    exit();
+}
+
+// ============================================================================
+// Kill one connected client's session (by its live status-file Client ID,
+// not by common name - see scripts/kill-client.php for why).
+// ============================================================================
+if (isset($_POST['action']) && $_POST['action'] === 'kill_client') {
+    csrf_require();
+    $cid = $_POST['client_id'] ?? '';
+    if (preg_match('/^[0-9]{1,10}$/', (string)$cid)) {
+        exec('sudo -n ' . escapeshellarg($ovpnctl) . ' kill-client ' . escapeshellarg($cid) . ' 2>&1', $killOut, $killRc);
+        if ($killRc !== 0) {
+            @file_put_contents($logFile, "\n[GUI KILL-CLIENT cid={$cid} Exit Code: {$killRc}]\n" . implode("\n", $killOut) . "\n", FILE_APPEND);
+        }
     }
     header("Location: config.php?display=ovpn_mgr");
     exit();
@@ -700,27 +729,15 @@ if (isset($_POST['action']) && $_POST['action'] === 'edit_package') {
         @unlink($oldPath);
 
         $settings = getActiveServerSettings($serverConf);
-        $selectedCipher = (string)($_POST['cipher'] ?? 'AES-128-CBC');
-        $allowedCiphers = ['AES-128-CBC', 'AES-256-CBC', 'AES-128-GCM', 'AES-256-GCM'];
-        if (!in_array($selectedCipher, $allowedCiphers, true)) {
-            $selectedCipher = 'AES-128-CBC';
+        $selectedCipher = (string)($_POST['cipher'] ?? '');
+        if (!in_array($selectedCipher, ovpnAllowedCiphers(), true)) {
+            $selectedCipher = getDefaultCipher($serverConf);
         }
 
-        // Ensure the server accepts the cipher selected while editing/rebuilding.
-        if (is_readable($serverConf) && is_writable($serverConf)) {
-            $serverText = (string)file_get_contents($serverConf);
-            $serverCipherList = 'AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC';
-            if (preg_match('/^data-ciphers\s+.*$/m', $serverText)) {
-                $serverText = preg_replace('/^data-ciphers\s+.*$/m', 'data-ciphers ' . $serverCipherList, $serverText);
-            } else {
-                $serverText .= "\ndata-ciphers " . $serverCipherList . "\n";
-            }
-            if (!preg_match('/^data-ciphers-fallback\s+/m', $serverText)) {
-                $serverText .= "data-ciphers-fallback AES-128-CBC\n";
-            }
-            file_put_contents($serverConf, $serverText);
-        }
-        buildClientPackage($pkiDir, $pkgDir, $baseDir, $newExt, $newMac, $settings['ip'], $settings['port'], $selectedCipher);
+        // Keep the server's cipher lines in step with what is in use; AES-128-CBC
+        // is only a fallback if it is the default or a package actually uses it.
+        syncServerCiphers($serverConf, $pkgDir, [$selectedCipher]);
+        buildClientPackage($pkiDir, $pkgDir, $baseDir, $newExt, $newMac, $settings['ip'], $settings['port'], $selectedCipher, false);
 
         if (!file_exists("{$baseDir}/.stopped")) {
             stopOpenVpnServer($ovpnctl);
@@ -739,22 +756,23 @@ if (isset($_POST['action']) && $_POST['action'] === 'generate_package') {
 
     if (!empty($ext) && !empty($mac)) {
         $settings = getActiveServerSettings($serverConf);
-        // Keep server negotiation compatible with every cipher offered by the UI.
-        // AES-128-CBC remains fallback for legacy phone firmware.
-        $serverCipherList = 'AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC';
-        if (is_readable($serverConf) && is_writable($serverConf)) {
-            $serverText = (string)file_get_contents($serverConf);
-            if (preg_match('/^data-ciphers\\s+.*$/m', $serverText)) {
-                $serverText = preg_replace('/^data-ciphers\\s+.*$/m', 'data-ciphers ' . $serverCipherList, $serverText);
-            } else {
-                $serverText .= "\ndata-ciphers " . $serverCipherList . "\n";
-            }
-            if (!preg_match('/^data-ciphers-fallback\\s+/m', $serverText)) {
-                $serverText .= "data-ciphers-fallback AES-128-CBC\n";
-            }
-            file_put_contents($serverConf, $serverText);
+        $selectedCipher = (string)($_POST['cipher'] ?? '');
+        if (!in_array($selectedCipher, ovpnAllowedCiphers(), true)) {
+            $selectedCipher = getDefaultCipher($serverConf);
         }
-        buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], (string)($_POST['cipher'] ?? 'AES-128-CBC'));
+        // "Set as default cipher" checkbox: remember this cipher as the default
+        // (pre-selected next time, and what the server falls back to).
+        if (!empty($_POST['set_default_cipher'])) {
+            setDefaultCipher($serverConf, $selectedCipher);
+        }
+        // AES-128-CBC is only added to the server's data-ciphers / fallback when it
+        // is the default or a package uses it. Restart only if that changed.
+        $cipherCfgChanged = syncServerCiphers($serverConf, $pkgDir, [$selectedCipher]);
+        buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], $selectedCipher, false);
+        if ($cipherCfgChanged && !file_exists("{$baseDir}/.stopped")) {
+            stopOpenVpnServer($ovpnctl);
+            startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
+        }
     }
     header("Location: config.php?display=ovpn_mgr");
     exit();
@@ -786,10 +804,12 @@ if (isset($_POST['action']) && $_POST['action'] === 'rebuild_all_packages') {
         $pkgCipher = getPackageCipher($pkgPath);
         revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $ext);
         @unlink($pkgPath);
-        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], $pkgCipher)) {
+        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], $pkgCipher, false)) {
             $rebuilt++;
         }
     }
+
+    syncServerCiphers($serverConf, $pkgDir);
 
     if (!file_exists("{$baseDir}/.stopped")) {
         stopOpenVpnServer($ovpnctl);
@@ -968,9 +988,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_rebuild_package
         $pkgCipher = getPackageCipher("{$pkgDir}/{$valid}");
         revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $ext);
         @unlink("{$pkgDir}/{$valid}");
-        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], $pkgCipher)) {
+        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], $pkgCipher, false)) {
             $rebuilt++;
         }
+    }
+
+    if ($rebuilt > 0) {
+        syncServerCiphers($serverConf, $pkgDir);
     }
 
     if ($rebuilt > 0 && !file_exists("{$baseDir}/.stopped")) {
@@ -994,7 +1018,9 @@ $subnetDetails = calculateSubnetDetails($currentHostIp, $currentNetMask);
 $currentCidr = $subnetDetails['cidr'];
 $currentClientIpCount = max(0, (pow(2, 32 - $currentCidr) - 2) - 1);
 
-$logContent = tailFile($logFile, 200);
+$initialBreakMarkerFile = "{$baseDir}/logs/.line_break_pos";
+$initialBreakMarkerPos = file_exists($initialBreakMarkerFile) ? (int)trim((string)@file_get_contents($initialBreakMarkerFile)) : null;
+$logContent = tailFileFromMarker($logFile, $initialBreakMarkerPos, 200);
 $hasTunError = (strpos($logContent, 'Cannot ioctl TUNSETIFF') !== false || strpos($logContent, 'Exiting due to fatal error') !== false);
 
 $pids = [];
@@ -1023,31 +1049,38 @@ $ip_forward_active = (trim((string)@shell_exec('sysctl -n net.ipv4.ip_forward 2>
 $hasSudoRule = hasOvpnctlAccess($ovpnctl);
 
 $createdPackages = glob("{$pkgDir}/*.tar");
+$ovpnCbcInUse = []; // legacy (CBC) cipher => package count, for the mixed-cipher warning
 $issuedCertFiles = glob("{$pkiDir}/issued/*.crt");
 
+// Read OpenVPN's own live status file (status-version 3, tab-separated -
+// see install.php / startOpenVpnServer()'s reconciliation) rather than
+// inferring "still connected" from CONNECT events in the daemon's
+// free-text activity log. The old log-scraping approach never noticed a
+// disconnect at all - it just showed the most recent connect event ever
+// seen for each virtual IP, forever, so a session that had long since
+// been reaped (or superseded by a reconnect) kept showing as "connected"
+// until that line eventually scrolled out of the log. The status file is
+// rewritten by the daemon itself in real time and only ever lists
+// sessions that are actually live right now, so this table now clears on
+// its own the moment a session really ends - no separate cleanup logic
+// needed here.
 $connectedClients = [];
-if (file_exists($logFile)) {
-    $logData = (string)@file_get_contents($logFile);
-    if (preg_match_all('/([A-Za-z0-9_\-]+)\/([\d\.]+:\d+)\s+MULTI_sva:\s+pool returned IPv4=([\d\.]+)/i', $logData, $matches, PREG_SET_ORDER)) {
-        $seenIps = [];
-        foreach (array_reverse($matches) as $m) {
-            $clientName = $m[1];
-            $realIp     = $m[2];
-            $virtIp     = $m[3];
-            if (!in_array($virtIp, $seenIps)) {
-                $seenIps[] = $virtIp;
-                $activeCipher = 'AES-128-CBC';
-                if (preg_match_all('/Data Channel.*[C|c]ipher [\'"]?([A-Za-z0-9\-]+)[\'"]?/i', $logData, $cipherMatches)) {
-                    $activeCipher = end($cipherMatches[1]);
-                }
-                $connectedClients[] = [
-                    'mac'           => $clientName,
-                    'virtual_ip'    => $virtIp,
-                    'real_ip'       => $realIp,
-                    'active_cipher' => $activeCipher,
-                ];
-            }
-        }
+if (file_exists($statusFile) && is_readable($statusFile)) {
+    $statusData = (string)@file_get_contents($statusFile);
+    foreach (explode("\n", $statusData) as $line) {
+        if (strpos($line, "CLIENT_LIST\t") !== 0) { continue; }
+        $f = explode("\t", rtrim($line, "\r\n"));
+        // CLIENT_LIST  CN  RealAddr  VirtAddr  VirtIPv6Addr  BytesRecv
+        // BytesSent  ConnectedSince  ConnectedSinceEpoch  Username
+        // ClientID  PeerID  DataChannelCipher
+        if (count($f) < 13) { continue; }
+        $connectedClients[] = [
+            'mac'           => $f[1],
+            'real_ip'       => $f[2],
+            'virtual_ip'    => $f[3],
+            'active_cipher' => $f[12] !== '' ? $f[12] : 'AES-128-CBC',
+            'client_id'     => $f[10],
+        ];
     }
 }
 ?>
@@ -1306,14 +1339,21 @@ if (file_exists($logFile)) {
                             </div>
 
                             <!-- Cipher selector ordered weakest to strongest -->
+                            <?php $ovpnDefaultCipher = getDefaultCipher($serverConf); ?>
                             <div class="form-group" style="margin-bottom: 0; min-width: 0;">
                                 <label for="ovpn_cipher" style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 5px;">Phone / Cipher</label>
-                                <select id="ovpn_cipher" name="cipher" class="form-control" style="height: 34px; width: 215px; max-width: 100%;">
-                                    <option value="AES-128-CBC" data-level="legacy" selected>1 &mdash; Weakest / Legacy Compatibility &mdash; AES-128-CBC</option>
-                                    <option value="AES-256-CBC" data-level="caution">2 &mdash; AES-256-CBC (Legacy CBC)</option>
-                                    <option value="AES-128-GCM" data-level="modern">3 &mdash; AES-128-GCM (Modern)</option>
-                                    <option value="AES-256-GCM" data-level="strong">4 &mdash; Strongest &mdash; AES-256-GCM</option>
-                                </select>
+                                <div style="display: flex; align-items: center; gap: 10px;">
+                                    <select id="ovpn_cipher" name="cipher" class="form-control" style="height: 34px; width: 215px; max-width: 100%;" data-default-cipher="<?php echo htmlspecialchars($ovpnDefaultCipher); ?>">
+                                        <option value="AES-128-CBC" data-level="legacy"<?php echo $ovpnDefaultCipher === 'AES-128-CBC' ? ' selected' : ''; ?>>1 &mdash; Weakest / Legacy Compatibility &mdash; AES-128-CBC</option>
+                                        <option value="AES-256-CBC" data-level="legacy"<?php echo $ovpnDefaultCipher === 'AES-256-CBC' ? ' selected' : ''; ?>>2 &mdash; Legacy Compatibility &mdash; AES-256-CBC</option>
+                                        <option value="AES-128-GCM" data-level="modern"<?php echo $ovpnDefaultCipher === 'AES-128-GCM' ? ' selected' : ''; ?>>3 &mdash; AES-128-GCM (Modern)</option>
+                                        <option value="AES-256-GCM" data-level="strong"<?php echo $ovpnDefaultCipher === 'AES-256-GCM' ? ' selected' : ''; ?>>4 &mdash; Strongest &mdash; AES-256-GCM</option>
+                                    </select>
+                                    <label for="ovpn_cipher_default" style="font-size: 11px; font-weight: normal; margin: 0; white-space: nowrap; cursor: pointer;" title="Pre-selects this cipher for new packages and makes it the server's fallback cipher. AES-128-CBC is only a fallback when it is the default or a phone is using it.">
+                                        <input type="checkbox" id="ovpn_cipher_default" name="set_default_cipher" value="1" style="margin: 0 4px 0 0; vertical-align: middle;">
+                                        <span id="ovpn_cipher_default_text">Default</span>
+                                    </label>
+                                </div>
                             </div>
                         </div>
 
@@ -1346,10 +1386,20 @@ if (file_exists($logFile)) {
                                 <tr><td colspan="4" class="text-muted" style="padding: 12px; text-align: center;">No active client tunnels currently connected.</td></tr>
                             <?php else: foreach ($connectedClients as $client): ?>
                                 <tr>
-                                    <td><code><?php echo htmlspecialchars($client['mac']); ?></code></td>
-                                    <td><code><?php echo htmlspecialchars($client['virtual_ip']); ?></code></td>
-                                    <td><?php echo htmlspecialchars($client['real_ip']); ?></td>
-                                    <td><span class="label label-info"><?php echo htmlspecialchars($client['active_cipher']); ?></span></td>
+                                    <td style="vertical-align: middle !important;"><code><?php echo htmlspecialchars($client['mac']); ?></code></td>
+                                    <td style="vertical-align: middle !important;"><code><?php echo htmlspecialchars($client['virtual_ip']); ?></code></td>
+                                    <td style="vertical-align: middle !important;"><?php echo htmlspecialchars($client['real_ip']); ?></td>
+                                    <td style="padding-left: 10px; ">
+                                        <span class="label label-info"><?php echo htmlspecialchars($client['active_cipher']); ?></span>
+                                        <form method="post" action="config.php?display=ovpn_mgr" style="display:inline;">
+                                            <input type="hidden" name="action" value="kill_client">
+                                            <input type="hidden" name="client_id" value="<?php echo htmlspecialchars($client['client_id'], ENT_QUOTES); ?>">
+                                            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
+                                            <button type="submit" title="Kill connection to Ext. <?php echo htmlspecialchars($client['mac'], ENT_QUOTES); ?>" data-confirm-message="Disconnect extension <?php echo htmlspecialchars($client['mac'], ENT_QUOTES); ?> at <?php echo htmlspecialchars($client['virtual_ip'], ENT_QUOTES); ?>? The phone will reconnect on its own if it's still online." <?php echo !$hasSudoRule ? 'disabled' : ''; ?> style="background: none; border: none; padding: 0; margin-left: 20px; color: #D60500; cursor: pointer; font-size: 22px; vertical-align: middle; line-height: 1;">
+                                                <i class="fa fa-times-circle"></i>
+                                            </button>
+                                        </form>
+                                    </td>
                                 </tr>
                             <?php endforeach; endif; ?>
                         </tbody>
@@ -1368,19 +1418,22 @@ if (file_exists($logFile)) {
                     <?php if (empty($createdPackages)): ?>
                         <div style="padding: 20px; text-align: center;" class="text-muted">No provisioning packages have been generated yet.</div>
                     <?php else: ?>
-                        <table class="table table-striped table-bordered" style="margin-bottom: 0; table-layout: fixed; width: 100%;">
+                        <table id="ovpnPkgTable" class="table table-striped table-bordered" style="margin-bottom: 0; table-layout: fixed; width: 100%;">
                             <colgroup>
-                                <col style="width: 100px;">
-                                <col style="width: 160px;">
+                                <col style="width: 105px;">
+                                <col style="width: 130px;">
+                                <col style="width: 80px;">
                                 <col style="width: auto;">
-                                <col style="width: 165px;">
+                                <col style="width: 170px;">
                             </colgroup>
 
                             <thead>
                                 <tr>
-                                    <th colspan="2" style="text-align: center;">Extension</th>
-                                    <th style="width: auto; text-align: center;">Date Created</th>
-                                    <th style="width: 165px; text-align: center;">Actions</th>
+                                    <th class="ovpn-sortable" data-sort="ext" tabindex="0" title="Sort by extension" style="text-align: left; padding-left: 10px;">Extension <span class="ovpn-sort-ind"></span></th>
+                                    <th class="ovpn-sortable" data-sort="mac" tabindex="0" title="Sort by MAC address" style="text-align: left; padding-left: 15px;">MAC <span class="ovpn-sort-ind"></span></th>
+                                    <th class="ovpn-sortable" data-sort="cipher" tabindex="0" title="Sort by cipher" style="text-align: center;">Cipher <span class="ovpn-sort-ind"></span></th>
+                                    <th class="ovpn-sortable" data-sort="date" tabindex="0" title="Sort by date created" style="width: auto; text-align: center;">Date Created <span class="ovpn-sort-ind"></span></th>
+                                    <th style="width: 155px; text-align: center;">Actions</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -1402,24 +1455,30 @@ if (file_exists($logFile)) {
 
     // Read the archive's current cipher so Edit opens with its existing value.
     $pkgCipher = getPackageCipher($pkgPath);
+    if (ovpnIsCbcCipher($pkgCipher)) { $ovpnCbcInUse[$pkgCipher] = ($ovpnCbcInUse[$pkgCipher] ?? 0) + 1; }
+    $pkgMtime = (int)filemtime($pkgPath);
 ?>
-    <tr>
-        <td style="text-align: left; vertical-align: middle; font-size: 14px; cursor: default; padding-left: 15px; border-right: none;" 
+    <tr data-ext="<?php echo htmlspecialchars($pkgExt, ENT_QUOTES); ?>" data-mac="<?php echo htmlspecialchars(strtolower($pkgMac), ENT_QUOTES); ?>" data-cipher="<?php echo htmlspecialchars(strtolower($pkgCipher), ENT_QUOTES); ?>" data-date="<?php echo $pkgMtime; ?>">
+        <td style="text-align: left; vertical-align: middle; font-size: 14px; cursor: default; padding-left: 10px; border-right: none;" 
             title="<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>">
             <strong>
                 <?php echo !empty($pkgExt) ? 'Ext. ' . htmlspecialchars($pkgExt) : '&mdash;'; ?>
             </strong>
         </td>
 
-        <td style="text-align: left; vertical-align: middle; font-size: 14px; cursor: default; padding-left: 5px; border-left: none;" 
+        <td style="text-align: left; vertical-align: middle; font-size: 14px; cursor: default; padding-left: 15px; border-left: none;" 
             title="<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>">
             <strong>
-                <?php echo !empty($pkgMac) ? 'MAC: ' . htmlspecialchars($pkgMac) : '&mdash;'; ?>
+                <?php echo !empty($pkgMac) ? ' ' . htmlspecialchars($pkgMac) : '&mdash;'; ?>
             </strong>
         </td>
 
-        <td style="text-align: center; vertical-align: middle; font-size: 12px;"><?php echo date("Y-m-d H:i", filemtime($pkgPath)); ?></td>
-        <td style="text-align: center; vertical-align: middle; padding: 4px 2px;">
+        <td style="text-align: center; vertical-align: middle; font-size: 12px;">
+            <span class="label label-info"><?php echo htmlspecialchars($pkgCipher); ?></span>
+        </td>
+
+        <td style="text-align: center; vertical-align: middle; font-size: 12px;"><?php echo date("Y-m-d H:i", $pkgMtime); ?></td>
+        <td style="text-align: center; vertical-align: middle; padding: 4px 3px; padding-left: 8px;">
             <div style="display: flex; justify-content: center; align-items: center; gap: 3px;">
                 <button type="button" class="btn btn-xs btn-info" style="padding: 3px;" title="Edit Package Details" onclick="openEditPackageModal('<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgExt, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgMac, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgCipher, ENT_QUOTES); ?>')">
                     <i class="fa fa-pencil"></i>
@@ -1478,7 +1537,7 @@ if (file_exists($logFile)) {
                         <label for="edit_cipher">Phone / Cipher (weakest to strongest):</label>
                         <select name="cipher" id="edit_cipher" class="form-control" required>
                             <option value="AES-128-CBC">1 &mdash; Weakest / Legacy Compatibility &mdash; AES-128-CBC</option>
-                            <option value="AES-256-CBC">2 &mdash; AES-256-CBC (Legacy CBC)</option>
+                            <option value="AES-256-CBC">2 &mdash; Legacy Compatibility &mdash; AES-256-CBC</option>
                             <option value="AES-128-GCM">3 &mdash; AES-128-GCM (Modern)</option>
                             <option value="AES-256-GCM">4 &mdash; Strongest &mdash; AES-256-GCM</option>
                         </select>
@@ -1722,16 +1781,22 @@ if (file_exists($logFile)) {
     align-items: center;
     min-height: 90px;
 }
+#ovpnPkgTable th.ovpn-sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+#ovpnPkgTable th.ovpn-sortable:hover, #ovpnPkgTable th.ovpn-sortable:focus { background-color: rgba(0,0,0,0.05); outline: none; }
+#ovpnPkgTable .ovpn-sort-ind { font-size: 15px; opacity: 0.8; color: #0f5a59 }
+#ovpnPkgTable th.ovpn-sorted .ovpn-sort-ind { opacity: 0.8; }
 </style>
 
 <script>
 var OVPN_CSRF = <?php echo json_encode($csrfToken); ?>;
+var OVPN_CBC_IN_USE = <?php echo json_encode((object)$ovpnCbcInUse); ?>;
 
 function openEditPackageModal(filename, currentExt, currentMac, currentCipher) {
     $('#edit_old_pkg').val(filename);
     $('#edit_ext').val(currentExt);
     $('#edit_mac').val(currentMac);
     $('#edit_cipher').val(currentCipher || 'AES-128-CBC');
+    ovpnEditOriginalCipher = currentCipher || 'AES-128-CBC';
     updateEditCipherNotice();
     $('#editPackageModal').modal('show');
 }
@@ -2058,30 +2123,126 @@ $('#logModal').on('hidden.bs.modal', function () {
 // Keep cipher guidance visible and color-coded in both package forms.
 var ovpnCipherGuidance = {
     'AES-128-CBC': { bg: '#fcf8e3', border: '#faebcc', color: '#8a6d3b', text: '<strong><span style="font-size: 1.5em;">&#9888;</span> Legacy compatibility:</strong> Uses AES-128-CBC and SHA1. Intended for older phones that cannot use modern OpenVPN data ciphers.' },
-    'AES-256-CBC': { bg: '#fcf8e3', border: '#ffeeba', color: '#856404', text: '<strong><span style="font-size: 1.5em;">&#9888;</span> CBC compatibility:</strong> AES-256-CBC is stronger than AES-128-CBC, but remains a legacy mode. Verify the phone firmware supports it before provisioning.' },
+    'AES-256-CBC': { bg: '#fcf8e3', border: '#faebcc', color: '#8a6d3b', text: '<strong><span style=\"font-size: 1.5em;\">&#9888;</span> Legacy compatibility:</strong> Uses AES-256-CBC and SHA1. Stronger than AES-128-CBC, for older phones that cannot use modern OpenVPN data ciphers.' },
     'AES-128-GCM': { bg: '#d4edda', border: '#c3e6cb', color: '#155724', text: '<strong><span style="font-size: 1.4em;">&#10004;</span> Modern cipher:</strong> AES-128-GCM. Use only with a phone/firmware that supports OpenVPN GCM data ciphers. Older models may fail to connect.' },
     'AES-256-GCM': { bg: '#d4edda', border: '#c3e6cb', color: '#155724', text: '<strong><span style="font-size: 1.4em;">&#10004;</span> Strong modern cipher:</strong> AES-256-GCM. Strongest option in this list; requires verified GCM support in the phone firmware.' }
 };
-function applyCipherNotice(selectId, noticeId) {
+function applyCipherNotice(selectId, noticeId, ownCipher) {
     var select = document.getElementById(selectId), notice = document.getElementById(noticeId);
     if (!select || !notice) return;
     var item = ovpnCipherGuidance[select.value] || ovpnCipherGuidance['AES-128-CBC'];
-    notice.innerHTML = item.text;
+    var extra = '';
+    // Older phones can't negotiate, so every legacy (CBC) package shares the
+    // server's single fallback cipher. Warn when this choice would mix them.
+    if (/-CBC$/.test(select.value)) {
+        var others = [];
+        for (var c in OVPN_CBC_IN_USE) {
+            if (!OVPN_CBC_IN_USE.hasOwnProperty(c) || c === select.value) continue;
+            var n = OVPN_CBC_IN_USE[c] - (ownCipher === c ? 1 : 0);
+            if (n > 0) others.push(n + ' on ' + c);
+        }
+        if (others.length) {
+            extra = '<br><strong>Heads up:</strong> older phones cannot negotiate, so all legacy packages share one server cipher. Existing legacy packages: ' + others.join(', ') + '. One group will not connect until every legacy package uses the same cipher.';
+        }
+    }
+    notice.innerHTML = item.text + extra;
     notice.style.backgroundColor = item.bg;
     notice.style.borderColor = item.border;
     notice.style.color = item.color;
 }
-function updateEditCipherNotice() { applyCipherNotice('edit_cipher', 'edit_cipher_notice'); }
+var ovpnEditOriginalCipher = null;
+function updateEditCipherNotice() { applyCipherNotice('edit_cipher', 'edit_cipher_notice', ovpnEditOriginalCipher); }
 (function () {
     var mainSelect = document.getElementById('ovpn_cipher');
     if (mainSelect) {
-        mainSelect.addEventListener('change', function () { applyCipherNotice('ovpn_cipher', 'ovpn_cipher_notice'); });
+        // "Default" checkbox: checked + locked when the selected cipher already is
+        // the default; otherwise tick it to make the selected cipher the new default.
+        var defaultBox = document.getElementById('ovpn_cipher_default');
+        var defaultText = document.getElementById('ovpn_cipher_default_text');
+        var currentDefault = mainSelect.getAttribute('data-default-cipher');
+        var syncDefaultBox = function () {
+            if (!defaultBox) return;
+            var isDefault = (mainSelect.value === currentDefault);
+            defaultBox.checked = isDefault;
+            defaultBox.disabled = isDefault;
+            if (defaultText) defaultText.textContent = isDefault ? 'Default' : 'Make default';
+        };
+        mainSelect.addEventListener('change', function () {
+            applyCipherNotice('ovpn_cipher', 'ovpn_cipher_notice');
+            syncDefaultBox();
+        });
         applyCipherNotice('ovpn_cipher', 'ovpn_cipher_notice');
+        syncDefaultBox();
     }
     var editSelect = document.getElementById('edit_cipher');
     if (editSelect) {
         editSelect.addEventListener('change', updateEditCipherNotice);
         updateEditCipherNotice();
     }
+})();
+// Sortable "Created Provisioning Archives" table (Extension / MAC / Cipher / Date Created).
+// Purely client-side; the chosen sort is remembered in this browser.
+(function () {
+    var table = document.getElementById('ovpnPkgTable');
+    if (!table || !table.tBodies.length) return;
+    var tbody = table.tBodies[0];
+    var headers = table.querySelectorAll('th.ovpn-sortable');
+    var STORE_KEY = 'ovpn_mgr_pkg_sort';
+    var rows = Array.prototype.slice.call(tbody.rows);
+    rows.forEach(function (r, i) { r._origIdx = i; });
+
+    function cmpFor(key) {
+        return function (a, b) {
+            var av = a.getAttribute('data-' + key) || '', bv = b.getAttribute('data-' + key) || '';
+            var r = 0;
+            if (key === 'date') {
+                r = (parseInt(av, 10) || 0) - (parseInt(bv, 10) || 0);
+            } else if (key === 'ext' && /^\d+$/.test(av) && /^\d+$/.test(bv)) {
+                r = parseInt(av, 10) - parseInt(bv, 10);
+            } else {
+                r = av < bv ? -1 : (av > bv ? 1 : 0);
+            }
+            return r !== 0 ? r : a._origIdx - b._origIdx;
+        };
+    }
+
+    function applySort(key, dir) {
+        var sorted = rows.slice().sort(cmpFor(key));
+        if (dir < 0) sorted.reverse();
+        sorted.forEach(function (r) { tbody.appendChild(r); });
+        Array.prototype.forEach.call(headers, function (th) {
+            var active = (th.getAttribute('data-sort') === key);
+            var ind = th.querySelector('.ovpn-sort-ind');
+            th.classList.toggle('ovpn-sorted', active);
+            th.setAttribute('aria-sort', active ? (dir > 0 ? 'ascending' : 'descending') : 'none');
+            if (ind) ind.textContent = active ? (dir > 0 ? '\u25B2' : '\u25BC') : '\u21C5';
+        });
+        try { localStorage.setItem(STORE_KEY, JSON.stringify({ key: key, dir: dir })); } catch (e) {}
+    }
+
+    var current = { key: null, dir: 1 };
+    function onHeader(th) {
+        var key = th.getAttribute('data-sort');
+        // Newest-first is the natural first click for dates; A-Z / low-high for the rest.
+        var dir = (current.key === key) ? -current.dir : (key === 'date' ? -1 : 1);
+        current = { key: key, dir: dir };
+        applySort(key, dir);
+    }
+    Array.prototype.forEach.call(headers, function (th) {
+        var ind = th.querySelector('.ovpn-sort-ind');
+        if (ind) ind.textContent = '\u21C5';
+        th.addEventListener('click', function () { onHeader(th); });
+        th.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onHeader(th); }
+        });
+    });
+
+    try {
+        var saved = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
+        if (saved && /^(ext|mac|cipher|date)$/.test(saved.key) && (saved.dir === 1 || saved.dir === -1)) {
+            current = { key: saved.key, dir: saved.dir };
+            applySort(saved.key, saved.dir);
+        }
+    } catch (e) {}
 })();
 </script>

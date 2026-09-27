@@ -77,6 +77,54 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
         return implode("\n", array_slice($arr, -$lines));
     }
 
+    /**
+     * Like tailFile(), but treats $markerBytePos (a byte offset recorded
+     * when a "line break" divider was inserted - see page.ovpn_mgr.php's
+     * add_page_break handler) as a floor on how far the window is allowed
+     * to advance: it never starts reading later than the marker, so the
+     * divider can't scroll out of view just because ordinary logging
+     * continues underneath it. It is NOT a forced starting point - the
+     * window still includes the normal $minLines of tail context even
+     * when that's further back than the marker (e.g. right after the
+     * marker was just added), so adding a break never makes the view jump
+     * forward and hide everything above it. $maxLines caps runaway growth
+     * so an old, never-cleared marker can't force an unbounded render.
+     *
+     * Falls back to a plain tailFile($minLines) when there's no marker, or
+     * the recorded offset no longer makes sense against the current file
+     * (e.g. the log was trimmed/restarted since, or has grown so much
+     * that the marker fell outside the $maxBytes window entirely) - the
+     * caller doesn't need to know which case applies.
+     */
+    function tailFileFromMarker($path, $markerBytePos, $minLines = 200, $maxLines = 5000, $maxBytes = 2000000) {
+        if (!file_exists($path)) { return ''; }
+        $size = filesize($path);
+        $windowStart = max(0, $size - $maxBytes);
+
+        if ($size <= $maxBytes) {
+            $content = (string)@file_get_contents($path);
+        } else {
+            $fp = @fopen($path, 'r');
+            if (!$fp) { return ''; }
+            fseek($fp, $windowStart, SEEK_SET);
+            $content = (string)fread($fp, $size - $windowStart);
+            fclose($fp);
+        }
+        $arr = explode("\n", $content);
+        $normalStart = max(0, count($arr) - $minLines);
+
+        $markerValid = $markerBytePos !== null && $markerBytePos >= $windowStart && $markerBytePos < $size;
+        if (!$markerValid) {
+            return implode("\n", array_slice($arr, $normalStart));
+        }
+
+        $markerLineIndex = substr_count(substr($content, 0, $markerBytePos - $windowStart), "\n");
+        $startIndex = min($normalStart, $markerLineIndex);
+        $startIndex = max($startIndex, count($arr) - $maxLines);
+
+        return implode("\n", array_slice($arr, $startIndex));
+    }
+
     function getOpenVpnVersion() {
         $openvpnBin = file_exists('/usr/sbin/openvpn') ? '/usr/sbin/openvpn' : '/usr/local/sbin/openvpn';
         exec(escapeshellarg($openvpnBin) . " --version 2>&1", $output);
@@ -117,6 +165,107 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
     }
 
     /**
+     * Ciphers the UI offers, weakest to strongest as shown, plus the order
+     * used when writing the server's data-ciphers list (strongest first).
+     */
+    function ovpnAllowedCiphers() {
+        return ['AES-128-CBC', 'AES-256-CBC', 'AES-128-GCM', 'AES-256-GCM'];
+    }
+
+    function ovpnIsCbcCipher($cipher) {
+        return substr((string)$cipher, -4) === '-CBC';
+    }
+
+    /**
+     * The default cipher pre-selected for new packages. Stored as a
+     * "# default-cipher X" comment in the server config (same pattern as
+     * "# client-remote-host"). Until one is set the initial default is
+     * AES-256-CBC.
+     */
+    function getDefaultCipher($serverConf) {
+        if (is_readable($serverConf)) {
+            $content = (string)@file_get_contents($serverConf);
+            if (preg_match('/^# default-cipher[ \t]+([A-Za-z0-9\-]+)/m', $content, $m)
+                && in_array($m[1], ovpnAllowedCiphers(), true)) {
+                return $m[1];
+            }
+        }
+        return 'AES-256-CBC';
+    }
+
+    function setDefaultCipher($serverConf, $cipher) {
+        if (!in_array($cipher, ovpnAllowedCiphers(), true)) { return false; }
+        if (!is_readable($serverConf) || !is_writable($serverConf)) { return false; }
+        $content = (string)file_get_contents($serverConf);
+        if (preg_match('/^# default-cipher[ \t].*$/m', $content)) {
+            $content = preg_replace('/^# default-cipher[ \t].*$/m', "# default-cipher {$cipher}", $content, 1);
+        } else {
+            $content = rtrim($content, "\r\n") . "\n# default-cipher {$cipher}\n";
+        }
+        return file_put_contents($serverConf, $content) !== false;
+    }
+
+    /**
+     * Sets a single-valued directive in server config text: replaces the
+     * first occurrence, drops any duplicates (older builds appended a new
+     * data-ciphers line on every package build), or appends it if missing.
+     */
+    function ovpnSetServerDirective($text, $name, $value) {
+        $pattern = '/^[ \t]*' . preg_quote($name, '/') . '[ \t]+.*$/m';
+        $line = "{$name} {$value}";
+        if (!preg_match($pattern, $text)) {
+            return rtrim($text, "\r\n") . "\n{$line}\n";
+        }
+        $seen = false;
+        $text = preg_replace_callback($pattern, function () use (&$seen, $line) {
+            if ($seen) { return ''; }
+            $seen = true;
+            return $line;
+        }, $text);
+        return preg_replace("/\n{3,}/", "\n\n", $text);
+    }
+
+    /**
+     * Brings the server's cipher directives in line with what is actually
+     * in use, so AES-128-CBC is never a fallback unless it has been chosen:
+     *   - data-ciphers: the default cipher, every cipher an existing package
+     *     uses, and any cipher in $extraCiphers (the one about to be built).
+     *   - data-ciphers-fallback / cipher: AES-128-CBC only when the default
+     *     is AES-128-CBC or at least one package uses it (legacy phones
+     *     can't negotiate, so they need it); otherwise the default cipher.
+     * The server's "auth" line is left alone: it is a single server-wide
+     * HMAC that every CBC client must match, and it is ignored for GCM.
+     * Returns true if the file changed (the daemon then needs a restart).
+     */
+    function syncServerCiphers($serverConf, $pkgDir, array $extraCiphers = []) {
+        if (!is_readable($serverConf) || !is_writable($serverConf)) { return false; }
+        $allowed = ovpnAllowedCiphers();
+        $original = (string)file_get_contents($serverConf);
+        $default = getDefaultCipher($serverConf);
+
+        $inUse = [$default];
+        foreach ($extraCiphers as $c) {
+            if (in_array($c, $allowed, true)) { $inUse[] = $c; }
+        }
+        foreach (glob("{$pkgDir}/*.tar") ?: [] as $pkg) {
+            $inUse[] = getPackageCipher($pkg);
+        }
+
+        $list = [];
+        foreach (['AES-256-GCM', 'AES-128-GCM', 'AES-256-CBC', 'AES-128-CBC'] as $c) {
+            if (in_array($c, $inUse, true)) { $list[] = $c; }
+        }
+        $fallback = in_array('AES-128-CBC', $inUse, true) ? 'AES-128-CBC' : $default;
+
+        $text = ovpnSetServerDirective($original, 'data-ciphers', implode(':', $list));
+        $text = ovpnSetServerDirective($text, 'data-ciphers-fallback', $fallback);
+        $text = ovpnSetServerDirective($text, 'cipher', $fallback);
+
+        if ($text === $original) { return false; }
+        return file_put_contents($serverConf, $text) !== false;
+    }
+
+    /**
      * Issues (if missing) a client cert/key under $pkiDir for $ext, and
      * builds the .tar package a Yealink/legacy client expects at
      * $pkgDir/{mac}_{ext}_ovpn.tar. Returns the tar path on success, or
@@ -126,9 +275,10 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
      * package built the same way, against the same PKI, instead of
      * maintaining a second implementation.
      */
-    function buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $serverIp, $port, $cipher = "AES-128-CBC") {
-        $allowedCiphers = ["AES-128-CBC", "AES-256-CBC", "AES-128-GCM", "AES-256-GCM"];
-        if (!in_array($cipher, $allowedCiphers, true)) { $cipher = "AES-128-CBC"; }
+    function buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $serverIp, $port, $cipher = null, $syncServer = true) {
+        // No (or an invalid) cipher means "the server's default cipher".
+        $allowedCiphers = ovpnAllowedCiphers();
+        if (!in_array($cipher, $allowedCiphers, true)) { $cipher = getDefaultCipher("{$baseDir}/legacy-vpn.conf"); }
         if (!file_exists($pkgDir)) {
             @mkdir($pkgDir, 0775, true);
         }
@@ -151,12 +301,16 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
         @copy($clientCrt, "{$keysSubDir}/client.crt");
         @copy($clientKey, "{$keysSubDir}/client.key");
 
-        // Legacy phones (AES-128-CBC) run an OpenVPN build that predates
+        // Legacy phones (both CBC ciphers) run an OpenVPN build that predates
         // data-ciphers / data-ciphers-fallback and rejects them as unknown
-        // options, so those two lines are only emitted for other ciphers.
-        $dataCipherLines = ($cipher === "AES-128-CBC")
+        // options, so those two lines are only emitted for the GCM ciphers.
+        $dataCipherLines = ovpnIsCbcCipher($cipher)
             ? ""
             : "data-ciphers {$cipher}\n" . "data-ciphers-fallback {$cipher}\n";
+
+        // The HMAC only matters for CBC ciphers (and must match the server's
+        // auth). GCM authenticates itself, so SHA1 is not emitted for it.
+        $authLine = ovpnIsCbcCipher($cipher) ? "auth SHA1\n" : "";
 
         $vpnCnf = "client\n"
                 . "nobind\n"
@@ -168,7 +322,7 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
                 . "key /config/openvpn/keys/client.key\n"
                 . "cipher {$cipher}\n"
                 . $dataCipherLines
-                . "auth SHA1\n"
+                . $authLine
                 . "verb 3\n"
                 . "explicit-exit-notify 0\n"
                 . "script-security 2\n";
@@ -198,6 +352,14 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
         $ok = ($tarRc === 0 && file_exists($tarPath));
         if ($ok) {
             @chmod($tarPath, 0644);
+            // Other callers (e.g. yealink_epm) get the server's cipher lines
+            // kept in step automatically. They still need to restart the
+            // daemon for a changed data-ciphers to take effect. This
+            // module's own handlers pass $syncServer=false and sync once
+            // themselves (so they can restart only when something changed).
+            if ($syncServer) {
+                syncServerCiphers("{$baseDir}/legacy-vpn.conf", $pkgDir, [$cipher]);
+            }
         } else {
             @unlink($tarPath);
         }
@@ -269,6 +431,13 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
         if (file_exists($logFile) && filesize($logFile) > 5242880) {
             $tail = tailFile($logFile, 2000);
             @file_put_contents($logFile, $tail . "\n");
+            // Any previously-recorded "line break" byte offset now points
+            // into a file that no longer exists in that shape - drop it
+            // rather than let tailFileFromMarker() fall back on its own
+            // (harmless, since it already treats an out-of-range offset as
+            // "no marker", but this keeps the sidecar file from lingering
+            // indefinitely with a stale value).
+            @unlink("{$logDir}/.line_break_pos");
         }
 
         if (!file_exists($crlFile) && file_exists("{$pkiDir}/ca.crt") && file_exists("{$pkiDir}/private/ca.key")) {
@@ -294,6 +463,33 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
                 if (strpos($trimmed, 'crl-verify') === 0 && !file_exists($crlFile)) {
                     continue;
                 }
+                // Configs from before this existed may still have
+                // "duplicate-cn", which is what let a reconnecting phone's
+                // old session linger (as a ghost row in the Connected
+                // OpenVPN Clients table) instead of being replaced
+                // immediately - see the comment in install.php's config
+                // template for the full explanation. Strip it on every
+                // start so existing installs self-heal without a manual
+                // migration step.
+                if ($trimmed === 'duplicate-cn') {
+                    continue;
+                }
+                // A bare "log <path>" directive truncates the file on every
+                // OpenVPN start, unlike ovpnctl's own "--log-append" CLI
+                // flag (see the "start" case) - and per OpenVPN's option
+                // parsing, whichever of the two actually wins is the one
+                // that opens the file first, not simply "last one on the
+                // command line", so having both present is not just
+                // redundant but actively destructive: it silently wipes the
+                // log (including any "Add Line Break" markers) on every
+                // restart. Configs from before this was understood may
+                // still have this line; strip it so existing installs
+                // self-heal without a manual edit, the same way
+                // "duplicate-cn" is handled above. (Matched with a
+                // trailing space so this never touches "log-append ...".)
+                if (strpos($trimmed, 'log ') === 0) {
+                    continue;
+                }
                 if ($isLegacy) {
                     if (strpos($trimmed, 'data-ciphers') === 0 || strpos($trimmed, 'data-ciphers-fallback') === 0 ||
                         strpos($trimmed, 'providers') === 0 || strpos($trimmed, 'ignore-unknown-option') === 0) {
@@ -310,16 +506,25 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
 
             if ($isLegacy) {
                 if (strpos($cleanContent, 'cipher ') === false) {
-                    $cleanContent .= "\ncipher AES-128-CBC\n";
+                    $cleanContent .= "\ncipher " . getDefaultCipher($serverConf) . "\n";
                 }
             } else {
                 if (strpos($cleanContent, 'data-ciphers ') === false) {
-                    $cleanContent .= "\ndata-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC:CHACHA20-POLY1305\n";
+                    $cleanContent .= "\ndata-ciphers " . getDefaultCipher($serverConf) . "\n";
                 }
             }
             if (strpos($cleanContent, 'verb ') === false) {
                 $cleanContent .= "\nverb 3\n";
             }
+            // Same self-heal as the duplicate-cn strip above: configs from
+            // before this existed lack these, so every start brings them
+            // in line with what a fresh install.php now generates. Needed
+            // for the Connected OpenVPN Clients table (reads the live
+            // session list instead of the log) and the "Kill Connection"
+            // button (issues client-kill over this socket).
+            $cleanContent = ovpnSetServerDirective($cleanContent, 'status-version', '3');
+            $cleanContent = ovpnSetServerDirective($cleanContent, 'management', '/run/ovpn_mgr/mgmt.sock unix');
+            $cleanContent = ovpnSetServerDirective($cleanContent, 'management-client-user', 'asterisk');
             @file_put_contents($serverConf, $cleanContent);
         }
 
@@ -417,7 +622,7 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
                 continue;
             }
             $cipher = getPackageCipher($pkgPath);
-            if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $id['ext'], $id['mac'], $serverIp, $port, $cipher)) {
+            if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $id['ext'], $id['mac'], $serverIp, $port, $cipher, false)) {
                 $rebuilt++;
             } else {
                 $skipped[] = $name;

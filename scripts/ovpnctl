@@ -42,11 +42,19 @@ fi
 CONF="${BASE_DIR}/legacy-vpn.conf"
 LOG_DIR="${BASE_DIR}/logs"
 LOG_FILE="${LOG_DIR}/openvpn.log"
+STATUS_FILE="${LOG_DIR}/openvpn-status.log"
 PID_FILE="${BASE_DIR}/openvpn.pid"
 
 STATE_DIR="/etc/ovpn_mgr"
 NAT_STATE_FILE="${STATE_DIR}/nat-state"
 NAT_MARK="OVPN_MGR_NAT"
+
+# Must match the "management ... unix" path legacy-vpn.conf declares
+# (written by install.php / reconciled by startOpenVpnServer() in
+# lib/client_ops.php). Under /run (tmpfs) rather than $BASE_DIR so it
+# never ends up somewhere web-served, and so it's naturally gone after a
+# reboot instead of pointing at a dead socket from the prior boot.
+MGMT_SOCK="/run/ovpn_mgr/mgmt.sock"
 
 is_port()   { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 is_cidr()   { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; }
@@ -90,6 +98,15 @@ case "$cmd" in
     echo "ovpnctl ok"
     ;;
 
+  status)
+    # Dumps OpenVPN's own status file verbatim (v1/v2/v3 format, whichever
+    # "status" directive legacy-vpn.conf uses) so a caller can parse the
+    # current client list. root:root 0600 by design - this is the one
+    # sanctioned way to read it without loosening that.
+    [ -f "$STATUS_FILE" ] || { echo "no status file: $STATUS_FILE" >&2; exit 1; }
+    cat "$STATUS_FILE"
+    ;;
+
   start)
     [ -n "$OPENVPN_BIN" ] || { echo "openvpn binary not found" >&2; exit 1; }
     mkdir -p "$LOG_DIR"
@@ -112,6 +129,14 @@ case "$cmd" in
     fi
     [ -f "$CONF" ] || { echo "missing config: $CONF" >&2; exit 1; }
 
+    # legacy-vpn.conf's "management" directive points here; /run is tmpfs,
+    # so the directory needs recreating on every start, not just at install.
+    # root:asterisk 0750, matching the wrapper's own ownership below,
+    # rather than leaving it at mkdir's default world-readable 0755.
+    mkdir -p "$(dirname "$MGMT_SOCK")"
+    chown root:asterisk "$(dirname "$MGMT_SOCK")" 2>/dev/null || true
+    chmod 750 "$(dirname "$MGMT_SOCK")" 2>/dev/null || true
+
     if [ "$(openssl_major_version)" -ge 3 ]; then
       openssl_cnf="$(find_openssl_cnf)"
       OPENSSL_CONF="$openssl_cnf" OPENSSL_CIPHER_LIST="DEFAULT:@SECLEVEL=0" \
@@ -124,6 +149,23 @@ case "$cmd" in
                       --writepid "$PID_FILE" \
                       --log-append "$LOG_FILE" \
                       --daemon
+    fi
+
+    # "management-client-user asterisk" in legacy-vpn.conf restricts who
+    # can *issue commands on* the socket once connected, but the socket
+    # file's own filesystem permissions (root:root, from whatever umask
+    # the daemon started with) still gate the connect() itself, before
+    # that check ever runs. Without this, 'asterisk' would get a plain
+    # permission-denied trying to reach it at all. --daemon backgrounds
+    # openvpn immediately, so the socket may not exist for a brief moment
+    # after that call returns - wait for it rather than racing it.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      [ -S "$MGMT_SOCK" ] && break
+      sleep 0.2
+    done
+    if [ -S "$MGMT_SOCK" ]; then
+      chown root:asterisk "$MGMT_SOCK" 2>/dev/null || true
+      chmod 660 "$MGMT_SOCK" 2>/dev/null || true
     fi
     ;;
 
@@ -178,6 +220,38 @@ case "$cmd" in
     exec "$PHP_BIN" "$HELPER" "$CONF"
     ;;
 
+  kill-client)
+    # kill-client <client_id>
+    # Ends exactly one connected session immediately via OpenVPN's local
+    # management socket (client-kill <CID>, not kill <CN> - the config
+    # deliberately no longer sets duplicate-cn, but the GUI still needs a
+    # precise way to drop one specific session by its status-file Client ID
+    # without guessing whether some other legitimate session shares that
+    # CN). Exists for page.ovpn_mgr.php's "Kill Connection" button.
+    cid="${1:?missing client id}"
+    [[ "$cid" =~ ^[0-9]{1,10}$ ]] || { echo "invalid client id" >&2; exit 1; }
+    PHP_BIN="$(find_bin php /usr/bin/php /usr/local/bin/php)"
+    [ -n "$PHP_BIN" ] || { echo "php binary not found" >&2; exit 1; }
+    HELPER="${MODULE_DIR}/scripts/kill-client.php"
+    [ -f "$HELPER" ] || { echo "Missing kill-client helper: $HELPER" >&2; exit 1; }
+    # legacy-vpn.conf sets "management-client-user asterisk", so OpenVPN
+    # checks the *connecting process's* real UID (via SO_PEERCRED) against
+    # asterisk, separately from the 0660 root:asterisk filesystem
+    # permission that gates connect() itself. This whole kill-client case
+    # runs as root (that's what the asterisk sudoers rule above grants), so
+    # without dropping back down to asterisk here, OpenVPN accepts the
+    # connection, sends its usual ">INFO:" banner, then closes the socket
+    # the instant it sees the peer is root rather than asterisk - which is
+    # exactly what surfaces as "fwrite(): ... Broken pipe" in kill-client.php:
+    # the banner read already succeeded by the time the close happens, so
+    # every write attempted afterwards fails.
+    if command -v runuser >/dev/null 2>&1; then
+      exec runuser -u asterisk -- "$PHP_BIN" "$HELPER" "$MGMT_SOCK" "$cid"
+    else
+      exec su -s /bin/sh asterisk -c "exec $(printf '%q ' "$PHP_BIN" "$HELPER" "$MGMT_SOCK" "$cid")"
+    fi
+    ;;
+
   nat-restore)
     # Run at boot by ovpn-mgr-nat.service. No-op if nothing was ever saved.
     [ -f "$NAT_STATE_FILE" ] || exit 0
@@ -190,7 +264,7 @@ case "$cmd" in
     ;;
 
   *)
-    echo "usage: ovpnctl {check|start|stop|ipforward-on|nat-sync|nat-restore|sip-localnet-sync}" >&2
+    echo "usage: ovpnctl {check|status|start|stop|ipforward-on|nat-sync|nat-restore|sip-localnet-sync|kill-client}" >&2
     exit 1
     ;;
 esac
