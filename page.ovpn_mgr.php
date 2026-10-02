@@ -163,6 +163,29 @@ function hasOvpnctlAccess($ovpnctl) {
     return ($rc === 0);
 }
 
+// True when FreePBX's own Firewall module is usable through fwconsole.
+// Plain Incredible PBX installs often lack it; those use the iptables
+// fallbacks in ovpnctl instead. Checked as root via the helper.
+function ovpnFreepbxFirewallAvailable($ovpnctl) {
+    static $cached = null;
+    if ($cached === null) {
+        $o = [];
+        exec('sudo -n ' . escapeshellarg($ovpnctl) . ' fw-available 2>&1', $o, $rc);
+        $cached = ($rc === 0);
+    }
+    return $cached;
+}
+
+// Runs "fwconsole firewall ..." as root through ovpnctl. The web user
+// (asterisk) cannot run fwconsole firewall itself, which is why restarts
+// issued directly from PHP returned a non-zero code and changed nothing.
+function ovpnRunFwconsoleFirewall($ovpnctl, array $args, &$out, &$rc) {
+    $out = [];
+    $cmd = 'sudo -n ' . escapeshellarg($ovpnctl);
+    foreach ($args as $a) { $cmd .= ' ' . escapeshellarg($a); }
+    exec($cmd . ' 2>&1', $out, $rc);
+}
+
 function syncOvpnFirewallPortRuleStandalone($port, $logFile, $ovpnctl) {
     $result = ['written' => false, 'reloaded' => false, 'message' => ''];
 
@@ -190,7 +213,8 @@ function syncOvpnFirewallPortRule($newPort, $logFile, $ovpnctl) {
     $serviceName = 'OpenVPN Manager';
     $result = ['written' => false, 'reloaded' => false, 'message' => ''];
 
-    if (!class_exists('FreePBX')) {
+    if (!class_exists('FreePBX') || !ovpnFreepbxFirewallAvailable($ovpnctl)) {
+        @file_put_contents($logFile, "\n[FIREWALL SYNC " . date('Y-m-d H:i:s') . "] FreePBX Firewall module not usable - using standalone iptables fallback.\n", FILE_APPEND);
         return syncOvpnFirewallPortRuleStandalone($port, $logFile, $ovpnctl);
     }
 
@@ -276,7 +300,17 @@ function applyVpnRoutingAndNat($ovpnctl, $netIp, $cidrBits, $iface, $baseDir) {
     $cidr = "{$netIp}/{$cidrBits}";
     $restartNeeded = false;
 
-    if (class_exists('FreePBX')) {
+    if (!ovpnFreepbxFirewallAvailable($ovpnctl)) {
+        // No FreePBX Firewall module (e.g. plain Incredible PBX): trust the
+        // tunnel and VPN pool with module-owned iptables rules instead.
+        $tOut = [];
+        exec('sudo -n ' . escapeshellarg($ovpnctl) . ' trust-sync ' . escapeshellarg($cidr) . ' 2>&1', $tOut, $tRc);
+        @file_put_contents(
+            "{$baseDir}/logs/openvpn.log",
+            "\n[FIREWALL SYNC " . date('Y-m-d H:i:s') . "] Standalone trust-sync {$cidr}, exit={$tRc}\n" . implode("\n", $tOut) . "\n",
+            FILE_APPEND
+        );
+    } elseif (class_exists('FreePBX')) {
         $trustedCidrState = "{$baseDir}/.trusted_cidr_state";
         $prevCidr = file_exists($trustedCidrState) ? trim((string)@file_get_contents($trustedCidrState)) : '';
 
@@ -286,11 +320,11 @@ function applyVpnRoutingAndNat($ovpnctl, $netIp, $cidrBits, $iface, $baseDir) {
             // adding once; re-running 'add' for an interface/CIDR already
             // trusted is a harmless no-op for the ruleset but still costs a
             // process + doesn't need a restart, so skip it entirely here.
-            exec('fwconsole firewall add trusted tun+ 2>&1');
+            ovpnRunFwconsoleFirewall($ovpnctl, ['fw-trusted', 'add', 'tun+'], $o1, $r1);
             if ($prevCidr !== '') {
-                exec('fwconsole firewall del trusted ' . escapeshellarg($prevCidr) . ' 2>&1');
+                ovpnRunFwconsoleFirewall($ovpnctl, ['fw-trusted', 'del', $prevCidr], $o2, $r2);
             }
-            exec('fwconsole firewall add trusted ' . escapeshellarg($cidr) . ' 2>&1');
+            ovpnRunFwconsoleFirewall($ovpnctl, ['fw-trusted', 'add', $cidr], $o3, $r3);
             @file_put_contents($trustedCidrState, $cidr);
             $restartNeeded = true;
         }
@@ -311,7 +345,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch_log') {
     if (file_exists($logFile)) {
         $breakMarkerFile = "{$baseDir}/logs/.line_break_pos";
         $breakMarkerPos = file_exists($breakMarkerFile) ? (int)trim((string)@file_get_contents($breakMarkerFile)) : null;
-        $lines = explode("\n", tailFileFromMarker($logFile, $breakMarkerPos, 200));
+        $lines = explode("\n", tailFileFromMarker($logFile, $breakMarkerPos, 500));
         $cleanLines = [];
         foreach ($lines as $line) {
             if (strpos($line, 'global-message-banner') === false && strpos($line, 'Unsigned Module') === false) {
@@ -381,6 +415,22 @@ if (function_exists('core_users_list')) {
         }
     } catch (\Throwable $e) {}
 }
+
+// Limit the dropdown to extensions whose device technology is SIP (chan_sip)
+// or PJSIP. Other types (IAX2, DAHDi, virtual extensions without a device)
+// cannot register a Yealink phone. If the devices table cannot be read, the
+// list is left unfiltered rather than emptied.
+try {
+    $sipDevices = \FreePBX::Database()->query("SELECT id, user FROM devices WHERE LOWER(tech) IN ('sip','pjsip')")->fetchAll(\PDO::FETCH_ASSOC);
+    $sipExts = [];
+    foreach ($sipDevices as $d) {
+        $sipExts[(string)$d['id']] = true;
+        if (isset($d['user']) && $d['user'] !== '' && $d['user'] !== 'none') {
+            $sipExts[(string)$d['user']] = true;
+        }
+    }
+    $available_extensions = array_intersect_key($available_extensions, $sipExts);
+} catch (\Throwable $e) {}
 
 $available_macs = [];
 // Uses the top-level $tftpDir (/tftpboot) directly rather than
@@ -626,8 +676,14 @@ if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
                     unset($_SESSION['ovpn_mgr_sipnat_warning']);
                 }
             }
+            // Only the running daemon's port/subnet actually require a restart
+            // to apply - restarting drops every connected client (one shared
+            // process), so a plain re-save that touches neither must not
+            // bounce it. Mirrors the same fix already applied to edit_package.
+            $daemonRestartNeeded = ($portChanged || $subnetChanged);
+
             $wasStopped = file_exists("{$baseDir}/.stopped");
-            if (!$wasStopped) {
+            if ($daemonRestartNeeded && !$wasStopped) {
                 stopOpenVpnServer($ovpnctl);
             }
 
@@ -661,12 +717,32 @@ if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
             $fwRestartNeeded = $fwRestartNeeded || $natRestartNeeded;
         }
 
+        // Without the FreePBX Firewall module, (re)apply the module's own
+        // iptables rules from the live config on every save, not only when
+        // the port/subnet changed. The values may already have been saved by
+        // an earlier version that failed to create the rules, in which case
+        // "changed" would never be true again.
+        if (!ovpnFreepbxFirewallAvailable($ovpnctl)) {
+            $ensureOut = [];
+            exec('sudo -n ' . escapeshellarg($ovpnctl) . ' fw-ensure 2>&1', $ensureOut, $ensureRc);
+            @file_put_contents(
+                $logFile,
+                "\n[FIREWALL SYNC " . date('Y-m-d H:i:s') . "] Standalone fw-ensure exit={$ensureRc}\n" . implode("\n", $ensureOut) . "\n",
+                FILE_APPEND
+            );
+            if ($ensureRc !== 0 && empty($_SESSION['ovpn_mgr_fw_warning'])) {
+                $_SESSION['ovpn_mgr_fw_warning'] = 'Could not create the iptables rules for the VPN port/subnet (exit ' . $ensureRc . '): ' . trim((string)end($ensureOut));
+            }
+        }
+
         if ($fwRestartNeeded) {
             // Single combined restart for both the custom-service and
             // trusted-zone changes above, instead of one restart per change.
             $restartOut = [];
             $restartRc  = 0;
-            exec('fwconsole firewall restart 2>&1', $restartOut, $restartRc);
+            if (ovpnFreepbxFirewallAvailable($ovpnctl)) {
+                ovpnRunFwconsoleFirewall($ovpnctl, ['fw-restart'], $restartOut, $restartRc);
+            }
             @file_put_contents(
                 $logFile,
                 "\n[FIREWALL SYNC " . date('Y-m-d H:i:s') . "] Combined fwconsole firewall restart exit={$restartRc}\n"
@@ -674,11 +750,11 @@ if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
                 FILE_APPEND
             );
             if ($restartRc !== 0 && empty($_SESSION['ovpn_mgr_fw_warning'])) {
-                $_SESSION['ovpn_mgr_fw_warning'] = 'Firewall settings were updated, but fwconsole firewall restart returned a non-zero code.';
+                $_SESSION['ovpn_mgr_fw_warning'] = 'Firewall settings were updated, but fwconsole firewall restart returned a non-zero code (' . $restartRc . '). See the OpenVPN log for details.';
             }
         }
 
-        if (!$wasStopped) {
+        if ($daemonRestartNeeded && !$wasStopped) {
             startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
         }
 
@@ -722,6 +798,12 @@ if (isset($_POST['action']) && $_POST['action'] === 'edit_package') {
             $oldExt = $m[1];
         }
 
+        // Snapshot before revokeExtension()/syncServerCiphers() so a restart
+        // can be based on whether the server config actually changed, not
+        // just on whether the cipher list did (revokeExtension() can also
+        // wire in crl-verify the very first time it ever runs on this server).
+        $confBeforeEdit = (string)@file_get_contents($serverConf);
+
         if (!empty($oldExt)) {
             revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $oldExt);
         }
@@ -733,13 +815,21 @@ if (isset($_POST['action']) && $_POST['action'] === 'edit_package') {
         if (!in_array($selectedCipher, ovpnAllowedCiphers(), true)) {
             $selectedCipher = getDefaultCipher($serverConf);
         }
+        // Only meaningful for GCM ciphers; confirms the phone's OpenVPN build
+        // is 2.5+ and actually understands data-ciphers / data-ciphers-fallback.
+        $includeDataCiphers = !empty($_POST['include_data_ciphers']);
 
         // Keep the server's cipher lines in step with what is in use; AES-128-CBC
         // is only a fallback if it is the default or a package actually uses it.
+        // Restart only if the server config actually changed - not
+        // unconditionally on every edit (a restart drops every connected
+        // client, not just this extension, since OpenVPN runs as one shared
+        // process here).
         syncServerCiphers($serverConf, $pkgDir, [$selectedCipher]);
-        buildClientPackage($pkiDir, $pkgDir, $baseDir, $newExt, $newMac, $settings['ip'], $settings['port'], $selectedCipher, false);
+        buildClientPackage($pkiDir, $pkgDir, $baseDir, $newExt, $newMac, $settings['ip'], $settings['port'], $selectedCipher, false, $includeDataCiphers);
 
-        if (!file_exists("{$baseDir}/.stopped")) {
+        $confChanged = ((string)@file_get_contents($serverConf) !== $confBeforeEdit);
+        if ($confChanged && !file_exists("{$baseDir}/.stopped")) {
             stopOpenVpnServer($ovpnctl);
             startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
         }
@@ -760,6 +850,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'generate_package') {
         if (!in_array($selectedCipher, ovpnAllowedCiphers(), true)) {
             $selectedCipher = getDefaultCipher($serverConf);
         }
+        // Only meaningful for GCM ciphers; confirms the phone's OpenVPN build
+        // is 2.5+ and actually understands data-ciphers / data-ciphers-fallback.
+        $includeDataCiphers = !empty($_POST['include_data_ciphers']);
         // "Set as default cipher" checkbox: remember this cipher as the default
         // (pre-selected next time, and what the server falls back to).
         if (!empty($_POST['set_default_cipher'])) {
@@ -768,7 +861,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'generate_package') {
         // AES-128-CBC is only added to the server's data-ciphers / fallback when it
         // is the default or a package uses it. Restart only if that changed.
         $cipherCfgChanged = syncServerCiphers($serverConf, $pkgDir, [$selectedCipher]);
-        buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], $selectedCipher, false);
+        buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], $selectedCipher, false, $includeDataCiphers);
         if ($cipherCfgChanged && !file_exists("{$baseDir}/.stopped")) {
             stopOpenVpnServer($ovpnctl);
             startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
@@ -785,6 +878,12 @@ if (isset($_POST['action']) && $_POST['action'] === 'rebuild_all_packages') {
     $existingPkgs = glob("{$pkgDir}/*.tar");
     $rebuilt = 0;
 
+    // Restart only if the server config actually changed - revokeExtension()'s
+    // CRL updates and syncServerCiphers()'s now-static cipher list don't
+    // require one on their own; see the same pattern in
+    // edit_package/revoke_cert/delete_package.
+    $confBeforeRebuild = (string)@file_get_contents($serverConf);
+
     foreach ($existingPkgs as $pkgPath) {
         $filename = basename($pkgPath);
         $mac = '';
@@ -800,18 +899,21 @@ if (isset($_POST['action']) && $_POST['action'] === 'rebuild_all_packages') {
             continue;
         }
 
-        // Read the cipher before revoking - revokeExtension() deletes the package.
+        // Read the cipher (and data-ciphers opt-in) before revoking -
+        // revokeExtension() deletes the package.
         $pkgCipher = getPackageCipher($pkgPath);
+        $pkgIncludeDataCiphers = packageHasDataCiphers($pkgPath);
         revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $ext);
         @unlink($pkgPath);
-        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], $pkgCipher, false)) {
+        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], $pkgCipher, false, $pkgIncludeDataCiphers)) {
             $rebuilt++;
         }
     }
 
     syncServerCiphers($serverConf, $pkgDir);
 
-    if (!file_exists("{$baseDir}/.stopped")) {
+    $confChanged = ((string)@file_get_contents($serverConf) !== $confBeforeRebuild);
+    if ($confChanged && !file_exists("{$baseDir}/.stopped")) {
         stopOpenVpnServer($ovpnctl);
         startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
     }
@@ -825,8 +927,16 @@ if (isset($_POST['action']) && $_POST['action'] === 'revoke_cert') {
     csrf_require();
     $revokeExt = preg_replace('/[^0-9]/', '', (string)($_POST['revoke_ext'] ?? ''));
     if (!empty($revokeExt)) {
+        // OpenVPN re-reads crl-verify's target file on every new connection
+        // on its own - no restart needed for the revocation itself to take
+        // effect. The only thing that ever needs a restart here is the
+        // one-time addition of the crl-verify directive itself (the very
+        // first revoke on a given server), so gate on whether the config
+        // text actually changed, same as edit_package.
+        $confBeforeRevoke = (string)@file_get_contents($serverConf);
         revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $revokeExt);
-        if (!file_exists("{$baseDir}/.stopped")) {
+        $confChanged = ((string)@file_get_contents($serverConf) !== $confBeforeRevoke);
+        if ($confChanged && !file_exists("{$baseDir}/.stopped")) {
             stopOpenVpnServer($ovpnctl);
             startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
         }
@@ -856,8 +966,12 @@ if (isset($_POST['action']) && $_POST['action'] === 'delete_package') {
         @unlink($fullPath);
 
         if (!empty($revokeExt)) {
+            // Same reasoning as revoke_cert: a restart is only ever needed for
+            // the one-time addition of crl-verify, not for the revoke itself.
+            $confBeforeRevoke = (string)@file_get_contents($serverConf);
             revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $revokeExt);
-            if (!file_exists("{$baseDir}/.stopped")) {
+            $confChanged = ((string)@file_get_contents($serverConf) !== $confBeforeRevoke);
+            if ($confChanged && !file_exists("{$baseDir}/.stopped")) {
                 stopOpenVpnServer($ovpnctl);
                 startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
             }
@@ -911,6 +1025,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_packages') {
     $selected = (array)($_POST['pkgs'] ?? []);
     $revokedCount = 0;
 
+    // See revoke_cert: a restart is only ever needed for the one-time
+    // addition of crl-verify, not for the revocation itself.
+    $confBeforeRevoke = (string)@file_get_contents($serverConf);
+
     foreach ($selected as $name) {
         $valid = ovpnValidateSelectedPkg($pkgDir, $name);
         if ($valid === null) { continue; }
@@ -932,7 +1050,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_packages') {
         }
     }
 
-    if ($revokedCount > 0 && !file_exists("{$baseDir}/.stopped")) {
+    $confChanged = ((string)@file_get_contents($serverConf) !== $confBeforeRevoke);
+    if ($confChanged && !file_exists("{$baseDir}/.stopped")) {
         stopOpenVpnServer($ovpnctl);
         startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
     }
@@ -967,6 +1086,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_rebuild_package
     $settings = getActiveServerSettings($serverConf);
     $rebuilt = 0;
 
+    // See rebuild_all_packages: revoke/rebuild no longer implies a restart
+    // is needed by itself, so gate on whether the config actually changed.
+    $confBeforeRebuild = (string)@file_get_contents($serverConf);
+
     foreach ($selected as $name) {
         $valid = ovpnValidateSelectedPkg($pkgDir, $name);
         if ($valid === null) { continue; }
@@ -984,11 +1107,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_rebuild_package
             continue;
         }
 
-        // Read the cipher before revoking - revokeExtension() deletes the package.
+        // Read the cipher (and data-ciphers opt-in) before revoking -
+        // revokeExtension() deletes the package.
         $pkgCipher = getPackageCipher("{$pkgDir}/{$valid}");
+        $pkgIncludeDataCiphers = packageHasDataCiphers("{$pkgDir}/{$valid}");
         revokeExtension($pkiDir, $serverConf, $crlFile, $pkgDir, $ext);
         @unlink("{$pkgDir}/{$valid}");
-        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], $pkgCipher, false)) {
+        if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $settings['ip'], $settings['port'], $pkgCipher, false, $pkgIncludeDataCiphers)) {
             $rebuilt++;
         }
     }
@@ -997,7 +1122,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_revoke_rebuild_package
         syncServerCiphers($serverConf, $pkgDir);
     }
 
-    if ($rebuilt > 0 && !file_exists("{$baseDir}/.stopped")) {
+    $confChanged = ((string)@file_get_contents($serverConf) !== $confBeforeRebuild);
+    if ($confChanged && !file_exists("{$baseDir}/.stopped")) {
         stopOpenVpnServer($ovpnctl);
         startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey);
     }
@@ -1020,8 +1146,12 @@ $currentClientIpCount = max(0, (pow(2, 32 - $currentCidr) - 2) - 1);
 
 $initialBreakMarkerFile = "{$baseDir}/logs/.line_break_pos";
 $initialBreakMarkerPos = file_exists($initialBreakMarkerFile) ? (int)trim((string)@file_get_contents($initialBreakMarkerFile)) : null;
-$logContent = tailFileFromMarker($logFile, $initialBreakMarkerPos, 200);
-$hasTunError = (strpos($logContent, 'Cannot ioctl TUNSETIFF') !== false || strpos($logContent, 'Exiting due to fatal error') !== false);
+$logContent = tailFileFromMarker($logFile, $initialBreakMarkerPos, 500);
+// Only errors from the most recent launch count: the log is append-only, so a
+// fatal error from an earlier failed attempt must not keep the banner on
+// STOPPED after a later start succeeded.
+$logSinceStart = ovpnLogSinceLastStart($logContent);
+$hasTunError = (strpos($logSinceStart, 'Cannot ioctl TUNSETIFF') !== false || strpos($logSinceStart, 'Exiting due to fatal error') !== false);
 
 $pids = [];
 if (!file_exists("{$baseDir}/.stopped")) {
@@ -1048,6 +1178,15 @@ $isRunning = !empty($pids) && !$hasTunError;
 $ip_forward_active = (trim((string)@shell_exec('sysctl -n net.ipv4.ip_forward 2>/dev/null')) === '1');
 $hasSudoRule = hasOvpnctlAccess($ovpnctl);
 
+// An older setup-root.sh wrote a unit whose ExecStart calls "ovpnctl start".
+// Until setup-root.sh is re-run, the GUI launches the daemon itself (inside
+// php-fpm's sandbox) instead of via systemd.
+$ovpnUnitPath = '/etc/systemd/system/ovpn-mgr-openvpn.service';
+$ovpnUnitStale = false;
+if (is_readable($ovpnUnitPath)) {
+    $ovpnUnitStale = (strpos((string)@file_get_contents($ovpnUnitPath), 'start-daemon') === false);
+}
+
 $createdPackages = glob("{$pkgDir}/*.tar");
 $ovpnCbcInUse = []; // legacy (CBC) cipher => package count, for the mixed-cipher warning
 $issuedCertFiles = glob("{$pkiDir}/issued/*.crt");
@@ -1064,8 +1203,13 @@ $issuedCertFiles = glob("{$pkiDir}/issued/*.crt");
 // sessions that are actually live right now, so this table now clears on
 // its own the moment a session really ends - no separate cleanup logic
 // needed here.
+//
+// One exception: OpenVPN never clears that file on exit, so after a Stop (or
+// a crash) it still holds the last snapshot of live sessions. Only trust it
+// while the daemon is actually running, otherwise a stopped server would keep
+// listing its last clients as "connected".
 $connectedClients = [];
-if (file_exists($statusFile) && is_readable($statusFile)) {
+if ($isRunning && file_exists($statusFile) && is_readable($statusFile)) {
     $statusData = (string)@file_get_contents($statusFile);
     foreach (explode("\n", $statusData) as $line) {
         if (strpos($line, "CLIENT_LIST\t") !== 0) { continue; }
@@ -1155,6 +1299,13 @@ if (file_exists($statusFile) && is_readable($statusFile)) {
         </div>
     <?php endif; ?>
 
+    <?php if ($hasSudoRule && $ovpnUnitStale): ?>
+        <div class="alert alert-warning" style="margin-bottom: 20px;">
+            <i class="fa fa-exclamation-triangle"></i> The OpenVPN systemd unit is out of date. Re-run the root setup so Start/Stop launch the daemon through systemd instead of from inside the web server (this avoids start failures such as a missing <code>/dev/net/tun</code> when php-fpm is sandboxed, and keeps the VPN up when php-fpm restarts):
+            <pre style="background:#f8f9fa; padding:10px; border:1px solid #ccc; font-size:12px; margin:8px 0 0;">sudo bash <?php echo htmlspecialchars($setupScript); ?></pre>
+        </div>
+    <?php endif; ?>
+
     <?php
     $ovpnFwWarning = $_SESSION['ovpn_mgr_fw_warning'] ?? null;
     unset($_SESSION['ovpn_mgr_fw_warning']);
@@ -1171,6 +1322,16 @@ if (file_exists($statusFile) && is_readable($statusFile)) {
     <?php if ($ovpnSipNatWarning): ?>
         <div class="alert alert-warning" style="margin-bottom: 20px;">
             <i class="fa fa-exclamation-triangle"></i> <strong>SIP NAT Local Networks sync warning:</strong> <?php echo htmlspecialchars($ovpnSipNatWarning); ?>
+        </div>
+    <?php endif; ?>
+    <?php
+    $ovpnCrlWarning = $_SESSION['ovpn_mgr_crl_warning'] ?? null;
+    unset($_SESSION['ovpn_mgr_crl_warning']);
+    ?>
+    <?php if ($ovpnCrlWarning): ?>
+        <div class="alert alert-danger" style="margin-bottom: 20px;">
+            <i class="fa fa-exclamation-triangle"></i> <strong>Certificate revocation list error:</strong> <?php echo nl2br(htmlspecialchars($ovpnCrlWarning)); ?>
+            <br>This is almost certainly why the "first-time revocation" prompt keeps reappearing - the CRL file is failing to (re)generate, so crl-verify can't stay in the config.
         </div>
     <?php endif; ?>
 
@@ -1307,7 +1468,7 @@ if (file_exists($statusFile) && is_readable($statusFile)) {
                     <h3 class="panel-title" style="margin: 0;"><i class="fa fa-cube"></i> Build Provisioning Package (vpn.tar)</h3>
                 </div>
                 <div class="panel-body">
-                    <form method="post" action="config.php?display=ovpn_mgr">
+                    <form method="post" action="config.php?display=ovpn_mgr" id="ovpnGenerateForm">
                         <input type="hidden" name="action" value="generate_package">
                         <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
                         
@@ -1359,6 +1520,13 @@ if (file_exists($statusFile) && is_readable($statusFile)) {
 
                         <div id="ovpn_cipher_notice" role="status" aria-live="polite" style="margin: 0 0 10px; padding: 7px 10px; border: 1px solid #faebcc; border-radius: 4px; background: #fcf8e3; color: #8a6d3b; font-size: 11px; line-height: 1.5;">
                             <strong>&#9888;&nbsp; Legacy compatibility:</strong> Uses AES-128-CBC and SHA1. Intended for older phones that cannot use modern OpenVPN data ciphers.
+                        </div>
+
+                        <div id="ovpn_data_ciphers_row" style="display: none; margin: 0 0 10px;">
+                            <label style="font-size: 11px; font-weight: normal; margin: 0; cursor: pointer;" title="Adds data-ciphers / data-ciphers-fallback to vpn.cnf so the client negotiates this cipher via NCP. Only understood by OpenVPN 2.5+ clients - on 2.4.x (including some phones' embedded builds, even ones that otherwise connect fine with a GCM cipher) this keyword fails to parse and the client won't start at all. Leave unchecked unless you've confirmed the client's OpenVPN version.">
+                                <input type="checkbox" id="ovpn_include_data_ciphers" name="include_data_ciphers" value="1" style="margin: 0 4px 0 0; vertical-align: middle;">
+                                Include data-ciphers (requires OpenVPN 2.5+ client &mdash; confirm before enabling)
+                            </label>
                         </div>
 
                         <div class="well well-sm" style="font-size: 11px; margin-bottom: 10px; padding: 5px; color: #555; max-width: 375px;">
@@ -1453,8 +1621,10 @@ if (file_exists($statusFile) && is_readable($statusFile)) {
         $pkgExt = !empty($parts[1]) ? $parts[1] : '';
     }
 
-    // Read the archive's current cipher so Edit opens with its existing value.
+    // Read the archive's current cipher (and data-ciphers opt-in) so Edit
+    // opens with its existing values.
     $pkgCipher = getPackageCipher($pkgPath);
+    $pkgHasDataCiphers = packageHasDataCiphers($pkgPath);
     if (ovpnIsCbcCipher($pkgCipher)) { $ovpnCbcInUse[$pkgCipher] = ($ovpnCbcInUse[$pkgCipher] ?? 0) + 1; }
     $pkgMtime = (int)filemtime($pkgPath);
 ?>
@@ -1480,7 +1650,7 @@ if (file_exists($statusFile) && is_readable($statusFile)) {
         <td style="text-align: center; vertical-align: middle; font-size: 12px;"><?php echo date("Y-m-d H:i", $pkgMtime); ?></td>
         <td style="text-align: center; vertical-align: middle; padding: 4px 3px; padding-left: 8px;">
             <div style="display: flex; justify-content: center; align-items: center; gap: 3px;">
-                <button type="button" class="btn btn-xs btn-info" style="padding: 3px;" title="Edit Package Details" onclick="openEditPackageModal('<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgExt, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgMac, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgCipher, ENT_QUOTES); ?>')">
+                <button type="button" class="btn btn-xs btn-info" style="padding: 3px;" title="Edit Package Details" onclick="openEditPackageModal('<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgExt, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgMac, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgCipher, ENT_QUOTES); ?>', <?php echo $pkgHasDataCiphers ? 'true' : 'false'; ?>)">
                     <i class="fa fa-pencil"></i>
                 </button>
                 <a href="<?php echo htmlspecialchars($downloadUrl); ?>" style="padding: 3px; font-size: 16px;" class="btn btn-xs btn-primary" download title="Download Package">
@@ -1542,7 +1712,14 @@ if (file_exists($statusFile) && is_readable($statusFile)) {
                             <option value="AES-256-GCM">4 &mdash; Strongest &mdash; AES-256-GCM</option>
                         </select>
                     </div>
-                    <div id="edit_cipher_notice" role="status" aria-live="polite" style="margin: 0; padding: 8px 10px; border: 1px solid #faebcc; border-radius: 4px; background: #fcf8e3; color: #8a6d3b; font-size: 11px; line-height: 1.5;"></div>
+                    <div id="edit_cipher_notice" role="status" aria-live="polite" style="margin: 0 0 10px; padding: 8px 10px; border: 1px solid #faebcc; border-radius: 4px; background: #fcf8e3; color: #8a6d3b; font-size: 11px; line-height: 1.5;"></div>
+
+                    <div id="edit_data_ciphers_row" style="display: none; margin: 0;">
+                        <label style="font-size: 11px; font-weight: normal; margin: 0; cursor: pointer;" title="Adds data-ciphers / data-ciphers-fallback to vpn.cnf so the client negotiates this cipher via NCP. Only understood by OpenVPN 2.5+ clients - on 2.4.x (including some phones' embedded builds, even ones that otherwise connect fine with a GCM cipher) this keyword fails to parse and the client won't start at all. Leave unchecked unless you've confirmed the client's OpenVPN version.">
+                            <input type="checkbox" id="edit_include_data_ciphers" name="include_data_ciphers" value="1" style="margin: 0 4px 0 0; vertical-align: middle;">
+                            Include data-ciphers (requires OpenVPN 2.5+ client &mdash; confirm before enabling)
+                        </label>
+                    </div>
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-default" data-dismiss="modal">Cancel</button>
@@ -1705,7 +1882,7 @@ if (file_exists($statusFile) && is_readable($statusFile)) {
         <div class="modal-content">
             <div class="modal-header">
                 <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
-                <h4 class="modal-title" id="logModalLabel"><i class="fa fa-terminal"></i> OpenVPN Live Log Output (Last 200 Lines)</h4>
+                <h4 class="modal-title" id="logModalLabel"><i class="fa fa-terminal"></i> OpenVPN Live Log Output (Last 500 Lines)</h4>
             </div>
             <div class="modal-body">
                 <textarea id="logModalPre" readonly style="width: 100%; height: 350px; min-height: 200px; resize: both; overflow: auto; background: #f4f4f4; color: #111111; font-family: monospace; font-size: 12px; border: 1px solid #ccc; border-radius: 4px; padding: 10px;"><?php echo !empty($logContent) ? htmlspecialchars($logContent) : 'No log output available.'; ?></textarea>
@@ -1790,14 +1967,21 @@ if (file_exists($statusFile) && is_readable($statusFile)) {
 <script>
 var OVPN_CSRF = <?php echo json_encode($csrfToken); ?>;
 var OVPN_CBC_IN_USE = <?php echo json_encode((object)$ovpnCbcInUse); ?>;
+// Whether crl-verify is already wired into the server config. If it isn't yet,
+// the NEXT revoke of any kind (including one from an Edit Package save) is
+// the one that adds it - a genuine, if rare, restart-requiring change. Once
+// present (true on essentially every already-used install), edits never
+// need a restart at all under the current design.
+var OVPN_CRL_VERIFY_PRESENT = <?php echo json_encode(strpos((string)@file_get_contents($serverConf), 'crl-verify') !== false); ?>;
 
-function openEditPackageModal(filename, currentExt, currentMac, currentCipher) {
+function openEditPackageModal(filename, currentExt, currentMac, currentCipher, currentHasDataCiphers) {
     $('#edit_old_pkg').val(filename);
     $('#edit_ext').val(currentExt);
     $('#edit_mac').val(currentMac);
     $('#edit_cipher').val(currentCipher || 'AES-128-CBC');
     ovpnEditOriginalCipher = currentCipher || 'AES-128-CBC';
     updateEditCipherNotice();
+    updateDataCiphersRow('edit_cipher', 'edit_data_ciphers_row', 'edit_include_data_ciphers', !!currentHasDataCiphers);
     $('#editPackageModal').modal('show');
 }
 
@@ -1999,6 +2183,80 @@ function showOvpnConfirm(message, onConfirm) {
     $modal.modal('show');
 }
 
+// Server Settings form: only the port and VPN subnet actually require the
+// OpenVPN daemon to restart (see update_server_settings) - re-saving with
+// neither changed doesn't touch the daemon at all, so don't prompt then.
+// .defaultValue holds each input's original server-rendered value regardless
+// of what the user has typed, so no separate "original" data is needed.
+(function () {
+    var settingsForm = document.getElementById('ovpnSettingsForm');
+    if (!settingsForm) return;
+    settingsForm.addEventListener('submit', function (e) {
+        var portEl = document.getElementById('ovpn_port');
+        var hostIpEl = document.getElementById('ovpn_host_ip');
+        var cidrEl = document.getElementById('ovpn_cidr');
+        var changed = (portEl && portEl.value !== portEl.defaultValue)
+            || (hostIpEl && hostIpEl.value !== hostIpEl.defaultValue)
+            || (cidrEl && cidrEl.value !== cidrEl.defaultValue);
+        if (!changed) {
+            // No restart will happen - submit normally, just show progress.
+            showOvpnProgress('Saving settings, please wait...');
+            return;
+        }
+        e.preventDefault();
+        showOvpnConfirm(
+            'Changing the port or VPN subnet requires restarting the OpenVPN daemon, which will disconnect every currently connected phone. They will reconnect on their own once it is back up. Continue?',
+            function () {
+                showOvpnProgress('Saving settings and restarting the OpenVPN daemon...');
+                settingsForm.submit();
+            }
+        );
+    });
+})();
+
+// Edit Package form: under the current design a plain cipher/ext/MAC edit
+// never needs a restart - EXCEPT the one-time case where crl-verify hasn't
+// been wired into the server config yet, in which case this save's revoke
+// is the one that adds it. Warn only in that (rare, usually one-time-ever)
+// case, so routine edits stay silent.
+(function () {
+    var editForm = document.getElementById('editPackageForm');
+    if (!editForm || OVPN_CRL_VERIFY_PRESENT) return;
+    editForm.addEventListener('submit', function (e) {
+        e.preventDefault();
+        showOvpnConfirm(
+            'This is the first time a certificate has been revoked on this server, which requires a one-time restart of the OpenVPN daemon to enable revocation checking. Every currently connected phone will be disconnected. Continue?',
+            function () {
+                showOvpnProgress('Saving, please wait...');
+                editForm.submit();
+            }
+        );
+    });
+})();
+
+// Generate Package form: the only thing here that can force a restart is
+// ticking "Set as default cipher" while actually changing the default (see
+// syncServerCiphers - data-ciphers itself is now static and never restarts).
+(function () {
+    var genForm = document.getElementById('ovpnGenerateForm');
+    var cipherSelect = document.getElementById('ovpn_cipher');
+    var defaultBox = document.getElementById('ovpn_cipher_default');
+    if (!genForm || !cipherSelect || !defaultBox) return;
+    genForm.addEventListener('submit', function (e) {
+        var currentDefault = cipherSelect.getAttribute('data-default-cipher');
+        var changingDefault = defaultBox.checked && !defaultBox.disabled && cipherSelect.value !== currentDefault;
+        if (!changingDefault) { return; }
+        e.preventDefault();
+        showOvpnConfirm(
+            'Changing the default cipher requires restarting the OpenVPN daemon, which will disconnect every currently connected phone. They will reconnect on their own once it is back up. Continue?',
+            function () {
+                showOvpnProgress('Building package, please wait...');
+                genForm.submit();
+            }
+        );
+    });
+})();
+
 $(document).on('click', 'button[data-confirm-message], a[data-confirm-message]', function(e) {
     e.preventDefault();
     var $btn = $(this);
@@ -2018,9 +2276,6 @@ $(document).on('click', 'button[data-confirm-message], a[data-confirm-message]',
 
 $('#ovpnServiceForm').on('submit', function() {
     showOvpnProgress('Applying service command, please wait...');
-});
-$('#ovpnSettingsForm').on('submit', function() {
-    showOvpnProgress('Saving settings and restarting the OpenVPN daemon...');
 });
 
 function toggleAllOvpnPkgCheckboxes(source) {
@@ -2124,8 +2379,8 @@ $('#logModal').on('hidden.bs.modal', function () {
 var ovpnCipherGuidance = {
     'AES-128-CBC': { bg: '#fcf8e3', border: '#faebcc', color: '#8a6d3b', text: '<strong><span style="font-size: 1.5em;">&#9888;</span> Legacy compatibility:</strong> Uses AES-128-CBC and SHA1. Intended for older phones that cannot use modern OpenVPN data ciphers.' },
     'AES-256-CBC': { bg: '#fcf8e3', border: '#faebcc', color: '#8a6d3b', text: '<strong><span style=\"font-size: 1.5em;\">&#9888;</span> Legacy compatibility:</strong> Uses AES-256-CBC and SHA1. Stronger than AES-128-CBC, for older phones that cannot use modern OpenVPN data ciphers.' },
-    'AES-128-GCM': { bg: '#d4edda', border: '#c3e6cb', color: '#155724', text: '<strong><span style="font-size: 1.4em;">&#10004;</span> Modern cipher:</strong> AES-128-GCM. Use only with a phone/firmware that supports OpenVPN GCM data ciphers. Older models may fail to connect.' },
-    'AES-256-GCM': { bg: '#d4edda', border: '#c3e6cb', color: '#155724', text: '<strong><span style="font-size: 1.4em;">&#10004;</span> Strong modern cipher:</strong> AES-256-GCM. Strongest option in this list; requires verified GCM support in the phone firmware.' }
+    'AES-128-GCM': { bg: '#d4edda', border: '#c3e6cb', color: '#155724', text: '<strong><span style="font-size: 1.4em;">&#10004;</span> Modern cipher:</strong> AES-128-GCM. Sent as a static cipher by default, which works even on many OpenVPN 2.4.x clients. Only check &ldquo;Include data-ciphers&rdquo; below if you have confirmed the phone runs OpenVPN 2.5+ - on 2.4.x that keyword fails to parse and the client won&rsquo;t start.' },
+    'AES-256-GCM': { bg: '#d4edda', border: '#c3e6cb', color: '#155724', text: '<strong><span style="font-size: 1.4em;">&#10004;</span> Strong modern cipher:</strong> AES-256-GCM. Sent as a static cipher by default, which works even on many OpenVPN 2.4.x clients. Only check &ldquo;Include data-ciphers&rdquo; below if you have confirmed the phone runs OpenVPN 2.5+ - on 2.4.x that keyword fails to parse and the client won&rsquo;t start.' }
 };
 function applyCipherNotice(selectId, noticeId, ownCipher) {
     var select = document.getElementById(selectId), notice = document.getElementById(noticeId);
@@ -2152,6 +2407,26 @@ function applyCipherNotice(selectId, noticeId, ownCipher) {
 }
 var ovpnEditOriginalCipher = null;
 function updateEditCipherNotice() { applyCipherNotice('edit_cipher', 'edit_cipher_notice', ovpnEditOriginalCipher); }
+
+// The "Include data-ciphers" checkbox only applies to GCM ciphers (CBC never
+// uses data-ciphers at all - see buildClientPackage()). Hide + uncheck it for
+// CBC so a stale checked box can't get submitted once the cipher is switched.
+// presetChecked is only honored the first time the row becomes relevant for a
+// given open of the form/modal (i.e. when explicitly passed in); ordinary
+// user cipher changes always reset it unchecked, since it should not be
+// silently carried from an unrelated cipher across a manual switch.
+function updateDataCiphersRow(selectId, rowId, checkboxId, presetChecked) {
+    var select = document.getElementById(selectId), row = document.getElementById(rowId), box = document.getElementById(checkboxId);
+    if (!select || !row || !box) return;
+    var isGcm = /-GCM$/.test(select.value);
+    row.style.display = isGcm ? '' : 'none';
+    if (!isGcm) {
+        box.checked = false;
+    } else if (typeof presetChecked !== 'undefined') {
+        box.checked = presetChecked;
+    }
+}
+
 (function () {
     var mainSelect = document.getElementById('ovpn_cipher');
     if (mainSelect) {
@@ -2170,13 +2445,18 @@ function updateEditCipherNotice() { applyCipherNotice('edit_cipher', 'edit_ciphe
         mainSelect.addEventListener('change', function () {
             applyCipherNotice('ovpn_cipher', 'ovpn_cipher_notice');
             syncDefaultBox();
+            updateDataCiphersRow('ovpn_cipher', 'ovpn_data_ciphers_row', 'ovpn_include_data_ciphers');
         });
         applyCipherNotice('ovpn_cipher', 'ovpn_cipher_notice');
         syncDefaultBox();
+        updateDataCiphersRow('ovpn_cipher', 'ovpn_data_ciphers_row', 'ovpn_include_data_ciphers');
     }
     var editSelect = document.getElementById('edit_cipher');
     if (editSelect) {
-        editSelect.addEventListener('change', updateEditCipherNotice);
+        editSelect.addEventListener('change', function () {
+            updateEditCipherNotice();
+            updateDataCiphersRow('edit_cipher', 'edit_data_ciphers_row', 'edit_include_data_ciphers');
+        });
         updateEditCipherNotice();
     }
 })();

@@ -61,6 +61,23 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
         ];
     }
 
+    /**
+     * Returns only the part of an OpenVPN log that belongs to the most
+     * recent launch: everything from the last version banner line
+     * ("... OpenVPN 2.6.x ... [SSL ...") onward. OpenVPN prints that banner at
+     * the top of every start, so errors from earlier failed attempts that are
+     * still sitting in the shared, append-only log don't count against a
+     * daemon that has since started cleanly. If no banner is in the window,
+     * the whole text is returned unchanged.
+     */
+    function ovpnLogSinceLastStart($logContent) {
+        if (preg_match_all('/^.*OpenVPN \d+\.\d+\.\d+ .*\[SSL.*$/m', $logContent, $m, PREG_OFFSET_CAPTURE) && !empty($m[0])) {
+            $last = end($m[0]);
+            return (string)substr($logContent, $last[1]);
+        }
+        return $logContent;
+    }
+
     function tailFile($path, $lines = 200, $maxBytes = 2000000) {
         if (!file_exists($path)) { return ''; }
         $size = filesize($path);
@@ -96,7 +113,7 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
      * that the marker fell outside the $maxBytes window entirely) - the
      * caller doesn't need to know which case applies.
      */
-    function tailFileFromMarker($path, $markerBytePos, $minLines = 200, $maxLines = 5000, $maxBytes = 2000000) {
+    function tailFileFromMarker($path, $markerBytePos, $minLines = 500, $maxLines = 5000, $maxBytes = 2000000) {
         if (!file_exists($path)) { return ''; }
         $size = filesize($path);
         $windowStart = max(0, $size - $maxBytes);
@@ -132,6 +149,189 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
             return $matches[1];
         }
         return '2.4.0';
+    }
+
+    /**
+     * The PBX's own LAN address, detected the same way install.php does
+     * (source address of the default route). Only used when the config has
+     * no record of it yet.
+     */
+    function ovpnDetectLanIp() {
+        $out = [];
+        $cmd = "ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if (\$i==\"src\") {print \$(i+1); exit}}'";
+        @exec($cmd, $out);
+        $ip = trim((string)($out[0] ?? ''));
+        if (filter_var($ip, FILTER_VALIDATE_IP) && strpos($ip, '127.') !== 0) {
+            return $ip;
+        }
+        $ip = (string)($_SERVER['SERVER_ADDR'] ?? '');
+        return filter_var($ip, FILTER_VALIDATE_IP) ? $ip : '';
+    }
+
+    /**
+     * True when an address clients connect to is the PBX's own LAN address -
+     * either literally, or a hostname that resolves to it.
+     */
+    function ovpnRemoteIsServerLan($remoteHost, $lanIp) {
+        $remote = strtolower(trim((string)$remoteHost));
+        if ($remote === '' || $lanIp === '') { return false; }
+        if ($remote === $lanIp) { return true; }
+        if (!filter_var($remote, FILTER_VALIDATE_IP)) {
+            static $dnsCache = [];
+            if (!isset($dnsCache[$remote])) {
+                $dnsCache[$remote] = @gethostbyname($remote); // returns the input unchanged on failure
+            }
+            if ($dnsCache[$remote] !== $remote && $dnsCache[$remote] === $lanIp) { return true; }
+        }
+        return false;
+    }
+
+    /**
+     * The PBX's LAN address that the per-client route points at: recorded in
+     * the "# push-route-host" marker, else taken from an existing pushed /32
+     * route line (active or commented out), else detected.
+     */
+    function ovpnRouteLanIp($text) {
+        $text = (string)$text;
+        if (preg_match('/^# push-route-host[ \t]+(\S+)[ \t]*$/m', $text, $m) && filter_var($m[1], FILTER_VALIDATE_IP)) {
+            return $m[1];
+        }
+        if (preg_match('/^[ \t#]*push[ \t]+"route[ \t]+(\d{1,3}(?:\.\d{1,3}){3})[ \t]+255\.255\.255\.255"[ \t]*$/m', $text, $m)) {
+            return $m[1];
+        }
+        return ovpnDetectLanIp();
+    }
+
+    /**
+     * Route to the PBX's LAN address, decided per client.
+     *
+     * Remote phones (connecting to a public IP / DNS name) need a route to
+     * the PBX's LAN address through the tunnel. Phones on the PBX's own LAN
+     * that connect to that same address must NOT get it: the route points
+     * the phone's own encrypted traffic to the server back into the tunnel (a
+     * routing loop). The handshake succeeds, then the phone goes silent and
+     * the server drops it after ping-restart. Both kinds can exist on one
+     * server, so this is no longer a global "push": each client's ccd file
+     * (client-config-dir, named after the certificate CN) pushes the route
+     * or not, according to the address that client's package connects to.
+     *
+     * This rewrites the server config for that: removes any global pushed
+     * route to the LAN address (active, or commented out by hand), records
+     * the address in a "# push-route-host" marker and points
+     * client-config-dir at $ccdDir. If the ccd directory can't be created or
+     * written, nothing is changed (the old global push keeps working).
+     * Returns ['text' => new config text, 'lan_ip' => address, or '' if not applied].
+     */
+    function ovpnPrepareRoutePolicy($text, $ccdDir) {
+        $text = (string)$text;
+        if (!is_dir($ccdDir)) { @mkdir($ccdDir, 0775, true); }
+        if (!is_dir($ccdDir) || !is_writable($ccdDir)) { return ['text' => $text, 'lan_ip' => '']; }
+        $lanIp = ovpnRouteLanIp($text);
+        if (!filter_var($lanIp, FILTER_VALIDATE_IP)) { return ['text' => $text, 'lan_ip' => '']; }
+
+        $marker  = "# push-route-host {$lanIp}";
+        $routeRe = '/^[ \t#]*push[ \t]+"route[ \t]+' . preg_quote($lanIp, '/') . '[ \t]+255\.255\.255\.255"[ \t]*$/';
+        $out = [];
+        $placed = false;
+        foreach (preg_split('/\r?\n/', $text) as $line) {
+            if (preg_match('/^# push-route-host[ \t]+\S+[ \t]*$/', $line) || preg_match($routeRe, $line)) {
+                if (!$placed) { $out[] = $marker; $placed = true; }
+                continue;
+            }
+            $out[] = $line;
+        }
+        if (!$placed) {
+            while (!empty($out) && end($out) === '') { array_pop($out); }
+            $out[] = $marker;
+            $out[] = '';
+        }
+        $text = ovpnSetServerDirective(implode("\n", $out), 'client-config-dir', $ccdDir);
+        return ['text' => $text, 'lan_ip' => $lanIp];
+    }
+
+    /** The address a built package's vpn.cnf connects to ("remote <host> <port>"), or ''. */
+    function getPackageRemote($pkgPath) {
+        $cnf = @shell_exec('tar -xOf ' . escapeshellarg($pkgPath) . ' vpn.cnf 2>/dev/null');
+        if (is_string($cnf) && preg_match('/^remote[ \t]+(\S+)/m', $cnf, $m)) {
+            return trim($m[1]);
+        }
+        return '';
+    }
+
+    /**
+     * (Re)writes the per-client ccd files described at ovpnPrepareRoutePolicy():
+     * one file per issued client certificate, containing the route to the
+     * PBX's LAN address - or just a comment when that client's package connects
+     * to the LAN address directly. A client with several packages is treated
+     * as same-LAN if ANY of them targets the LAN address (a missing route is
+     * harmless, a loop is not); a client with no readable package keeps the old
+     * behaviour (route pushed). OpenVPN reads a client's ccd file when it
+     * connects, so changes need no daemon restart.
+     *
+     * $onlyExt limits the work to one extension (used right after building its
+     * package); otherwise every issued certificate is handled and stale
+     * module-written files are removed.
+     */
+    function ovpnSyncCcdFiles($baseDir, $pkiDir, $pkgDir, $lanIp = '', $onlyExt = null) {
+        $ccdDir = "{$baseDir}/ccd";
+        if ($lanIp === '') {
+            $lanIp = ovpnRouteLanIp((string)@file_get_contents("{$baseDir}/legacy-vpn.conf"));
+        }
+        if (!filter_var($lanIp, FILTER_VALIDATE_IP)) { return false; }
+        if ($onlyExt !== null && !preg_match('/^[A-Za-z0-9_-]{1,64}$/', (string)$onlyExt)) { return false; }
+        if (!is_dir($ccdDir)) { @mkdir($ccdDir, 0775, true); }
+        if (!is_dir($ccdDir) || !is_writable($ccdDir)) { return false; }
+
+        $header = '# managed by ovpn_mgr: rewritten on every daemon start and package build';
+        $exts = [];
+        $targetsLan = [];
+        if ($onlyExt !== null) {
+            $exts[(string)$onlyExt] = true;
+            $tars = glob("{$pkgDir}/*_{$onlyExt}_*ovpn.tar") ?: [];
+        } else {
+            $tars = glob("{$pkgDir}/*_ovpn.tar") ?: [];
+            foreach (glob("{$pkiDir}/issued/*.crt") ?: [] as $crt) {
+                $exts[basename($crt, '.crt')] = true;
+            }
+        }
+        foreach ($tars as $tar) {
+            $id = ovpnParsePackageName($tar);
+            if ($id === null) { continue; }
+            if ($onlyExt !== null && $id['ext'] !== (string)$onlyExt) { continue; }
+            $exts[$id['ext']] = true;
+            $remote = getPackageRemote($tar);
+            if ($remote !== '' && ovpnRemoteIsServerLan($remote, $lanIp)) {
+                $targetsLan[$id['ext']] = true;
+            }
+        }
+
+        $known = [];
+        foreach (array_keys($exts) as $cn) {
+            $cn = (string)$cn;
+            if (!preg_match('/^[A-Za-z0-9_-]{1,64}$/', $cn) || $cn === 'server') { continue; }
+            $known[$cn] = true;
+            $body = $header . "\n";
+            if (!empty($targetsLan[$cn])) {
+                $body .= "# This client connects to the PBX LAN address ({$lanIp}) directly, so no route to it\n"
+                       . "# is pushed: it would send the phone's own tunnel traffic back into the tunnel.\n";
+            } else {
+                $body .= "push \"route {$lanIp} 255.255.255.255\"\n";
+            }
+            $file = "{$ccdDir}/{$cn}";
+            if (@file_get_contents($file) !== $body) {
+                @file_put_contents($file, $body, LOCK_EX);
+                @chmod($file, 0644);
+            }
+        }
+
+        if ($onlyExt === null) {
+            foreach (glob("{$ccdDir}/*") ?: [] as $f) {
+                if (!is_file($f) || isset($known[basename($f)])) { continue; }
+                // Only ever remove files this module wrote.
+                if (strpos((string)@file_get_contents($f), $header) === 0) { @unlink($f); }
+            }
+        }
+        return true;
     }
 
     function getActiveServerSettings($serverConf) {
@@ -189,6 +389,21 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
                 && in_array($m[1], ovpnAllowedCiphers(), true)) {
                 return $m[1];
             }
+            // No explicit default has ever been set via "Set as default
+            // cipher" - fall back to whatever data-ciphers-fallback/cipher
+            // is CURRENTLY in the config, not a hardcoded literal. Otherwise
+            // syncServerCiphers() would rewrite that directive to a fixed
+            // guess that doesn't match what's actually there on every single
+            // call, making every save look like a real config change and
+            // forcing a restart no matter what cipher was actually picked.
+            if (preg_match('/^data-ciphers-fallback[ \t]+([A-Za-z0-9\-]+)/m', $content, $m2)
+                && in_array($m2[1], ovpnAllowedCiphers(), true)) {
+                return $m2[1];
+            }
+            if (preg_match('/^cipher[ \t]+([A-Za-z0-9\-]+)/m', $content, $m3)
+                && in_array($m3[1], ovpnAllowedCiphers(), true)) {
+                return $m3[1];
+            }
         }
         return 'AES-256-CBC';
     }
@@ -226,38 +441,36 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
     }
 
     /**
-     * Brings the server's cipher directives in line with what is actually
-     * in use, so AES-128-CBC is never a fallback unless it has been chosen:
-     *   - data-ciphers: the default cipher, every cipher an existing package
-     *     uses, and any cipher in $extraCiphers (the one about to be built).
-     *   - data-ciphers-fallback / cipher: AES-128-CBC only when the default
-     *     is AES-128-CBC or at least one package uses it (legacy phones
-     *     can't negotiate, so they need it); otherwise the default cipher.
-     * The server's "auth" line is left alone: it is a single server-wide
-     * HMAC that every CBC client must match, and it is ignored for GCM.
+     * Keeps the server's cipher directives in sync with the admin's chosen
+     * default - and nothing else:
+     *   - data-ciphers: statically every allowed cipher, always. This is a
+     *     process-wide directive (one daemon serves every extension), so
+     *     recalculating it from "what packages currently exist" meant that
+     *     editing or rebuilding a single extension's package could change a
+     *     server-wide setting and force a restart that dropped every other
+     *     connected client - and, worse, a save that removed the last
+     *     package using a given cipher would silently stop the server from
+     *     offering it at all, breaking any client whose own config (not yet
+     *     rebuilt/reprovisioned) still expected it. Advertising every cipher
+     *     unconditionally means no per-extension edit ever needs to touch
+     *     this directive, and no client can be locked out by another
+     *     client's unrelated change.
+     *   - data-ciphers-fallback / cipher: the admin's chosen default cipher
+     *     only, changed solely via the explicit "Set as default cipher"
+     *     checkbox - not a side effect of any particular package's cipher.
+     *     Every package this module builds already pins its own explicit
+     *     "cipher" line (see buildClientPackage()), so this fallback is only
+     *     ever exercised by a client that both skips NCP negotiation and
+     *     sends no cipher preference of its own - not a case this module's
+     *     generated packages produce.
      * Returns true if the file changed (the daemon then needs a restart).
      */
     function syncServerCiphers($serverConf, $pkgDir, array $extraCiphers = []) {
         if (!is_readable($serverConf) || !is_writable($serverConf)) { return false; }
-        $allowed = ovpnAllowedCiphers();
         $original = (string)file_get_contents($serverConf);
-        $default = getDefaultCipher($serverConf);
+        $fallback = getDefaultCipher($serverConf);
 
-        $inUse = [$default];
-        foreach ($extraCiphers as $c) {
-            if (in_array($c, $allowed, true)) { $inUse[] = $c; }
-        }
-        foreach (glob("{$pkgDir}/*.tar") ?: [] as $pkg) {
-            $inUse[] = getPackageCipher($pkg);
-        }
-
-        $list = [];
-        foreach (['AES-256-GCM', 'AES-128-GCM', 'AES-256-CBC', 'AES-128-CBC'] as $c) {
-            if (in_array($c, $inUse, true)) { $list[] = $c; }
-        }
-        $fallback = in_array('AES-128-CBC', $inUse, true) ? 'AES-128-CBC' : $default;
-
-        $text = ovpnSetServerDirective($original, 'data-ciphers', implode(':', $list));
+        $text = ovpnSetServerDirective($original, 'data-ciphers', implode(':', ovpnAllowedCiphers()));
         $text = ovpnSetServerDirective($text, 'data-ciphers-fallback', $fallback);
         $text = ovpnSetServerDirective($text, 'cipher', $fallback);
 
@@ -275,7 +488,7 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
      * package built the same way, against the same PKI, instead of
      * maintaining a second implementation.
      */
-    function buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $serverIp, $port, $cipher = null, $syncServer = true) {
+    function buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $serverIp, $port, $cipher = null, $syncServer = true, $includeDataCiphers = false) {
         // No (or an invalid) cipher means "the server's default cipher".
         $allowedCiphers = ovpnAllowedCiphers();
         if (!in_array($cipher, $allowedCiphers, true)) { $cipher = getDefaultCipher("{$baseDir}/legacy-vpn.conf"); }
@@ -301,12 +514,18 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
         @copy($clientCrt, "{$keysSubDir}/client.crt");
         @copy($clientKey, "{$keysSubDir}/client.key");
 
-        // Legacy phones (both CBC ciphers) run an OpenVPN build that predates
-        // data-ciphers / data-ciphers-fallback and rejects them as unknown
-        // options, so those two lines are only emitted for the GCM ciphers.
-        $dataCipherLines = ovpnIsCbcCipher($cipher)
-            ? ""
-            : "data-ciphers {$cipher}\n" . "data-ciphers-fallback {$cipher}\n";
+        // data-ciphers / data-ciphers-fallback require an OpenVPN 2.5+ client
+        // (the keyword itself doesn't parse on 2.4.x - it fails the whole
+        // config, it doesn't just skip negotiation). GCM does NOT imply a
+        // client is new enough: some 2.4.x builds (e.g. Yealink's) negotiate
+        // GCM fine via the static "cipher" line below but don't understand
+        // "data-ciphers" at all. So these lines are never emitted by default,
+        // even for GCM ciphers - only when the caller has explicitly opted
+        // in (the "Include data-ciphers" checkbox in the UI), confirming the
+        // client is known to be 2.5+.
+        $dataCipherLines = (!ovpnIsCbcCipher($cipher) && $includeDataCiphers)
+            ? "data-ciphers {$cipher}\n" . "data-ciphers-fallback {$cipher}\n"
+            : "";
 
         // The HMAC only matters for CBC ciphers (and must match the server's
         // auth). GCM authenticates itself, so SHA1 is not emitted for it.
@@ -352,6 +571,14 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
         $ok = ($tarRc === 0 && file_exists($tarPath));
         if ($ok) {
             @chmod($tarPath, 0644);
+            // Per-client route policy (see ovpnPrepareRoutePolicy): this
+            // package's target decides whether the client is pushed a route
+            // to the PBX's LAN address. Never fail a build over it.
+            try {
+                ovpnSyncCcdFiles($baseDir, $pkiDir, $pkgDir, '', (string)$ext);
+            } catch (\Throwable $e) {
+                // best effort
+            }
             // Other callers (e.g. yealink_epm) get the server's cipher lines
             // kept in step automatically. They still need to restart the
             // daemon for a changed data-ciphers to take effect. This
@@ -387,16 +614,39 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
             return;
         }
 
-        $tmpCnf = "{$pkiDir}/crl_openssl.cnf";
-        $cnfData = "[ ca ]\ndefault_ca = CA_default\n\n[ CA_default ]\ndir = {$pkiDir}\ndefault_md = sha256\n";
-        @file_put_contents($tmpCnf, $cnfData);
-
         if (!file_exists("{$pkiDir}/index.txt")) { @touch("{$pkiDir}/index.txt"); }
         if (!file_exists("{$pkiDir}/crlnumber")) { @file_put_contents("{$pkiDir}/crlnumber", "01\n"); }
 
-        exec("OPENSSL_CONF=" . escapeshellarg($tmpCnf) . " openssl ca -revoke " . escapeshellarg($targetCrt) . " -keyfile " . escapeshellarg("{$pkiDir}/private/ca.key") . " -cert " . escapeshellarg("{$pkiDir}/ca.crt") . " -config " . escapeshellarg($tmpCnf) . " 2>&1");
-        exec("OPENSSL_CONF=" . escapeshellarg($tmpCnf) . " openssl ca -gencrl -keyfile " . escapeshellarg("{$pkiDir}/private/ca.key") . " -cert " . escapeshellarg("{$pkiDir}/ca.crt") . " -out " . escapeshellarg($crlFile) . " -config " . escapeshellarg($tmpCnf) . " 2>&1");
+        // "dir" alone isn't enough for openssl's "ca" command - "database"
+        // and "crlnumber" (which -revoke and -gencrl both need) aren't
+        // derived from it, they have to be spelled out, or every call fails
+        // with "variable lookup failed for CA_default::database".
+        $tmpCnf = "{$pkiDir}/crl_openssl.cnf";
+        $cnfData = "[ ca ]\ndefault_ca = CA_default\n\n[ CA_default ]\ndir = {$pkiDir}\ndatabase = {$pkiDir}/index.txt\ncrlnumber = {$pkiDir}/crlnumber\ndefault_md = sha256\ndefault_crl_days = 3650\n";
+        @file_put_contents($tmpCnf, $cnfData);
+
+        $revokeOut = []; $revokeRc = 0;
+        $gencrlOut = []; $gencrlRc = 0;
+        exec("OPENSSL_CONF=" . escapeshellarg($tmpCnf) . " openssl ca -revoke " . escapeshellarg($targetCrt) . " -keyfile " . escapeshellarg("{$pkiDir}/private/ca.key") . " -cert " . escapeshellarg("{$pkiDir}/ca.crt") . " -config " . escapeshellarg($tmpCnf) . " 2>&1", $revokeOut, $revokeRc);
+        exec("OPENSSL_CONF=" . escapeshellarg($tmpCnf) . " openssl ca -gencrl -keyfile " . escapeshellarg("{$pkiDir}/private/ca.key") . " -cert " . escapeshellarg("{$pkiDir}/ca.crt") . " -out " . escapeshellarg($crlFile) . " -config " . escapeshellarg($tmpCnf) . " 2>&1", $gencrlOut, $gencrlRc);
         @unlink($tmpCnf);
+
+        // These two commands previously ran unchecked - a failure was
+        // completely silent. In particular, if -gencrl fails, $crlFile never
+        // gets (re)written, which - combined with startOpenVpnServer()'s own
+        // defensive strip of crl-verify when that file is missing - can
+        // silently undo the crl-verify line added below on the very next
+        // restart, making it look like it "never sticks". Surface it instead.
+        if ($gencrlRc !== 0 || !file_exists($crlFile)) {
+            $_SESSION['ovpn_mgr_crl_warning'] = "Generating the CRL failed (exit {$gencrlRc}), so revocation checking is not active for this change: "
+                . trim(implode(' ', $gencrlOut));
+        } elseif ($revokeRc !== 0) {
+            // gencrl still ran (it always writes a CRL reflecting whatever
+            // index.txt currently has), but the revoke itself didn't record -
+            // this extension's cert may not actually end up on the CRL.
+            $_SESSION['ovpn_mgr_crl_warning'] = "Revoking extension {$revokeExt}'s certificate reported an error (exit {$revokeRc}): "
+                . trim(implode(' ', $revokeOut));
+        }
 
         $confContent = (string)@file_get_contents($serverConf);
         if (strpos($confContent, 'crl-verify') === false) {
@@ -444,12 +694,24 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
             if (!file_exists("{$pkiDir}/index.txt")) { @touch("{$pkiDir}/index.txt"); }
             if (!file_exists("{$pkiDir}/crlnumber")) { @file_put_contents("{$pkiDir}/crlnumber", "01\n"); }
 
+            // See revokeExtension() - "dir" alone isn't enough for openssl's
+            // "ca" command, "database"/"crlnumber" have to be spelled out too.
             $tmpCnf = "{$pkiDir}/crl_openssl.cnf";
-            $cnfData = "[ ca ]\ndefault_ca = CA_default\n\n[ CA_default ]\ndir = {$pkiDir}\ndefault_md = sha256\n";
+            $cnfData = "[ ca ]\ndefault_ca = CA_default\n\n[ CA_default ]\ndir = {$pkiDir}\ndatabase = {$pkiDir}/index.txt\ncrlnumber = {$pkiDir}/crlnumber\ndefault_md = sha256\ndefault_crl_days = 3650\n";
             @file_put_contents($tmpCnf, $cnfData);
 
-            exec("OPENSSL_CONF=" . escapeshellarg($tmpCnf) . " openssl ca -gencrl -keyfile " . escapeshellarg("{$pkiDir}/private/ca.key") . " -cert " . escapeshellarg("{$pkiDir}/ca.crt") . " -out " . escapeshellarg($crlFile) . " -config " . escapeshellarg($tmpCnf) . " 2>&1");
+            $gencrlOut = []; $gencrlRc = 0;
+            exec("OPENSSL_CONF=" . escapeshellarg($tmpCnf) . " openssl ca -gencrl -keyfile " . escapeshellarg("{$pkiDir}/private/ca.key") . " -cert " . escapeshellarg("{$pkiDir}/ca.crt") . " -out " . escapeshellarg($crlFile) . " -config " . escapeshellarg($tmpCnf) . " 2>&1", $gencrlOut, $gencrlRc);
             @unlink($tmpCnf);
+
+            if (($gencrlRc !== 0 || !file_exists($crlFile)) && empty($_SESSION['ovpn_mgr_crl_warning'])) {
+                // Without a valid crl.pem, crl-verify gets stripped from the
+                // config below on every start (OpenVPN would otherwise refuse
+                // to start pointing at a missing file) - so this is the other
+                // place a broken CA/index.txt state can make crl-verify look
+                // like it never sticks.
+                $_SESSION['ovpn_mgr_crl_warning'] = "Generating the CRL failed (exit {$gencrlRc}): " . trim(implode(' ', $gencrlOut));
+            }
         }
 
         $installedVersion = getOpenVpnVersion();
@@ -525,7 +787,26 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
             $cleanContent = ovpnSetServerDirective($cleanContent, 'status-version', '3');
             $cleanContent = ovpnSetServerDirective($cleanContent, 'management', '/run/ovpn_mgr/mgmt.sock unix');
             $cleanContent = ovpnSetServerDirective($cleanContent, 'management-client-user', 'asterisk');
+            // Installs from before crl-verify was part of install.php's
+            // baseline template only ever got it added reactively, by
+            // revokeExtension(), on whichever save first revoked a cert -
+            // meaning that one save needed a restart to activate it. Ensure
+            // it here too, on every start, so an existing install converges
+            // to the same "always present" guarantee a fresh install now
+            // gets immediately - after which no revoke, ever, needs a
+            // restart, matching how any standard OpenVPN CRL setup behaves.
+            if (file_exists($crlFile)) {
+                $cleanContent = ovpnSetServerDirective($cleanContent, 'crl-verify', $crlFile);
+            }
+            // Route to the PBX's LAN address: pushed per client (ccd files),
+            // not globally, so phones on the PBX's own LAN and remote phones
+            // can share one server. See ovpnPrepareRoutePolicy().
+            $routePolicy = ovpnPrepareRoutePolicy($cleanContent, "{$baseDir}/ccd");
+            $cleanContent = $routePolicy['text'];
             @file_put_contents($serverConf, $cleanContent);
+            if ($routePolicy['lan_ip'] !== '') {
+                ovpnSyncCcdFiles($baseDir, $pkiDir, dirname($baseDir) . '/vpnkeys', $routePolicy['lan_ip']);
+            }
         }
 
         if (file_exists($serverKey)) {
@@ -593,6 +874,16 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
     }
 
     /**
+     * Whether a package's vpn.cnf currently includes the data-ciphers /
+     * data-ciphers-fallback lines (see the note in buildClientPackage() on
+     * why this is opt-in rather than automatic for GCM ciphers).
+     */
+    function packageHasDataCiphers($pkgPath) {
+        $cnf = @shell_exec('tar -xOf ' . escapeshellarg($pkgPath) . ' vpn.cnf 2>/dev/null');
+        return is_string($cnf) && preg_match('/^data-ciphers\s+\S/m', $cnf) === 1;
+    }
+
+    /**
      * Rewrites vpn.cnf and re-tars existing client packages WITHOUT revoking
      * anything: each phone keeps its current key and certificate, and keeps
      * the cipher its package already uses. Only the server address/port and
@@ -622,7 +913,8 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
                 continue;
             }
             $cipher = getPackageCipher($pkgPath);
-            if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $id['ext'], $id['mac'], $serverIp, $port, $cipher, false)) {
+            $includeDataCiphers = packageHasDataCiphers($pkgPath);
+            if (buildClientPackage($pkiDir, $pkgDir, $baseDir, $id['ext'], $id['mac'], $serverIp, $port, $cipher, false, $includeDataCiphers)) {
                 $rebuilt++;
             } else {
                 $skipped[] = $name;

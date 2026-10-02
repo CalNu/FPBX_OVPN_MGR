@@ -318,7 +318,7 @@ EOF
 
     cat > "$UNIT_FILE" <<EOF
 [Unit]
-Description=Reapply ovpn_mgr VPN NAT rule
+Description=Reapply ovpn_mgr VPN NAT and firewall-port rules
 After=network-online.target firewalld.service nftables.service netfilter-persistent.service iptables.service ovpn-mgr-fixperms.service
 Requires=ovpn-mgr-fixperms.service
 Wants=network-online.target
@@ -326,6 +326,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=${WRAPPER} nat-restore
+ExecStart=${WRAPPER} port-restore
 RemainAfterExit=no
 
 [Install]
@@ -340,13 +341,23 @@ EOF
 Description=ovpn_mgr OpenVPN server
 After=network-online.target ovpn-mgr-nat.service
 Wants=network-online.target
-Requires=ovpn-mgr-nat.service
+# Ordering only (no Requires= on ovpn-mgr-nat.service): at boot the NAT unit is
+# enabled on its own and runs first; a GUI Start must not drag it in and
+# re-run nat-restore/port-restore every time.
+# Don't retry forever if the daemon can't start (e.g. missing TUN device).
+# ovpnctl start clears this with reset-failed before a manual/GUI start.
+StartLimitIntervalSec=120
+StartLimitBurst=3
 
 [Service]
 Type=forking
 PIDFile=${VPN_DATA_DIR}/openvpn.pid
-ExecStart=${WRAPPER} start
-ExecStop=${WRAPPER} stop
+# The unit calls start-daemon/stop-daemon (the real launch/stop). The plain
+# "start"/"stop" commands are what the web GUI calls via sudo: they delegate
+# to this unit so the daemon runs here, outside php-fpm's sandbox
+# (PrivateDevices, read-only /etc, cgroup), instead of as a child of PHP.
+ExecStart=${WRAPPER} start-daemon
+ExecStop=${WRAPPER} stop-daemon
 TimeoutStartSec=30
 TimeoutStopSec=15
 Restart=on-failure
@@ -376,6 +387,10 @@ chown -R asterisk:asterisk "${VPN_DATA_DIR}" 2>/dev/null || true
 # --- Start/restart OpenVPN under systemd so it also starts after reboot ---
 echo "==> Enabling and restarting the OpenVPN systemd service..."
 if command -v systemctl >/dev/null 2>&1; then
+    # Clear any daemon that was launched outside the unit (older versions
+    # started it from the web GUI, i.e. inside php-fpm's cgroup) so the unit
+    # owns the process from here on.
+    "$WRAPPER" stop-daemon || true
     if ! systemctl enable ovpn-mgr-openvpn.service >/dev/null 2>&1; then
         echo "WARNING: Could not enable ovpn-mgr-openvpn.service." >&2
     fi
@@ -396,7 +411,8 @@ echo "    after FreePBX's own permission sweep runs, so this no longer needs to"
 echo "    be re-run manually after a reboot"
 echo "  - ${SUDOERS_FILE} grants 'asterisk' passwordless sudo on that script only"
 echo "  - net.ipv4.ip_forward=1 persisted in /etc/sysctl.d/99-ovpn-mgr.conf"
-echo "  - ovpn-mgr-nat.service will reapply the VPN's NAT rule on every boot"
+echo "  - ovpn-mgr-nat.service will reapply the VPN's NAT rule, and (on hosts"
+echo "    without FreePBX's own Firewall module) its UDP port rule, on every boot"
 echo "  - ovpn-mgr-openvpn.service is enabled to start OpenVPN on every boot"
 echo "  - 'asterisk' was granted read-only ACL access to the web server's access"
 echo "    log (see warnings above if that could not be completed), so the Yealink"

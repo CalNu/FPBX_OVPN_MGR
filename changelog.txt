@@ -1,3 +1,25 @@
+2.67
+• Replaces 2.68's single global setting with a per-client route, so phones on the PBX's own LAN and remote phones can share one server. The route to the PBX's LAN address is no longer pushed globally; each client gets it (or not) from its own client-config-dir file (ccd/<extension>), based on the address its package connects to: a public IP or DNS name gets the route, the PBX's LAN address (or a name that resolves to it) does not, because the route would loop that phone's tunnel traffic back into the tunnel (phone connects, goes silent, dropped after ping-restart). The files are written on every package build and daemon start (no restart needed for new packages), upgrades convert the old global push automatically, and certificates with no readable package keep the old behaviour (route pushed). Restart the daemon once after upgrading so it loads client-config-dir.
+• Fixed the Connected OpenVPN Clients table still listing clients after the server was stopped. OpenVPN does not clear its status file on exit, so the GUI now only lists clients while the daemon is running, and ovpnctl empties the status file when it stops the daemon.
+• Changed the extension auto populate to limit to pjsip/sip extensions ignoring other types.
+• Fixed the "Firewall port may not be open yet: ... fwconsole firewall restart returned a non-zero code" warning and the missing iptables entries for the new port and VPN subnet. The web user cannot run fwconsole firewall, so restarts and trusted-zone changes made straight from PHP failed silently. They now go through the root helper (ovpnctl fw-restart / fw-trusted).
+• Systems without a usable FreePBX Firewall module now use iptables rules: the UDP port rule (port-sync) and a new trust-sync rule that accepts traffic from tun+ and the VPN pool. trust-sync is saved and reapplied at boot by the existing ovpn-mgr-nat unit (via port-restore), so setup-root.sh does not need re-running.
+• The restart warning now includes the exit code. Details are in the OpenVPN log under [FIREWALL SYNC].
+
+
+2.66
+• Fixed OpenVPN failing to start from the GUI on systems where php-fpm runs sandboxed (e.g. PrivateDevices=yes on Debian/Sury PHP): "Cannot open TUN/TAP dev /dev/net/tun". Start/Stop now go through the ovpn-mgr-openvpn systemd unit, so the daemon runs outside php-fpm's sandbox and survives php-fpm restarts. Re-run setup-root.sh once after upgrading; until then the GUI shows a notice and uses the old direct launch.
+• ovpnctl: new start-daemon / stop-daemon commands (used by the systemd unit); loads or creates /dev/net/tun if it is genuinely missing; start now verifies OpenVPN is actually running and returns an error otherwise instead of reporting success; stop no longer waits when nothing is running.
+• Fixed the status banner staying on STOPPED after a successful start because of an old "Exiting due to fatal error" line in the log. Only the most recent launch's output is checked now.
+• Live log now shows the last 500 lines (was 200).
+• uninstall.php: manual cleanup notes now list all three systemd units (openvpn, nat, fixperms) plus the optional leftovers (freepbx_chown.conf line, Fail2Ban ignoreip, iptables rules, log ACL). Still never touches PhoneSettings, keys or packages.
+• setup-root.sh: unit now calls start-daemon/stop-daemon, has a start limit so a persistent failure doesn't retry forever, no longer Requires= the NAT unit (ordering only), and clears any daemon started outside the unit before restarting it.
+
+2.65
+• Fixed bug where revoking keys and changing cipher was knocking out all vpn connections.
+• Changed default setting for GCM packages to omit data-ciphers parameters which wouldn't allow phones that would otherwise connect to fail. Added checkbox in case the newest phones do allow for those parameters.
+• Fixed not creating iptables rules for non-asterisk firewall installations
+
 2.64
 • Added cipher used column in provisioning archives.
 • Updated setup-root.sh to add a new step that grants asterisk a read-only POSIX ACL on apache2 log directories actually exist, plus a default ACL on the directory so logs recreated later by logrotate inherit the grant automatically. This is to give permission to the Yealink EPM subnet scanner to add a device.

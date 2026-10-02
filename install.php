@@ -153,6 +153,27 @@ if (!file_exists("{$pkiDir}/dh.pem")) {
 
 @chmod("{$pkiDir}/private/server.key", 0600);
 
+// Generate an initial (empty) CRL and wire crl-verify into the server config
+// from day one - same as pfSense does - rather than adding it reactively the
+// first time a cert is ever revoked. OpenVPN re-reads the CRL file's content
+// on its own for every new connection, so once crl-verify is active in the
+// process from the moment it starts, no revoke (first or hundredth) ever
+// needs a restart to take effect; the daemon just picks up the changed file.
+// Only the directive's initial presence in a not-yet-started daemon requires
+// a restart, so doing it here means that restart never has to happen later.
+$crlFile = "{$pkiDir}/crl.pem";
+if (!file_exists($crlFile) && file_exists("{$pkiDir}/ca.crt") && file_exists("{$pkiDir}/private/ca.key")) {
+    if (!file_exists("{$pkiDir}/index.txt")) { @touch("{$pkiDir}/index.txt"); }
+    if (!file_exists("{$pkiDir}/crlnumber")) { @file_put_contents("{$pkiDir}/crlnumber", "01\n"); }
+    // "dir" alone isn't enough for openssl's "ca" command - "database"/
+    // "crlnumber" have to be spelled out too, or -gencrl fails with
+    // "variable lookup failed for CA_default::database".
+    $tmpCnf = "{$pkiDir}/crl_openssl.cnf";
+    @file_put_contents($tmpCnf, "[ ca ]\ndefault_ca = CA_default\n\n[ CA_default ]\ndir = {$pkiDir}\ndatabase = {$pkiDir}/index.txt\ncrlnumber = {$pkiDir}/crlnumber\ndefault_md = sha256\ndefault_crl_days = 3650\n");
+    exec("OPENSSL_CONF=" . escapeshellarg($tmpCnf) . " openssl ca -gencrl -keyfile " . escapeshellarg("{$pkiDir}/private/ca.key") . " -cert " . escapeshellarg("{$pkiDir}/ca.crt") . " -out " . escapeshellarg($crlFile) . " -config " . escapeshellarg($tmpCnf) . " 2>&1");
+    @unlink($tmpCnf);
+}
+
 // 3. Generate legacy-vpn.conf
 $rawServerIp = '';
 exec("ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}'", $ipOut);
@@ -224,6 +245,12 @@ if (!file_exists($serverConf)) {
     // appending to it - whichever of the two actually wins isn't simply
     // "the last one specified", so this isn't safe to add back even
     // alongside --log-append.
+    // The route to the PBX's LAN address is not a global "push" here: it is
+    // pushed per client through client-config-dir (one small file per
+    // certificate CN under ccd/), because phones on the PBX's own LAN must NOT
+    // get it (it would loop their tunnel traffic back into the tunnel) while
+    // remote phones need it. "# push-route-host" records the LAN address; see
+    // ovpnPrepareRoutePolicy() / ovpnSyncCcdFiles() in lib/client_ops.php.
     $serverConfigContent = <<<CONF
 port 1194
 proto udp
@@ -232,8 +259,10 @@ ca {$pkiDir}/ca.crt
 cert {$pkiDir}/server.crt
 key {$pkiDir}/private/server.key
 dh {$pkiDir}/dh.pem
+crl-verify {$crlFile}
 server 10.1.0.0 255.255.255.0
-push "route {$rawServerIp} 255.255.255.255"
+# push-route-host {$rawServerIp}
+client-config-dir {$baseDir}/ccd
 keepalive 10 120
 
 cipher AES-256-CBC
@@ -260,6 +289,36 @@ CONF;
 @exec("chmod -R 775 " . escapeshellarg($baseDir) . " " . escapeshellarg($pkgDir) . " 2>&1");
 @chown($logFile, 'asterisk');
 @chmod($logFile, 0664);
+
+// 4b. Per-client route policy. Existing installs carry a global
+//     push "route <PBX LAN IP> 255.255.255.255" that loops phones on the
+//     PBX's own LAN; move it to per-client ccd files (idempotent). A running
+//     daemon picks up the config change on its next restart.
+// Load the shared library only if none of its (generically named) functions
+// already exist from another module in this same PHP process - a clash would
+// be a fatal "cannot redeclare" and abort the whole module install. If it
+// can't be loaded here, the same conversion happens on the next daemon
+// start from the GUI (startOpenVpnServer()).
+$ovpnLibUsable = defined('OVPN_MGR_CLIENT_OPS_LOADED');
+if (!$ovpnLibUsable) {
+    $ovpnLibUsable = true;
+    foreach (['tailFile', 'tailFileFromMarker', 'getOpenVpnVersion', 'getActiveServerSettings', 'getDefaultCipher',
+              'setDefaultCipher', 'syncServerCiphers', 'buildClientPackage', 'revokeExtension', 'startOpenVpnServer',
+              'stopOpenVpnServer', 'revokeExtensionAndRestart', 'getPackageCipher', 'packageHasDataCiphers',
+              'getPackageRemote', 'rebuildPackagesConfigOnly'] as $ovpnFn) {
+        if (function_exists($ovpnFn)) { $ovpnLibUsable = false; break; }
+    }
+    if ($ovpnLibUsable) {
+        require_once "{$module_root}/lib/client_ops.php";
+    }
+}
+if ($ovpnLibUsable && file_exists($serverConf)) {
+    $routePolicy = ovpnPrepareRoutePolicy((string)@file_get_contents($serverConf), "{$baseDir}/ccd");
+    if ($routePolicy['lan_ip'] !== '') {
+        @file_put_contents($serverConf, $routePolicy['text']);
+        ovpnSyncCcdFiles($baseDir, $pkiDir, $pkgDir, $routePolicy['lan_ip']);
+    }
+}
 
 // 5. Module signature (no elevated privilege needed - module dir is
 //    already owned by the web user).

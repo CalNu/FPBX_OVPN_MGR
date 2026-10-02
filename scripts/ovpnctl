@@ -48,6 +48,10 @@ PID_FILE="${BASE_DIR}/openvpn.pid"
 STATE_DIR="/etc/ovpn_mgr"
 NAT_STATE_FILE="${STATE_DIR}/nat-state"
 NAT_MARK="OVPN_MGR_NAT"
+PORT_STATE_FILE="${STATE_DIR}/port-state"
+PORT_MARK="OVPN_MGR_PORT"
+TRUST_STATE_FILE="${STATE_DIR}/trust-state"
+TRUST_MARK="OVPN_MGR_TRUST"
 
 # Must match the "management ... unix" path legacy-vpn.conf declares
 # (written by install.php / reconciled by startOpenVpnServer() in
@@ -89,40 +93,113 @@ find_openssl_cnf() {
     echo ""
 }
 
-cmd="${1:-}"
-shift || true
+# --- Daemon lifecycle helpers -------------------------------------------
+OVPN_UNIT="ovpn-mgr-openvpn.service"
+OVPN_UNIT_FILE="/etc/systemd/system/${OVPN_UNIT}"
 
-case "$cmd" in
+# Is an openvpn process using our config alive? (matched by --config, not
+# the pidfile, which can be stale or missing.)
+daemon_running() { pgrep -f -- "--config ${CONF}\b" >/dev/null 2>&1; }
 
-  check)
-    echo "ovpnctl ok"
-    ;;
+# Should start/stop be delegated to systemd? Only when systemd is really
+# PID 1, the unit exists, AND that unit was written by a setup-root.sh new
+# enough to call "start-daemon"/"stop-daemon" directly. Delegating to an
+# older unit whose ExecStart is "ovpnctl start" would recurse forever, so
+# stale units fall back to the old direct launch until setup-root.sh is
+# re-run.
+use_systemd_unit() {
+    [ -d /run/systemd/system ] || return 1
+    command -v systemctl >/dev/null 2>&1 || return 1
+    [ -f "$OVPN_UNIT_FILE" ] || return 1
+    grep -q 'ovpnctl start-daemon' "$OVPN_UNIT_FILE" 2>/dev/null
+}
 
-  status)
-    # Dumps OpenVPN's own status file verbatim (v1/v2/v3 format, whichever
-    # "status" directive legacy-vpn.conf uses) so a caller can parse the
-    # current client list. root:root 0600 by design - this is the one
-    # sanctioned way to read it without loosening that.
-    [ -f "$STATUS_FILE" ] || { echo "no status file: $STATUS_FILE" >&2; exit 1; }
-    cat "$STATUS_FILE"
-    ;;
+# Make sure /dev/net/tun exists. Best effort; returns 1 if it still doesn't.
+ensure_tun_device() {
+    [ -c /dev/net/tun ] && return 0
+    if command -v modprobe >/dev/null 2>&1; then modprobe tun >/dev/null 2>&1 || true; fi
+    [ -c /dev/net/tun ] && return 0
+    mkdir -p /dev/net 2>/dev/null || true
+    if mknod /dev/net/tun c 10 200 2>/dev/null; then chmod 0666 /dev/net/tun 2>/dev/null || true; fi
+    [ -c /dev/net/tun ] && return 0
+    return 1
+}
 
-  start)
+mask_bits() {
+  local m="$1" b=0 o
+  local -a oct
+  IFS=. read -r -a oct <<< "$m"
+  [ "${#oct[@]}" -eq 4 ] || return 1
+  for o in "${oct[@]}"; do
+    case "$o" in
+      255) b=$((b+8)) ;; 254) b=$((b+7)) ;; 252) b=$((b+6)) ;; 248) b=$((b+5)) ;;
+      240) b=$((b+4)) ;; 224) b=$((b+3)) ;; 192) b=$((b+2)) ;; 128) b=$((b+1)) ;;
+      0) ;; *) return 1 ;;
+    esac
+  done
+  echo "$b"
+}
+
+# Standalone (no FreePBX Firewall module) iptables rules, derived from the
+# live server config rather than from what the GUI last changed: the UDP
+# port rule and the tun+/VPN-pool trust rules. Idempotent. Run on every
+# daemon start (including at boot) and on every Settings save, so the rules
+# come back even if the firewall was reloaded or the port/subnet had already
+# been saved by an earlier version that failed to create them.
+ensure_fw_rules() {
+  [ -n "$IPTABLES_BIN" ] || { echo "iptables not found" >&2; return 1; }
+  if [ -d "${AMPWEBROOT}/admin/modules/firewall" ]; then
+    echo "FreePBX Firewall module present - not managing iptables rules"
+    return 0
+  fi
+  [ -f "$CONF" ] || { echo "missing config: $CONF" >&2; return 1; }
+  local port net mask bits
+  port="$(awk '$1=="port" && $2 ~ /^[0-9]+$/ {print $2; exit}' "$CONF")"
+  read -r net mask <<< "$(awk '$1=="server" && $2 ~ /^[0-9.]+$/ {print $2, $3; exit}' "$CONF")"
+  if is_port "${port:-}"; then
+    bash "${BASH_SOURCE[0]}" port-sync "$port" || echo "port-sync failed" >&2
+  fi
+  if [ -n "${net:-}" ] && [ -n "${mask:-}" ] && bits="$(mask_bits "$mask")"; then
+    bash "${BASH_SOURCE[0]}" trust-sync "${net}/${bits}" || echo "trust-sync failed" >&2
+  fi
+}
+
+start_daemon() {
     [ -n "$OPENVPN_BIN" ] || { echo "openvpn binary not found" >&2; exit 1; }
     mkdir -p "$LOG_DIR"
     touch "$LOG_FILE"
 
+    # Pre-flight: OpenVPN cannot start without /dev/net/tun. Load/create it if
+    # it is genuinely missing (fresh VM/container images often ship without it
+    # until the tun module is loaded), and otherwise fail with an actionable
+    # message instead of letting openvpn die silently after daemonizing.
+    if ! ensure_tun_device; then
+      echo "TUN device /dev/net/tun is not available, so OpenVPN cannot start." >&2
+      echo "  - If 'ls -l /dev/net/tun' works in your SSH session but not here, this was launched from inside the web server's sandbox (for example php-fpm with PrivateDevices=yes). Re-run setup-root.sh so systemd launches the daemon instead." >&2
+      echo "  - If the device is missing everywhere: modprobe tun (and add 'tun' to /etc/modules-load.d/tun.conf), or in a container/VPS enable TUN/TAP for it." >&2
+      exit 1
+    fi
+
     # Kernel IP forwarding is otherwise only turned on by setup-root.sh at
     # initial install and by the GUI when the VPN subnet is changed in
     # Settings - neither of which runs on a plain Start/Restart, or at boot
-    # (ovpn-mgr-openvpn.service calls this "start" case directly, before
+    # (ovpn-mgr-openvpn.service calls start-daemon directly, before
     # PHP ever runs). If forwarding gets reset by anything outside this
     # module (a reboot racing the sysctl.d file, a competing sysctl.d entry,
     # a hardening tool, etc.), the daemon would otherwise come back up
     # passing no traffic with no obvious error. Cheap and idempotent, so
-    # just ensure it's on every time OpenVPN starts, from any trigger.
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null
-    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-ovpn-mgr.conf
+    # just ensure it's on every time OpenVPN starts, from any trigger -
+    # best-effort only, with `set -e` in play: some container runtimes
+    # (plain Incredible PBX Docker images, most commonly) don't expose
+    # /proc/sys/net as writable even to root inside the container, and
+    # that must not block the daemon from starting - forwarding may
+    # already be correct at the host/container-runtime level regardless
+    # of whether this particular write succeeds.
+    if ! sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1; then
+      echo "warning: could not set net.ipv4.ip_forward=1 (read-only in this container/sandbox?) - continuing; verify IP forwarding is enabled at the host level if routed VPN traffic doesn't pass" >&2
+    fi
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-ovpn-mgr.conf 2>/dev/null || true
+    ensure_fw_rules || true
     if pgrep -f -- "--config ${CONF}\b" >/dev/null 2>&1; then
       echo "already running"
       exit 0
@@ -133,6 +210,7 @@ case "$cmd" in
     # so the directory needs recreating on every start, not just at install.
     # root:asterisk 0750, matching the wrapper's own ownership below,
     # rather than leaving it at mkdir's default world-readable 0755.
+    LOG_START_OFFSET="$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)"
     mkdir -p "$(dirname "$MGMT_SOCK")"
     chown root:asterisk "$(dirname "$MGMT_SOCK")" 2>/dev/null || true
     chmod 750 "$(dirname "$MGMT_SOCK")" 2>/dev/null || true
@@ -188,24 +266,118 @@ case "$cmd" in
       chown root:asterisk "$STATUS_FILE" 2>/dev/null || true
       chmod 640 "$STATUS_FILE" 2>/dev/null || true
     fi
+
+    # --daemon returns 0 as soon as openvpn forks, even if it then dies during
+    # initialization (TUN open failure, bad cert, port in use...). Wait for
+    # either "Initialization Sequence Completed" in *this* start's log output
+    # or for the process to disappear, so callers (systemd, the web GUI) get a
+    # real exit status instead of a false success.
+    started_ok=0
+    for _ in $(seq 1 40); do
+      if ! daemon_running; then break; fi
+      if tail -c +"$((LOG_START_OFFSET + 1))" "$LOG_FILE" 2>/dev/null | grep -q "Initialization Sequence Completed"; then
+        started_ok=1; break
+      fi
+      sleep 0.25
+    done
+    # Still alive after 10s without the marker (e.g. very slow DH/CRL load):
+    # not provably failed, so don't report failure.
+    if [ "$started_ok" -eq 0 ] && daemon_running; then started_ok=1; fi
+    if [ "$started_ok" -eq 0 ]; then
+      echo "OpenVPN exited right after starting - see ${LOG_FILE} for the reason." >&2
+      exit 1
+    fi
+}
+
+stop_daemon() {
+    if daemon_running; then
+      # Match on the actual running process (by its --config argument),
+      # not the pidfile - the pidfile can be stale/missing, and the config
+      # file's *current* port may already have been rewritten to a new
+      # value by the time this runs (e.g. during a settings save), which
+      # would make a port-based lookup kill the wrong thing (or nothing).
+      pkill -TERM -f -- "--config ${CONF}\b" 2>/dev/null || true
+      for _ in $(seq 1 12); do
+        daemon_running || break
+        sleep 0.25
+      done
+      pkill -9 -f -- "--config ${CONF}\b" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+    # OpenVPN leaves its last status snapshot behind on exit; empty it so no
+    # tool reads stale "connected" clients from a stopped server. (Truncate
+    # in place to keep the root:asterisk 0640 ownership; the daemon rewrites
+    # it on the next start.)
+    if [ -f "$STATUS_FILE" ]; then : > "$STATUS_FILE" 2>/dev/null || true; fi
+    ip link delete tun0 2>/dev/null || true
+}
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+
+  check)
+    echo "ovpnctl ok"
+    ;;
+
+  status)
+    # Dumps OpenVPN's own status file verbatim (v1/v2/v3 format, whichever
+    # "status" directive legacy-vpn.conf uses) so a caller can parse the
+    # current client list. root:root 0600 by design - this is the one
+    # sanctioned way to read it without loosening that.
+    [ -f "$STATUS_FILE" ] || { echo "no status file: $STATUS_FILE" >&2; exit 1; }
+    cat "$STATUS_FILE"
+    ;;
+
+  start-daemon)
+    # The real launch. Called by ovpn-mgr-openvpn.service (ExecStart) and, on
+    # systems without a current unit, directly by "start" below.
+    start_daemon
+    ;;
+
+  stop-daemon)
+    stop_daemon
+    ;;
+
+  start)
+    # Entry point used by the web GUI (via sudo, from inside php-fpm's
+    # sandbox). When possible, hand the launch to systemd so the daemon runs
+    # in its own unit - outside php-fpm's private /dev (PrivateDevices),
+    # read-only filesystem and cgroup. Otherwise a php-fpm restart would also
+    # kill the VPN, and /dev/net/tun may not even be visible there.
+    if daemon_running; then
+      echo "already running"
+      exit 0
+    fi
+    if use_systemd_unit; then
+      # A unit that hit StartLimitBurst refuses manual starts until cleared.
+      systemctl reset-failed "$OVPN_UNIT" >/dev/null 2>&1 || true
+      if ! systemctl start "$OVPN_UNIT"; then
+        echo "systemd could not start ${OVPN_UNIT} (see: journalctl -u ${OVPN_UNIT} -n 50 --no-pager, and ${LOG_FILE})" >&2
+        exit 1
+      fi
+    else
+      start_daemon
+    fi
     ;;
 
   stop)
-    # Match on the actual running process (by its --config argument),
-    # not the pidfile - the pidfile can be stale/missing, and the config
-    # file's *current* port may already have been rewritten to a new
-    # value by the time this runs (e.g. during a settings save), which
-    # would make a port-based lookup kill the wrong thing (or nothing).
-    pkill -TERM -f -- "--config ${CONF}\b" 2>/dev/null || true
-    sleep 1
-    pkill -9 -f -- "--config ${CONF}\b" 2>/dev/null || true
-    rm -f "$PID_FILE"
-    ip link delete tun0 2>/dev/null || true
+    if use_systemd_unit; then
+      # Also cancels any pending Restart=on-failure timer.
+      systemctl stop "$OVPN_UNIT" >/dev/null 2>&1 || true
+    fi
+    # Catch anything not owned by the unit (legacy direct launches).
+    stop_daemon
     ;;
 
   ipforward-on)
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null
-    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-ovpn-mgr.conf
+    # Same container/sandbox caveat as the "start" case above - best-effort,
+    # must not hard-fail the caller (a Settings save) under `set -e`.
+    if ! sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1; then
+      echo "warning: could not set net.ipv4.ip_forward=1 (read-only in this container/sandbox?) - continuing; verify IP forwarding is enabled at the host level if routed VPN traffic doesn't pass" >&2
+    fi
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-ovpn-mgr.conf 2>/dev/null || true
     ;;
 
   nat-sync)
@@ -229,6 +401,130 @@ case "$cmd" in
     mkdir -p "$STATE_DIR"
     printf '%s %s\n' "$cidr" "$iface" > "$NAT_STATE_FILE"
     chmod 600 "$NAT_STATE_FILE"
+    ;;
+
+  port-sync)
+    # port-sync <port>
+    # Adds/replaces the single UDP ACCEPT rule this module owns in INPUT.
+    # This is only reached as a fallback (syncOvpnFirewallPortRule() in
+    # page.ovpn_mgr.php) when FreePBX's own Firewall module isn't present
+    # or doesn't expose addCustomService() - e.g. plain Incredible PBX
+    # installs, which have no FreePBX Firewall module to manage this at
+    # all. Same idempotent insert-at-top pattern as nat-sync, and the same
+    # reason it needs a state file + restore case: a bare iptables rule
+    # doesn't survive a reboot on its own.
+    [ -n "$IPTABLES_BIN" ] || { echo "iptables not found" >&2; exit 1; }
+    port="${1:?missing port}"
+    is_port "$port" || { echo "invalid port" >&2; exit 1; }
+
+    oldport=""
+    if [ -f "$PORT_STATE_FILE" ]; then
+      read -r oldport < "$PORT_STATE_FILE" || true
+    fi
+    if [ -n "$oldport" ] && is_port "$oldport"; then
+      while "$IPTABLES_BIN" -C INPUT -p udp --dport "$oldport" -j ACCEPT -m comment --comment "$PORT_MARK" 2>/dev/null; do
+        "$IPTABLES_BIN" -D INPUT -p udp --dport "$oldport" -j ACCEPT -m comment --comment "$PORT_MARK"
+      done
+    fi
+    while "$IPTABLES_BIN" -C INPUT -p udp --dport "$port" -j ACCEPT -m comment --comment "$PORT_MARK" 2>/dev/null; do
+      "$IPTABLES_BIN" -D INPUT -p udp --dport "$port" -j ACCEPT -m comment --comment "$PORT_MARK"
+    done
+    "$IPTABLES_BIN" -I INPUT 1 -p udp --dport "$port" -j ACCEPT -m comment --comment "$PORT_MARK"
+
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$port" > "$PORT_STATE_FILE"
+    chmod 600 "$PORT_STATE_FILE"
+    ;;
+
+  fw-ensure)
+    ensure_fw_rules
+    ;;
+
+  fw-available)
+    # Exit 0 only if FreePBX's own Firewall module is usable via fwconsole.
+    # Plain Incredible PBX installs often have no such module, in which
+    # case the iptables fallbacks (port-sync / trust-sync) are used instead.
+    [ -d "${AMPWEBROOT}/admin/modules/firewall" ] || exit 1
+    FWC="$(find_bin fwconsole /usr/sbin/fwconsole /usr/local/sbin/fwconsole)"
+    [ -n "$FWC" ] || exit 1
+    "$FWC" firewall --help >/dev/null 2>&1
+    ;;
+
+  fw-restart)
+    # fwconsole firewall needs root; the web user (asterisk) cannot run it.
+    FWC="$(find_bin fwconsole /usr/sbin/fwconsole /usr/local/sbin/fwconsole)"
+    [ -n "$FWC" ] || { echo "fwconsole not found" >&2; exit 1; }
+    "$FWC" firewall restart
+    ;;
+
+  fw-trusted)
+    # fw-trusted <add|del> <cidr|tun+>
+    action="${1:?missing action}"
+    target="${2:?missing target}"
+    case "$action" in add|del) ;; *) echo "invalid action" >&2; exit 1 ;; esac
+    if [ "$target" != "tun+" ]; then
+      is_cidr "$target" || { echo "invalid target" >&2; exit 1; }
+    fi
+    FWC="$(find_bin fwconsole /usr/sbin/fwconsole /usr/local/sbin/fwconsole)"
+    [ -n "$FWC" ] || { echo "fwconsole not found" >&2; exit 1; }
+    "$FWC" firewall "$action" trusted "$target"
+    ;;
+
+  trust-sync)
+    # trust-sync <cidr>
+    # Standalone fallback (no FreePBX Firewall module): accepts all INPUT
+    # traffic from the tunnel interface and the VPN pool, so phones can
+    # reach SIP/RTP/provisioning on the PBX through the tunnel. Replaces
+    # any previous rules this module added, and saves the CIDR so
+    # port-restore can reapply it at boot.
+    [ -n "$IPTABLES_BIN" ] || { echo "iptables not found" >&2; exit 1; }
+    cidr="${1:?missing cidr}"
+    is_cidr "$cidr" || { echo "invalid cidr" >&2; exit 1; }
+
+    oldcidr=""
+    if [ -f "$TRUST_STATE_FILE" ]; then
+      read -r oldcidr < "$TRUST_STATE_FILE" || true
+    fi
+    if [ -n "$oldcidr" ] && is_cidr "$oldcidr"; then
+      while "$IPTABLES_BIN" -C INPUT -s "$oldcidr" -j ACCEPT -m comment --comment "$TRUST_MARK" 2>/dev/null; do
+        "$IPTABLES_BIN" -D INPUT -s "$oldcidr" -j ACCEPT -m comment --comment "$TRUST_MARK"
+      done
+    fi
+    while "$IPTABLES_BIN" -C INPUT -s "$cidr" -j ACCEPT -m comment --comment "$TRUST_MARK" 2>/dev/null; do
+      "$IPTABLES_BIN" -D INPUT -s "$cidr" -j ACCEPT -m comment --comment "$TRUST_MARK"
+    done
+    while "$IPTABLES_BIN" -C INPUT -i tun+ -j ACCEPT -m comment --comment "$TRUST_MARK" 2>/dev/null; do
+      "$IPTABLES_BIN" -D INPUT -i tun+ -j ACCEPT -m comment --comment "$TRUST_MARK"
+    done
+    "$IPTABLES_BIN" -I INPUT 1 -s "$cidr" -j ACCEPT -m comment --comment "$TRUST_MARK"
+    "$IPTABLES_BIN" -I INPUT 1 -i tun+ -j ACCEPT -m comment --comment "$TRUST_MARK"
+
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$cidr" > "$TRUST_STATE_FILE"
+    chmod 600 "$TRUST_STATE_FILE"
+    ;;
+
+  port-restore)
+    # Run at boot alongside nat-restore (see setup-root.sh's
+    # ovpn-mgr-nat.service). No-op if port-sync was never called - e.g.
+    # FreePBX's own Firewall module is present and handling this instead.
+    # Also reapplies the trust-sync rules, if any were saved.
+    if [ -f "$TRUST_STATE_FILE" ] && [ -n "$IPTABLES_BIN" ]; then
+      read -r tcidr < "$TRUST_STATE_FILE" || true
+      if is_cidr "${tcidr:-}"; then
+        "$IPTABLES_BIN" -C INPUT -s "$tcidr" -j ACCEPT -m comment --comment "$TRUST_MARK" 2>/dev/null \
+          || "$IPTABLES_BIN" -I INPUT 1 -s "$tcidr" -j ACCEPT -m comment --comment "$TRUST_MARK"
+        "$IPTABLES_BIN" -C INPUT -i tun+ -j ACCEPT -m comment --comment "$TRUST_MARK" 2>/dev/null \
+          || "$IPTABLES_BIN" -I INPUT 1 -i tun+ -j ACCEPT -m comment --comment "$TRUST_MARK"
+      fi
+    fi
+    [ -f "$PORT_STATE_FILE" ] || exit 0
+    [ -n "$IPTABLES_BIN" ] || exit 0
+    read -r port < "$PORT_STATE_FILE"
+    is_port "$port" || exit 0
+
+    "$IPTABLES_BIN" -C INPUT -p udp --dport "$port" -j ACCEPT -m comment --comment "$PORT_MARK" 2>/dev/null \
+      || "$IPTABLES_BIN" -I INPUT 1 -p udp --dport "$port" -j ACCEPT -m comment --comment "$PORT_MARK"
     ;;
 
   sip-localnet-sync)
@@ -285,7 +581,7 @@ case "$cmd" in
     ;;
 
   *)
-    echo "usage: ovpnctl {check|status|start|stop|ipforward-on|nat-sync|nat-restore|sip-localnet-sync|kill-client}" >&2
+    echo "usage: ovpnctl {check|status|start|stop|start-daemon|stop-daemon|ipforward-on|nat-sync|nat-restore|port-sync|port-restore|fw-ensure|fw-available|fw-restart|fw-trusted|trust-sync|sip-localnet-sync|kill-client}" >&2
     exit 1
     ;;
 esac
