@@ -1302,7 +1302,7 @@ if ($isRunning && file_exists($statusFile) && is_readable($statusFile)) {
     <?php if ($hasSudoRule && $ovpnUnitStale): ?>
         <div class="alert alert-warning" style="margin-bottom: 20px;">
             <i class="fa fa-exclamation-triangle"></i> The OpenVPN systemd unit is out of date. Re-run the root setup so Start/Stop launch the daemon through systemd instead of from inside the web server (this avoids start failures such as a missing <code>/dev/net/tun</code> when php-fpm is sandboxed, and keeps the VPN up when php-fpm restarts):
-            <pre style="background:#f8f9fa; padding:10px; border:1px solid #ccc; font-size:12px; margin:8px 0 0;">sudo bash <?php echo htmlspecialchars($setupScript); ?></pre>
+            <pre id="setupCmdStale" title="Click to copy" style="background:#f8f9fa; padding:10px; border:1px solid #ccc; font-size:12px; margin:8px 0 0; cursor:pointer;" onclick="copySetupCommand('setupCmdStale')">sudo bash <?php echo htmlspecialchars($setupScript); ?></pre>
         </div>
     <?php endif; ?>
 
@@ -1600,7 +1600,7 @@ if ($isRunning && file_exists($statusFile) && is_readable($statusFile)) {
                                     <th class="ovpn-sortable" data-sort="ext" tabindex="0" title="Sort by extension" style="text-align: left; padding-left: 10px;">Extension <span class="ovpn-sort-ind"></span></th>
                                     <th class="ovpn-sortable" data-sort="mac" tabindex="0" title="Sort by MAC address" style="text-align: left; padding-left: 15px;">MAC <span class="ovpn-sort-ind"></span></th>
                                     <th class="ovpn-sortable" data-sort="cipher" tabindex="0" title="Sort by cipher" style="text-align: center;">Cipher <span class="ovpn-sort-ind"></span></th>
-                                    <th class="ovpn-sortable" data-sort="date" tabindex="0" title="Sort by date created" style="width: auto; text-align: center;">Date Created <span class="ovpn-sort-ind"></span></th>
+                                    <th class="ovpn-sortable date-column" style="width: auto; text-align: center;  white-space: normal; overflow: hidden;" data-sort="date" tabindex="0" title="Sort by date created">Date Created <span class="ovpn-sort-ind"></span></th>
                                     <th style="width: 155px; text-align: center;">Actions</th>
                                 </tr>
                             </thead>
@@ -1647,7 +1647,7 @@ if ($isRunning && file_exists($statusFile) && is_readable($statusFile)) {
             <span class="label label-info"><?php echo htmlspecialchars($pkgCipher); ?></span>
         </td>
 
-        <td style="text-align: center; vertical-align: middle; font-size: 12px;"><?php echo date("Y-m-d H:i", $pkgMtime); ?></td>
+        <td class="date-column" style="text-align: center; vertical-align: middle; font-size: 12px;"><?php echo date("Y-m-d H:i", $pkgMtime); ?></td>
         <td style="text-align: center; vertical-align: middle; padding: 4px 3px; padding-left: 8px;">
             <div style="display: flex; justify-content: center; align-items: center; gap: 3px;">
                 <button type="button" class="btn btn-xs btn-info" style="padding: 3px;" title="Edit Package Details" onclick="openEditPackageModal('<?php echo htmlspecialchars($filename, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgExt, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgMac, ENT_QUOTES); ?>', '<?php echo htmlspecialchars($pkgCipher, ENT_QUOTES); ?>', <?php echo $pkgHasDataCiphers ? 'true' : 'false'; ?>)">
@@ -1962,6 +1962,14 @@ if ($isRunning && file_exists($statusFile) && is_readable($statusFile)) {
 #ovpnPkgTable th.ovpn-sortable:hover, #ovpnPkgTable th.ovpn-sortable:focus { background-color: rgba(0,0,0,0.05); outline: none; }
 #ovpnPkgTable .ovpn-sort-ind { font-size: 15px; opacity: 0.8; color: #0f5a59 }
 #ovpnPkgTable th.ovpn-sorted .ovpn-sort-ind { opacity: 0.8; }
+
+.date-column { 
+	width: auto; 
+	text-align: center;  
+	white-space: normal; 
+	overflow: hidden; 
+}	 
+
 </style>
 
 <script>
@@ -2144,8 +2152,8 @@ function fallbackCopy(element) {
     }
 }
 
-function copySetupCommand() {
-    var text = document.getElementById('setupCmd').innerText;
+function copySetupCommand(id) {
+    var text = document.getElementById(id || 'setupCmd').innerText;
     var done = function() { showOvpnToast('Command copied to clipboard'); };
     if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(text).then(done).catch(function() {
