@@ -251,6 +251,9 @@ if (!file_exists($serverConf)) {
     // get it (it would loop their tunnel traffic back into the tunnel) while
     // remote phones need it. "# push-route-host" records the LAN address; see
     // ovpnPrepareRoutePolicy() / ovpnSyncCcdFiles() in lib/client_ops.php.
+    // TLS renegotiation is daily (also pushed to clients): see
+    // ovpnApplyRenegDirectives() in lib/client_ops.php. Existing installs are
+    // brought in line by step 4c below and on every daemon start.
     $serverConfigContent = <<<CONF
 port 1194
 proto udp
@@ -277,6 +280,8 @@ persist-key
 persist-tun
 status {$logDir}/openvpn-status.log 1
 status-version 3
+reneg-sec 86400
+push "reneg-sec 86400"
 management /run/ovpn_mgr/mgmt.sock unix
 management-client-user asterisk
 verb 3
@@ -317,6 +322,33 @@ if ($ovpnLibUsable && file_exists($serverConf)) {
     if ($routePolicy['lan_ip'] !== '') {
         @file_put_contents($serverConf, $routePolicy['text']);
         ovpnSyncCcdFiles($baseDir, $pkiDir, $pkgDir, $routePolicy['lan_ip']);
+    }
+}
+
+// 4c. (2.70) Status file on tmpfs. {$logDir}/openvpn-status.log becomes a symlink to
+//     /run/ovpn_mgr/openvpn-status.log so OpenVPN's once-a-second status rewrite never
+//     waits on the disk (a stalled disk froze every tunnel at once). legacy-vpn.conf,
+//     ovpnctl and the GUI keep using the old path. Written inline (no dependency on the
+//     shared library, which may not load here); startOpenVpnServer() re-creates the
+//     link on every GUI start via ovpnEnsureStatusSymlink(). Takes effect when the
+//     daemon next restarts.
+$ovpnStatusTarget = '/run/ovpn_mgr/openvpn-status.log';
+$ovpnStatusIsLink = is_link($statusFile) && @readlink($statusFile) === $ovpnStatusTarget;
+if (!$ovpnStatusIsLink && is_dir($logDir) && is_writable($logDir) && !(is_dir($statusFile) && !is_link($statusFile))) {
+    if (is_link($statusFile) || file_exists($statusFile)) { @unlink($statusFile); }
+    if (@symlink($ovpnStatusTarget, $statusFile)) {
+        @lchown($statusFile, 'asterisk');
+        @lchgrp($statusFile, 'asterisk');
+    }
+}
+
+// 4d. (2.70) Daily TLS renegotiation for existing configs (idempotent). Takes effect when
+//     the daemon next restarts; the same conversion runs on every GUI daemon start.
+if ($ovpnLibUsable && function_exists('ovpnApplyRenegDirectives') && file_exists($serverConf) && is_writable($serverConf)) {
+    $ovpnConfBefore = (string)@file_get_contents($serverConf);
+    $ovpnConfAfter  = ovpnApplyRenegDirectives($ovpnConfBefore);
+    if ($ovpnConfAfter !== $ovpnConfBefore) {
+        @file_put_contents($serverConf, $ovpnConfAfter);
     }
 }
 

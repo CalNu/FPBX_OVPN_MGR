@@ -440,6 +440,75 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
         return preg_replace("/\n{3,}/", "\n\n", $text);
     }
 
+    if (!defined('OVPN_MGR_STATUS_FILE')) {
+        // tmpfs, next to the management socket (see ovpnEnsureStatusSymlink()).
+        define('OVPN_MGR_STATUS_FILE', '/run/ovpn_mgr/openvpn-status.log');
+    }
+    if (!defined('OVPN_MGR_RENEG_SEC')) {
+        define('OVPN_MGR_RENEG_SEC', 86400);
+    }
+
+    /**
+     * Keeps OpenVPN's status file off the disk.
+     *
+     * OpenVPN is single-threaded and rewrites its status file (truncate +
+     * write, every "status <file> <n>" interval) from inside the same event
+     * loop that moves tunnel packets. With the file on a disk that stalls for
+     * seconds (a busy VM, a consumer SSD without power-loss protection), every
+     * rewrite froze the traffic of ALL clients until the write returned:
+     * tunnel pings to every phone delayed 1-4 s together, then delivered in one
+     * burst, and extensions flapping to Unreachable in Asterisk.
+     *
+     * Nothing else needs to change for this: legacy-vpn.conf, ovpnctl and the
+     * GUI keep using <logDir>/openvpn-status.log, which is made a symlink to
+     * the tmpfs file. OpenVPN opens it through the link and every write lands
+     * in RAM. The link lives on disk, so it survives reboots (it simply dangles
+     * until ovpnctl recreates /run/ovpn_mgr and the daemon creates the file).
+     *
+     * Idempotent. Returns true if the link is in place afterwards.
+     */
+    function ovpnEnsureStatusSymlink($logDir) {
+        $logDir = rtrim((string)$logDir, '/');
+        $link   = $logDir . '/openvpn-status.log';
+        if (is_link($link) && @readlink($link) === OVPN_MGR_STATUS_FILE) { return true; }
+        if (!is_dir($logDir) || !is_writable($logDir)) { return false; }
+        if (is_dir($link) && !is_link($link)) { return false; }
+        if (is_link($link) || file_exists($link)) { @unlink($link); }
+        $ok = @symlink(OVPN_MGR_STATUS_FILE, $link);
+        if ($ok) {
+            @lchown($link, 'asterisk');
+            @lchgrp($link, 'asterisk');
+        }
+        return $ok;
+    }
+
+    /**
+     * Daily TLS renegotiation: "reneg-sec 86400" on the server and the same
+     * value pushed to clients. The default (hourly) renegotiation keeps a slow
+     * phone's VPN client (e.g. a T28P doing a 1024-bit DHE/RSA handshake) busy
+     * for 1-3 s once an hour, delaying that phone's tunnel traffic. The push
+     * covers clients whose package has no reneg-sec of its own; a client that
+     * ignores it keeps its own 3600 s timer. Idempotent (also collapses
+     * duplicate or conflicting lines). Returns the new config text.
+     */
+    function ovpnApplyRenegDirectives($text) {
+        $text = ovpnSetServerDirective((string)$text, 'reneg-sec', (string)OVPN_MGR_RENEG_SEC);
+
+        $pushLine = 'push "reneg-sec ' . OVPN_MGR_RENEG_SEC . '"';
+        $pushRe = '/^[ \t]*push[ \t]+"reneg-sec[ \t]+[^"]*"[ \t]*$/m';
+        $seen = false;
+        $text = preg_replace_callback($pushRe, function () use (&$seen, $pushLine) {
+            if ($seen) { return ''; }
+            $seen = true;
+            return $pushLine;
+        }, $text);
+        if (!$seen) {
+            // Keep the pushed line next to its server-side twin.
+            $text = preg_replace('/^([ \t]*reneg-sec[ \t]+\S+[ \t]*)$/m', '$1' . "\n" . $pushLine, $text, 1);
+        }
+        return preg_replace("/\n{3,}/", "\n\n", $text);
+    }
+
     /**
      * Keeps the server's cipher directives in sync with the admin's chosen
      * default - and nothing else:
@@ -659,6 +728,46 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
 
         foreach (glob("{$pkgDir}/*_{$revokeExt}_*_ovpn.tar") as $matchingTar) { @unlink($matchingTar); }
         foreach (glob("{$pkgDir}/*_{$revokeExt}_ovpn.tar") as $matchingTar) { @unlink($matchingTar); }
+
+        // The CRL only stops NEW handshakes. A tunnel that is already up keeps
+        // running (and stays listed as connected) until it renegotiates, so end
+        // any live session for this extension now. The cert is already revoked
+        // above, so the phone cannot simply reconnect.
+        ovpn_mgr_kill_extension_sessions($revokeExt);
+    }
+
+    /**
+     * Ends every live OpenVPN session whose common name is $ext, using the same
+     * sudo-scoped ovpnctl helpers the GUI's Kill Connection button uses
+     * (status snapshot -> client-kill <CID>). Best effort and silent: a stopped
+     * daemon, missing sudo rule or missing management socket just means there is
+     * nothing to kill. Returns the number of sessions it asked OpenVPN to drop.
+     */
+    function ovpn_mgr_kill_extension_sessions($ext) {
+        $ext = preg_replace('/[^0-9]/', '', (string)$ext);
+        if ($ext === '') { return 0; }
+        $ovpnctl = dirname(__DIR__) . '/scripts/ovpnctl';
+        if (!file_exists($ovpnctl)) { return 0; }
+
+        $out = []; $rc = 0;
+        exec('sudo -n ' . escapeshellarg($ovpnctl) . ' status 2>/dev/null', $out, $rc);
+        if ($rc !== 0 || empty($out)) { return 0; }
+
+        $cids = [];
+        foreach ($out as $line) {
+            if (strpos($line, "CLIENT_LIST\t") !== 0) { continue; }
+            $f = explode("\t", rtrim($line, "\r\n"));
+            if (count($f) >= 11 && $f[1] === $ext && preg_match('/^[0-9]{1,10}$/', $f[10])) {
+                $cids[$f[10]] = true;
+            }
+        }
+        $killed = 0;
+        foreach (array_keys($cids) as $cid) {
+            $kOut = []; $kRc = 0;
+            exec('sudo -n ' . escapeshellarg($ovpnctl) . ' kill-client ' . escapeshellarg((string)$cid) . ' 2>&1', $kOut, $kRc);
+            if ($kRc === 0) { $killed++; }
+        }
+        return $killed;
     }
 
     /**
@@ -787,6 +896,8 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
             $cleanContent = ovpnSetServerDirective($cleanContent, 'status-version', '3');
             $cleanContent = ovpnSetServerDirective($cleanContent, 'management', '/run/ovpn_mgr/mgmt.sock unix');
             $cleanContent = ovpnSetServerDirective($cleanContent, 'management-client-user', 'asterisk');
+            // Daily TLS renegotiation (2.70); existing installs converge on every start.
+            $cleanContent = ovpnApplyRenegDirectives($cleanContent);
             // Installs from before crl-verify was part of install.php's
             // baseline template only ever got it added reactively, by
             // revokeExtension(), on whichever save first revoked a cert -
@@ -812,6 +923,10 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
         if (file_exists($serverKey)) {
             @chmod($serverKey, 0600);
         }
+
+        // Status file on tmpfs (2.70): re-create the symlink if anything removed it,
+        // otherwise OpenVPN would silently go back to rewriting a file on disk.
+        ovpnEnsureStatusSymlink($logDir);
 
         exec('sudo -n ' . escapeshellarg($ovpnctl) . ' start 2>&1', $output, $returnCode);
         if ($returnCode !== 0 && !empty($output)) {

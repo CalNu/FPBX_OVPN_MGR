@@ -50,12 +50,15 @@ if (file_exists($pidFile)) {
 //      # stop and disable the module's three systemd units first
 //      sudo systemctl disable --now ovpn-mgr-openvpn.service \
 //                                   ovpn-mgr-nat.service \
-//                                   ovpn-mgr-fixperms.service 2>/dev/null
+//                                   ovpn-mgr-fixperms.service \
+//                                   ovpn-mgr-fixperms.path 2>/dev/null
 //      sudo rm -f /etc/sudoers.d/ovpn_mgr \
 //                 /etc/sysctl.d/99-ovpn-mgr.conf \
 //                 /etc/systemd/system/ovpn-mgr-openvpn.service \
 //                 /etc/systemd/system/ovpn-mgr-nat.service \
-//                 /etc/systemd/system/ovpn-mgr-fixperms.service
+//                 /etc/systemd/system/ovpn-mgr-fixperms.service \
+//                 /etc/systemd/system/ovpn-mgr-fixperms-watch.service \
+//                 /etc/systemd/system/ovpn-mgr-fixperms.path
 //      sudo rm -rf /etc/ovpn_mgr
 //      sudo systemctl daemon-reload
 //      sudo systemctl reset-failed 'ovpn-mgr-*' 2>/dev/null

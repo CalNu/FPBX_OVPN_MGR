@@ -6,6 +6,9 @@
 #
 #     sudo bash /path/to/admin/modules/ovpn_mgr/scripts/setup-root.sh
 #
+# Add --restart-vpn to also restart the OpenVPN daemon (drops connected
+# phones). Without it a healthy running daemon is left alone.
+#
 # It never runs as part of a web request and never sees a password typed
 # into the browser. All it does:
 #
@@ -26,6 +29,15 @@
 
 set -euo pipefail
 
+# Re-running this script no longer restarts a healthy OpenVPN daemon (which
+# drops every connected phone). Pass --restart-vpn to force a restart, e.g.
+# after an upgrade whose changelog says the daemon must be restarted.
+FORCE_RESTART=0
+OVPN_UNIT_CHANGED=1
+for arg in "$@"; do
+    [ "$arg" = "--restart-vpn" ] && FORCE_RESTART=1
+done
+
 if [ "$(id -u)" -ne 0 ]; then
     echo "This must be run as root, e.g.: sudo bash $0" >&2
     exit 1
@@ -38,6 +50,9 @@ STATE_DIR="/etc/ovpn_mgr"
 UNIT_FILE="/etc/systemd/system/ovpn-mgr-nat.service"
 OPENVPN_UNIT_FILE="/etc/systemd/system/ovpn-mgr-openvpn.service"
 FIXPERMS_UNIT_FILE="/etc/systemd/system/ovpn-mgr-fixperms.service"
+FIXPERMS_WATCH_UNIT_FILE="/etc/systemd/system/ovpn-mgr-fixperms-watch.service"
+FIXPERMS_PATH_UNIT_FILE="/etc/systemd/system/ovpn-mgr-fixperms.path"
+FIXPERMS_HELPER="/etc/ovpn_mgr/fixperms.sh"
 
 # This script lives at <AMPWEBROOT>/admin/modules/ovpn_mgr/scripts/setup-root.sh
 AMPWEBROOT="$(cd "${MODULE_DIR}/../.." && pwd)"
@@ -316,6 +331,47 @@ WantedBy=multi-user.target
 EOF
     chmod 644 "$FIXPERMS_UNIT_FILE"
 
+    # Module upgrades/re-uploads replace scripts/ovpnctl with a fresh copy that
+    # is asterisk:asterisk 0644 (not executable), which breaks the sudo rule
+    # until this script is re-run. The helper below lives OUTSIDE the module
+    # directory (root-only /etc/ovpn_mgr) so root never executes a file the
+    # web user can write. It is a no-op when the wrapper is already correct,
+    # which also keeps the path unit from retriggering itself on its own chown.
+    cat > "$FIXPERMS_HELPER" <<EOF
+#!/bin/bash
+W="${WRAPPER}"
+[ -e "\$W" ] || exit 0
+if [ -L "\$W" ]; then
+    echo "ovpn_mgr: \$W is a symlink; refusing to change it" >&2
+    exit 1
+fi
+[ "\$(stat -c '%U:%G:%a' "\$W")" = "root:asterisk:750" ] && exit 0
+chown root:asterisk "\$W" && chmod 750 "\$W"
+EOF
+    chown root:root "$FIXPERMS_HELPER"
+    chmod 700 "$FIXPERMS_HELPER"
+
+    cat > "$FIXPERMS_WATCH_UNIT_FILE" <<EOF
+[Unit]
+Description=Re-lock ovpn_mgr ovpnctl after a module upgrade
+
+[Service]
+Type=oneshot
+ExecStart=${FIXPERMS_HELPER}
+EOF
+    cat > "$FIXPERMS_PATH_UNIT_FILE" <<EOF
+[Unit]
+Description=Watch ovpn_mgr ovpnctl for replacement (module upgrade)
+
+[Path]
+PathChanged=${WRAPPER}
+Unit=ovpn-mgr-fixperms-watch.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$FIXPERMS_WATCH_UNIT_FILE" "$FIXPERMS_PATH_UNIT_FILE"
+
     cat > "$UNIT_FILE" <<EOF
 [Unit]
 Description=Reapply ovpn_mgr VPN NAT and firewall-port rules
@@ -336,6 +392,7 @@ EOF
     # OpenVPN itself must also be managed by systemd. Previously setup-root
     # started it interactively, but no enabled boot unit brought it back after
     # reboot; users had to rerun this entire setup script.
+    OLD_OVPN_UNIT_SUM="$(cksum < "$OPENVPN_UNIT_FILE" 2>/dev/null || echo none)"
     cat > "$OPENVPN_UNIT_FILE" <<EOF
 [Unit]
 Description=ovpn_mgr OpenVPN server
@@ -367,13 +424,20 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
     chmod 644 "$UNIT_FILE" "$OPENVPN_UNIT_FILE"
+    if [ "$OLD_OVPN_UNIT_SUM" = "$(cksum < "$OPENVPN_UNIT_FILE")" ]; then
+        OVPN_UNIT_CHANGED=0
+    fi
     systemctl daemon-reload
     systemctl enable ovpn-mgr-fixperms.service >/dev/null 2>&1 || true
+    systemctl enable ovpn-mgr-fixperms.path >/dev/null 2>&1 || true
     systemctl enable ovpn-mgr-nat.service >/dev/null 2>&1 || true
     systemctl enable ovpn-mgr-openvpn.service >/dev/null 2>&1 || true
     # Perms first, then NAT restored after network/firewall setup, then OpenVPN starts.
     if ! systemctl restart ovpn-mgr-fixperms.service; then
         echo "WARNING: ovpn-mgr-fixperms.service failed; ${WRAPPER} may not be root:asterisk 0750. Inspect: systemctl status ovpn-mgr-fixperms.service" >&2
+    fi
+    if ! systemctl restart ovpn-mgr-fixperms.path; then
+        echo "WARNING: ovpn-mgr-fixperms.path failed; module upgrades will need setup-root.sh or fwconsole chown. Inspect: systemctl status ovpn-mgr-fixperms.path" >&2
     fi
     if ! systemctl restart ovpn-mgr-nat.service; then
         echo "WARNING: ovpn-mgr NAT restore service failed; inspect: systemctl status ovpn-mgr-nat.service" >&2
@@ -385,18 +449,27 @@ mkdir -p "${VPN_DATA_DIR}/logs" 2>/dev/null || true
 chown -R asterisk:asterisk "${VPN_DATA_DIR}" 2>/dev/null || true
 
 # --- Start/restart OpenVPN under systemd so it also starts after reboot ---
-echo "==> Enabling and restarting the OpenVPN systemd service..."
+echo "==> Enabling the OpenVPN systemd service (restarting only if needed)..."
 if command -v systemctl >/dev/null 2>&1; then
-    # Clear any daemon that was launched outside the unit (older versions
-    # started it from the web GUI, i.e. inside php-fpm's cgroup) so the unit
-    # owns the process from here on.
-    "$WRAPPER" stop-daemon || true
-    if ! systemctl enable ovpn-mgr-openvpn.service >/dev/null 2>&1; then
-        echo "WARNING: Could not enable ovpn-mgr-openvpn.service." >&2
-    fi
-    if ! systemctl restart ovpn-mgr-openvpn.service; then
-        echo "WARNING: OpenVPN service did not start cleanly. Inspect: systemctl status ovpn-mgr-openvpn.service" >&2
-        echo "         Recent logs: journalctl -u ovpn-mgr-openvpn.service -n 80 --no-pager" >&2
+    if [ "$FORCE_RESTART" != "1" ] && [ "$OVPN_UNIT_CHANGED" = "0" ] \
+       && systemctl is-active --quiet ovpn-mgr-openvpn.service; then
+        # Already running under an unchanged unit: leave it alone so phones
+        # stay connected. (Enable is idempotent and doesn't touch the process.)
+        systemctl enable ovpn-mgr-openvpn.service >/dev/null 2>&1 || true
+        echo "    OpenVPN is already running under systemd; leaving it (and its"
+        echo "    connected clients) untouched. Use --restart-vpn to restart it."
+    else
+        # Clear any daemon that was launched outside the unit (older versions
+        # started it from the web GUI, i.e. inside php-fpm's cgroup) so the
+        # unit owns the process from here on.
+        "$WRAPPER" stop-daemon || true
+        if ! systemctl enable ovpn-mgr-openvpn.service >/dev/null 2>&1; then
+            echo "WARNING: Could not enable ovpn-mgr-openvpn.service." >&2
+        fi
+        if ! systemctl restart ovpn-mgr-openvpn.service; then
+            echo "WARNING: OpenVPN service did not start cleanly. Inspect: systemctl status ovpn-mgr-openvpn.service" >&2
+            echo "         Recent logs: journalctl -u ovpn-mgr-openvpn.service -n 80 --no-pager" >&2
+        fi
     fi
 else
     "$WRAPPER" stop || true
@@ -409,6 +482,7 @@ echo "  - ${WRAPPER} is now root:asterisk 0750"
 echo "  - ovpn-mgr-fixperms.service reapplies that ownership/mode on every boot,"
 echo "    after FreePBX's own permission sweep runs, so this no longer needs to"
 echo "    be re-run manually after a reboot"
+echo "  - ovpn-mgr-fixperms.path re-applies it automatically after a module upgrade"
 echo "  - ${SUDOERS_FILE} grants 'asterisk' passwordless sudo on that script only"
 echo "  - net.ipv4.ip_forward=1 persisted in /etc/sysctl.d/99-ovpn-mgr.conf"
 echo "  - ovpn-mgr-nat.service will reapply the VPN's NAT rule, and (on hosts"

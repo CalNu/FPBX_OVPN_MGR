@@ -158,9 +158,65 @@ function isValidHostOrIp($s) {
     return (bool) preg_match('/^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$/', $s);
 }
 
+// Cockpit (web console) detection for the optional header button.
+// Installed = its systemd socket unit exists. The port comes from the
+// ListenStream= lines (base unit, then drop-ins in name order; an empty
+// ListenStream= resets the list), falling back to Cockpit's default 9090.
+function ovpnCockpitInfo() {
+    static $cached = null;
+    if ($cached !== null) { return $cached; }
+    $info = ['installed' => false, 'port' => 9090];
+
+    $unitPaths = [
+        '/etc/systemd/system/cockpit.socket',
+        '/usr/lib/systemd/system/cockpit.socket',
+        '/lib/systemd/system/cockpit.socket',
+    ];
+    $mainUnit = null;
+    foreach ($unitPaths as $u) {
+        if (@is_file($u)) { $mainUnit = $u; break; }
+    }
+    if ($mainUnit === null) { return $cached = $info; }
+    $info['installed'] = true;
+
+    // Drop-ins: same file name in a higher-priority directory wins.
+    $dropIns = [];
+    foreach (array_reverse(['/etc/systemd/system', '/usr/lib/systemd/system', '/lib/systemd/system']) as $dir) {
+        foreach ((array)@glob($dir . '/cockpit.socket.d/*.conf') as $f) {
+            $dropIns[basename($f)] = $f;
+        }
+    }
+    ksort($dropIns);
+
+    $listen = [];
+    foreach (array_merge([$mainUnit], array_values($dropIns)) as $file) {
+        $lines = @file($file, FILE_IGNORE_NEW_LINES);
+        if (!is_array($lines)) { continue; }
+        foreach ($lines as $line) {
+            if (!preg_match('/^\s*ListenStream\s*=\s*(.*?)\s*$/i', $line, $m)) { continue; }
+            if ($m[1] === '') { $listen = []; } else { $listen[] = $m[1]; }
+        }
+    }
+    foreach ($listen as $v) {
+        if ($v === '' || $v[0] === '/' || $v[0] === '@') { continue; } // unix socket
+        if (ctype_digit($v)) { $port = (int)$v; }
+        elseif (preg_match('/:(\d{1,5})$/', $v, $pm)) { $port = (int)$pm[1]; }
+        else { continue; }
+        if ($port >= 1 && $port <= 65535) { $info['port'] = $port; break; }
+    }
+    return $cached = $info;
+}
+
 function hasOvpnctlAccess($ovpnctl) {
     exec('sudo -n ' . escapeshellarg($ovpnctl) . ' check 2>&1', $out, $rc);
-    return ($rc === 0);
+    if ($rc !== 0) { return false; }
+    // The sudoers rule runs this file as root, so it must be root-owned and
+    // not writable by the web user (a module upgrade resets it to
+    // asterisk:asterisk). Treat that state as "setup needed" too.
+    clearstatcache(true, $ovpnctl);
+    $st = @stat($ovpnctl);
+    if ($st === false || $st['uid'] !== 0 || ($st['mode'] & 0022) !== 0) { return false; }
+    return true;
 }
 
 // True when FreePBX's own Firewall module is usable through fwconsole.
@@ -392,7 +448,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'add_page_break') {
     exit();
 }
 
-require_once __DIR__ . '/ovpn_mgr.class.php';
+require_once __DIR__ . '/Ovpn_mgr.class.php';
 $freepbxObj = \FreePBX::create();
 $ovpn_mgr = new \FreePBX\modules\Ovpn_mgr($freepbxObj);
 
@@ -550,7 +606,14 @@ if (class_exists('FreePBX')) {
 // ============================================================================
 // Save Server Settings
 // ============================================================================
+// An error from a failed save is handed over via the session (Post/Redirect/Get)
+// so the browser never ends up sitting on a POST response; reloading the page
+// then doesn't trigger Firefox/Chrome's "resend form data?" prompt.
 $settingsError = '';
+if (!empty($_SESSION['ovpn_mgr_settings_error'])) {
+    $settingsError = (string)$_SESSION['ovpn_mgr_settings_error'];
+}
+unset($_SESSION['ovpn_mgr_settings_error']);
 if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
     csrf_require();
 
@@ -774,6 +837,11 @@ if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
         exit();
         } // end verified config save
     }
+
+    // Validation / save failed: redirect back (PRG) and show the error there.
+    $_SESSION['ovpn_mgr_settings_error'] = $settingsError;
+    header("Location: config.php?display=ovpn_mgr");
+    exit();
 }
 
 // ============================================================================
@@ -1187,6 +1255,9 @@ if (is_readable($ovpnUnitPath)) {
     $ovpnUnitStale = (strpos((string)@file_get_contents($ovpnUnitPath), 'start-daemon') === false);
 }
 
+// Upgrade auto-relock (path unit) added in 2.69; older setups lack it.
+$ovpnWatchMissing = is_dir('/run/systemd/system') && !file_exists('/etc/systemd/system/ovpn-mgr-fixperms.path');
+
 $createdPackages = glob("{$pkgDir}/*.tar");
 $ovpnCbcInUse = []; // legacy (CBC) cipher => package count, for the mixed-cipher warning
 $issuedCertFiles = glob("{$pkiDir}/issued/*.crt");
@@ -1218,6 +1289,10 @@ if ($isRunning && file_exists($statusFile) && is_readable($statusFile)) {
         // BytesSent  ConnectedSince  ConnectedSinceEpoch  Username
         // ClientID  PeerID  DataChannelCipher
         if (count($f) < 13) { continue; }
+        // The status file is only rewritten every few seconds, so a client that
+        // was just revoked/killed lingers in it. A session whose certificate no
+        // longer exists in the PKI (revoked) is not a live connection - hide it.
+        if (preg_match('/^[0-9]+$/', $f[1]) && !file_exists("{$pkiDir}/issued/{$f[1]}.crt")) { continue; }
         $connectedClients[] = [
             'mac'           => $f[1],
             'real_ip'       => $f[2],
@@ -1277,6 +1352,12 @@ if ($isRunning && file_exists($statusFile) && is_readable($statusFile)) {
             <button type="button" class="btn btn-info btn-sm" data-toggle="modal" data-target="#logModal">
                 <i class="fa fa-file-text-o"></i> View Live Logs
             </button>
+            <?php $ovpnCockpit = ovpnCockpitInfo(); if ($ovpnCockpit['installed']): ?>
+                <button type="button" class="btn btn-default btn-sm" id="ovpnCockpitBtn" data-port="<?php echo (int)$ovpnCockpit['port']; ?>" title="Open Cockpit in a new tab (port <?php echo (int)$ovpnCockpit['port']; ?>)" aria-label="Open Cockpit" onclick="openCockpit(this)">
+                    <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" style="vertical-align: -3px; margin-right: 3px;"><circle cx="12" cy="12" r="10.8" fill="none" stroke="#0066cc" stroke-width="1.8"/><path fill="#0066cc" transform="translate(12 12) rotate(45) scale(0.58) translate(-12 -12)" d="M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/></svg>
+                    Cockpit
+                </button>
+            <?php endif; ?>
             <?php if ($show_ovpn_resign_button): ?>
                 <button type="button" class="btn btn-danger btn-sm" style="margin: 0; font-weight: bold; background-color: #db001a; border-color: #6b000d;" data-toggle="modal" data-target="#signModal">
                     <i class="fa fa-key"></i> Sign Module
@@ -1296,6 +1377,13 @@ if ($isRunning && file_exists($statusFile) && is_readable($statusFile)) {
     <?php elseif (!$ip_forward_active): ?>
         <div class="alert alert-warning" style="margin-bottom: 20px;">
             <i class="fa fa-exclamation-triangle"></i> IP forwarding is currently inactive. Starting the service will enable it.
+        </div>
+    <?php endif; ?>
+
+    <?php if ($hasSudoRule && $ovpnWatchMissing): ?>
+        <div class="alert alert-warning" style="margin-bottom: 20px;">
+            <i class="fa fa-exclamation-triangle"></i> Re-run the root setup once so future module upgrades re-secure the root helper automatically (otherwise this page asks for setup again after every upgrade):
+            <pre id="setupCmdWatch" title="Click to copy" style="background:#f8f9fa; padding:10px; border:1px solid #ccc; font-size:12px; margin:8px 0 0; cursor:pointer;" onclick="copySetupCommand('setupCmdWatch')">sudo bash <?php echo htmlspecialchars($setupScript); ?></pre>
         </div>
     <?php endif; ?>
 
@@ -2152,6 +2240,11 @@ function fallbackCopy(element) {
     }
 }
 
+function openCockpit(btn) {
+    var port = btn.getAttribute('data-port');
+    window.open('https://' + window.location.hostname + ':' + port + '/', '_blank', 'noopener');
+}
+
 function copySetupCommand(id) {
     var text = document.getElementById(id || 'setupCmd').innerText;
     var done = function() { showOvpnToast('Command copied to clipboard'); };
@@ -2342,19 +2435,38 @@ function submitOvpnBulkPkgAction(action) {
 let logInterval = null;
 let isInitialOpen = false;
 
+let logInFlight = false;
+
+function renderOpenVPNLog(text) {
+    const $textarea = $('#logModalPre');
+    const elem = $textarea[0];
+    const isAtBottom = (elem.scrollHeight - elem.clientHeight - elem.scrollTop) <= 40;
+    $textarea.val(text);
+    if (isInitialOpen || isAtBottom) {
+        elem.scrollTop = elem.scrollHeight;
+        isInitialOpen = false;
+    }
+}
+
+// Polls ajax.php (no per-request GPG module-signature check, unlike
+// config.php), never overlaps requests, and skips hidden tabs. If ajax.php
+// can't serve it, falls back to the original config.php endpoint.
+let logUseFallback = false;
 function fetchOpenVPNLog() {
+    if (logInFlight || document.hidden) { return; }
+    logInFlight = true;
+    const req = logUseFallback
+        ? { url: 'config.php', dataType: 'text', data: { display: 'ovpn_mgr', action: 'fetch_log' } }
+        : { url: 'ajax.php', dataType: 'json', data: { module: 'ovpn_mgr', command: 'fetch_log' } };
     $.ajax({
-        url: 'config.php', type: 'GET', data: { display: 'ovpn_mgr', action: 'fetch_log' },
+        url: req.url, type: 'GET', dataType: req.dataType, timeout: 8000, data: req.data,
         success: function(response) {
-            const $textarea = $('#logModalPre');
-            const elem = $textarea[0];
-            const isAtBottom = (elem.scrollHeight - elem.clientHeight - elem.scrollTop) <= 40;
-            $textarea.val(response);
-            if (isInitialOpen || isAtBottom) {
-                elem.scrollTop = elem.scrollHeight;
-                isInitialOpen = false;
-            }
-        }
+            if (logUseFallback) { renderOpenVPNLog(response); }
+            else if (response && response.status && typeof response.log === 'string') { renderOpenVPNLog(response.log); }
+            else { logUseFallback = true; }
+        },
+        error: function() { logUseFallback = true; },
+        complete: function() { logInFlight = false; }
     });
 }
 
@@ -2377,7 +2489,7 @@ $('#logModal').on('shown.bs.modal', function () {
     isInitialOpen = true;
     fetchOpenVPNLog();
     if (logInterval) clearInterval(logInterval);
-    logInterval = setInterval(fetchOpenVPNLog, 2000);
+    logInterval = setInterval(fetchOpenVPNLog, 4000);
 });
 $('#logModal').on('hidden.bs.modal', function () {
     if (logInterval) { clearInterval(logInterval); logInterval = null; }
