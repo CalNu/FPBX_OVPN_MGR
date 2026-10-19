@@ -46,24 +46,27 @@ public function getServiceStatus() {
     public function ajaxHandler() {
         $command = isset($_REQUEST['command']) ? $_REQUEST['command'] : '';
         if ($command === 'fetch_log') {
-            return ['status' => true, 'log' => $this->getLogText()];
+            // The page passes the server whose log it shows; anything but "modern" means legacy.
+            $instance = (isset($_REQUEST['instance']) && $_REQUEST['instance'] === 'modern') ? 'modern' : 'legacy';
+            return ['status' => true, 'log' => $this->getLogText($instance)];
         }
         return ['status' => false, 'message' => 'Unknown command'];
     }
 
-    public function getLogText() {
+    public function getLogText($instance = 'legacy') {
         $webRoot = '/var/www/html';
         try {
             $cfg = \FreePBX::Config()->get('AMPWEBROOT');
             if (!empty($cfg)) { $webRoot = rtrim($cfg, '/'); }
         } catch (\Throwable $e) {}
+        require_once __DIR__ . '/lib/client_ops.php';
         $baseDir = "{$webRoot}/PhoneSettings/openvpn";
-        $logFile = "{$baseDir}/logs/openvpn.log";
+        $logDir  = ovpnLogDir($baseDir, $instance === 'modern' ? 'modern' : 'legacy');
+        $logFile = "{$logDir}/openvpn.log";
         if (!file_exists($logFile)) {
             return 'No log output available.';
         }
-        require_once __DIR__ . '/lib/client_ops.php';
-        $markerFile = "{$baseDir}/logs/.line_break_pos";
+        $markerFile = "{$logDir}/.line_break_pos";
         $marker = file_exists($markerFile) ? (int)trim((string)@file_get_contents($markerFile)) : null;
         $clean = [];
         foreach (explode("\n", tailFileFromMarker($logFile, $marker, 500)) as $line) {

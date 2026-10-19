@@ -42,22 +42,267 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
      * Callers reject a symlinked PhoneSettings path so private data stays
      * out of /tftpboot.
      */
-    function ovpn_mgr_resolve_paths($ampWebRoot) {
+    /**
+     * The module can run two independent OpenVPN instances side by side, inside
+     * ONE base directory (PhoneSettings/openvpn). They differ only by file name:
+     *                legacy (RSA-1024/SHA-1,      modern (RSA-2048/SHA-256,
+     *                AES-CBC, old firmware)       AES-GCM, TLS 1.2+)
+     *   config       legacy-vpn.conf              modern-vpn.conf
+     *   PKI          legacy_pki                   modern_pki
+     *   logs         logs-legacy                  logs-modern
+     *   client dirs  ccd-legacy                   ccd-modern
+     *   pid file     openvpn.pid                  openvpn-modern.pid
+     *   state files  .stopped, .pending_apply     .stopped-modern, .pending_apply-modern
+     * Every function that takes a $baseDir works on either instance; the instance
+     * is derived from whichever instance-specific path the function also receives
+     * ($pkiDir, $serverConf or $logDir).
+     */
+    function ovpnInstanceFromPki($pkiDir) {
+        return basename(rtrim((string)$pkiDir, '/')) === 'modern_pki' ? 'modern' : 'legacy';
+    }
+
+    function ovpnConfInstance($serverConf) {
+        return basename((string)$serverConf) === 'modern-vpn.conf' ? 'modern' : 'legacy';
+    }
+
+    function ovpnInstanceFromLogDir($logDir) {
+        return basename(rtrim((string)$logDir, '/')) === 'logs-modern' ? 'modern' : 'legacy';
+    }
+
+    function ovpnConfPath($baseDir, $instance) {
+        return rtrim((string)$baseDir, '/') . '/' . ($instance === 'modern' ? 'modern-vpn.conf' : 'legacy-vpn.conf');
+    }
+
+    function ovpnPkiDir($baseDir, $instance) {
+        return rtrim((string)$baseDir, '/') . '/' . ($instance === 'modern' ? 'modern_pki' : 'legacy_pki');
+    }
+
+    function ovpnLogDir($baseDir, $instance) {
+        return rtrim((string)$baseDir, '/') . '/' . ($instance === 'modern' ? 'logs-modern' : 'logs-legacy');
+    }
+
+    function ovpnCcdDir($baseDir, $instance) {
+        return rtrim((string)$baseDir, '/') . '/' . ($instance === 'modern' ? 'ccd-modern' : 'ccd-legacy');
+    }
+
+    function ovpnPidFile($baseDir, $instance) {
+        return rtrim((string)$baseDir, '/') . '/' . ($instance === 'modern' ? 'openvpn-modern.pid' : 'openvpn.pid');
+    }
+
+    /** A per-instance dot file such as ".stopped" or ".pending_apply" under the base directory. */
+    function ovpnStateFile($baseDir, $instance, $name) {
+        return rtrim((string)$baseDir, '/') . '/' . $name . ($instance === 'modern' ? '-modern' : '');
+    }
+
+    function ovpnMgmtSocketForInstance($instance) {
+        return $instance === 'modern' ? '/run/ovpn_mgr/mgmt-modern.sock' : '/run/ovpn_mgr/mgmt.sock';
+    }
+
+    function ovpnStatusTmpfsForInstance($instance) {
+        return $instance === 'modern' ? '/run/ovpn_mgr/openvpn-modern-status.log' : '/run/ovpn_mgr/openvpn-status.log';
+    }
+
+    /**
+     * The sudo-able helper for an instance. Legacy: the module's own
+     * scripts/ovpnctl. Modern: a root-owned shim installed OUTSIDE the module
+     * directory by setup-root.sh (a sudo-able script inside the web-user-
+     * writable module directory would be a root escalation).
+     */
+    function ovpnctlPathForInstance($scriptsDir, $instance) {
+        return $instance === 'modern' ? '/usr/local/sbin/ovpn_mgr-ctl-modern' : rtrim($scriptsDir, '/') . '/ovpnctl';
+    }
+
+    /** Ciphers the modern instance's server accepts (also what its UI offers). */
+    function ovpnModernCiphers() {
+        return ['AES-128-GCM', 'AES-256-GCM'];
+    }
+
+    function ovpnModernDataCiphers() {
+        return 'AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305';
+    }
+
+    /**
+     * 2.73 kept the modern instance in its own directory (PhoneSettings/openvpn-modern).
+     * From 2.74 both instances share PhoneSettings/openvpn and differ only by file
+     * name. Moves an existing modern instance over (PKI, config with its paths
+     * rewritten, client dirs, logs, state files) and removes the old directory once
+     * it is empty. A modern daemon still running from the old location is stopped
+     * first: its CRL and client-config paths are about to disappear (setup-root.sh
+     * starts it again from the new location). Returns true if anything was migrated.
+     */
+    function ovpnMigrateModernBase($phoneSettingsDir) {
+        $old = rtrim($phoneSettingsDir, '/') . '/openvpn-modern';
+        $new = rtrim($phoneSettingsDir, '/') . '/openvpn';
+        if (!is_dir($old) || !is_dir($new) || is_file("{$new}/modern-vpn.conf")) { return false; }
+
+        $oldPid = (int)trim((string)@file_get_contents("{$old}/openvpn.pid"));
+        if ($oldPid > 1 && is_dir("/proc/{$oldPid}")) {
+            @exec('kill ' . $oldPid . ' 2>&1');
+            for ($i = 0; $i < 10 && is_dir("/proc/{$oldPid}"); $i++) { usleep(300000); }
+        }
+
+        $moves = [
+            "{$old}/modern_pki"          => "{$new}/modern_pki",
+            "{$old}/ccd"                 => "{$new}/ccd-modern",
+            "{$old}/logs"                => "{$new}/logs-modern",
+            "{$old}/.stopped"            => "{$new}/.stopped-modern",
+            "{$old}/.pending_apply"      => "{$new}/.pending_apply-modern",
+            "{$old}/.trusted_cidr_state" => "{$new}/.trusted_cidr_state-modern",
+        ];
+        foreach ($moves as $from => $to) {
+            if (file_exists($from) && !file_exists($to)) { @rename($from, $to); }
+        }
+
+        $rewrite = function ($text) use ($old, $new) {
+            return str_replace(
+                ["{$old}/modern_pki", "{$old}/ccd", "{$old}/logs"],
+                ["{$new}/modern_pki", "{$new}/ccd-modern", "{$new}/logs-modern"],
+                $text
+            );
+        };
+        if (is_file("{$old}/modern-vpn.conf")) {
+            $conf = $rewrite((string)@file_get_contents("{$old}/modern-vpn.conf"));
+            if (@file_put_contents("{$new}/modern-vpn.conf", $conf) !== false) { @unlink("{$old}/modern-vpn.conf"); }
+        }
+        $cnf = "{$new}/modern_pki/openssl.cnf";
+        if (is_file($cnf)) { @file_put_contents($cnf, $rewrite((string)@file_get_contents($cnf))); }
+
+        @unlink("{$old}/openvpn.pid");
+        foreach (glob("{$old}/build_*") ?: [] as $leftover) { @rmdir($leftover); }
+        @rmdir($old);
+        return true;
+    }
+
+    /**
+     * Creates the modern instance if it does not exist yet: its own base
+     * directory (same layout as the legacy one), its own PKI (RSA-2048 / SHA-256
+     * with proper server and client extensions) and modern-vpn.conf (AES-GCM
+     * only, TLS 1.2+, no DH parameters). It never reads or writes anything of the
+     * legacy instance except for reading $legacyConf, to avoid its port/subnet
+     * and to inherit the PBX's LAN address. Idempotent: every piece is created
+     * only if missing. Returns true if the instance is complete afterwards.
+     */
+    function ovpnEnsureModernInstance($phoneSettingsDir, $legacyConf = '') {
+        $baseDir = rtrim($phoneSettingsDir, '/') . '/openvpn';
+        $pki     = ovpnPkiDir($baseDir, 'modern');
+        $conf    = ovpnConfPath($baseDir, 'modern');
+        $logDir  = ovpnLogDir($baseDir, 'modern');
+        $ccdDir  = ovpnCcdDir($baseDir, 'modern');
+        $run = function ($cmd) {
+            $o = []; $rc = 1;
+            exec($cmd . ' 2>&1', $o, $rc);
+            return $rc === 0;
+        };
+
+        foreach ([$baseDir, $logDir, $ccdDir, $pki, "{$pki}/private", "{$pki}/issued"] as $d) {
+            if (!is_dir($d) && !@mkdir($d, 0775, true)) { return false; }
+        }
+
+        $cnf = "{$pki}/openssl.cnf";
+        if (!is_file($cnf)) {
+            $cnfText = "[ req ]\ndistinguished_name = dn\nprompt = no\n\n[ dn ]\nCN = placeholder\n\n"
+                . "[ v3_ca ]\nbasicConstraints = critical,CA:TRUE\nkeyUsage = critical,keyCertSign,cRLSign\nsubjectKeyIdentifier = hash\n\n"
+                . "[ v3_server ]\nbasicConstraints = CA:FALSE\nkeyUsage = digitalSignature,keyEncipherment\nextendedKeyUsage = serverAuth\nsubjectKeyIdentifier = hash\nauthorityKeyIdentifier = keyid,issuer\n\n"
+                . "[ v3_client ]\nbasicConstraints = CA:FALSE\nkeyUsage = digitalSignature\nextendedKeyUsage = clientAuth\nsubjectKeyIdentifier = hash\nauthorityKeyIdentifier = keyid,issuer\n\n"
+                . "[ ca ]\ndefault_ca = CA_default\n\n"
+                . "[ CA_default ]\ndir = {$pki}\ndatabase = {$pki}/index.txt\ncrlnumber = {$pki}/crlnumber\ndefault_md = sha256\ndefault_crl_days = 3650\n";
+            if (@file_put_contents($cnf, $cnfText) === false) { return false; }
+        }
+
+        $caKey = "{$pki}/private/ca.key";
+        $caCrt = "{$pki}/ca.crt";
+        if (!is_file($caKey) || !is_file($caCrt)) {
+            @unlink($caKey); @unlink($caCrt);
+            if (!$run('openssl req -x509 -new -nodes -sha256 -days 3650 -newkey rsa:2048 -config ' . escapeshellarg($cnf)
+                . ' -extensions v3_ca -keyout ' . escapeshellarg($caKey) . ' -out ' . escapeshellarg($caCrt)
+                . ' -subj ' . escapeshellarg('/CN=Modern-VPN-CA/'))) { return false; }
+        }
+        @chmod($caKey, 0600);
+
+        $srvKey = "{$pki}/private/server.key";
+        $srvCrt = "{$pki}/server.crt";
+        if (!is_file($srvKey) || !is_file($srvCrt)) {
+            $csr = "{$pki}/server.csr";
+            @unlink($srvKey); @unlink($srvCrt);
+            if (!$run('openssl req -new -nodes -sha256 -newkey rsa:2048 -config ' . escapeshellarg($cnf)
+                . ' -keyout ' . escapeshellarg($srvKey) . ' -out ' . escapeshellarg($csr)
+                . ' -subj ' . escapeshellarg('/CN=modern-vpn-server/'))) { return false; }
+            if (!$run('openssl x509 -req -sha256 -days 3650 -in ' . escapeshellarg($csr)
+                . ' -CA ' . escapeshellarg($caCrt) . ' -CAkey ' . escapeshellarg($caKey)
+                . ' -set_serial 0x' . bin2hex(random_bytes(8))
+                . ' -extfile ' . escapeshellarg($cnf) . ' -extensions v3_server -out ' . escapeshellarg($srvCrt))) { return false; }
+            @unlink($csr);
+        }
+        @chmod($srvKey, 0600);
+
+        if (!is_file("{$pki}/index.txt")) { @touch("{$pki}/index.txt"); }
+        if (!is_file("{$pki}/crlnumber")) { @file_put_contents("{$pki}/crlnumber", "01\n"); }
+        if (!is_file("{$pki}/crl.pem")) {
+            if (!$run('OPENSSL_CONF=' . escapeshellarg($cnf) . ' openssl ca -gencrl -keyfile ' . escapeshellarg($caKey)
+                . ' -cert ' . escapeshellarg($caCrt) . ' -out ' . escapeshellarg("{$pki}/crl.pem")
+                . ' -config ' . escapeshellarg($cnf))) { return false; }
+        }
+
+        if (!is_file($conf)) {
+            $legacyText = ($legacyConf !== '' && is_readable($legacyConf)) ? (string)@file_get_contents($legacyConf) : '';
+            $legacyPort = 1195;
+            $legacyNet  = '10.3.0.0';
+            if (preg_match('/^[ \t]*port[ \t]+(\d+)/mi', $legacyText, $m)) { $legacyPort = (int)$m[1]; }
+            if (preg_match('/^server[ \t]+([0-9.]+)[ \t]+[0-9.]+/m', $legacyText, $m)) { $legacyNet = $m[1]; }
+            // Defaults: the modern instance takes the classic 1194 and 10.1.0.0/24, the legacy one
+            // 1195 and 10.3.0.0/24. An existing legacy instance that already uses them keeps them;
+            // the modern one then moves to the next free port and subnet.
+            $port = 1194;
+            while ($port === $legacyPort) { $port++; }
+            $net = '10.1.0.0';
+            foreach (['10.1.0.0', '10.3.0.0', '10.4.0.0', '10.5.0.0'] as $candidateNet) {
+                if ($candidateNet !== $legacyNet) { $net = $candidateNet; break; }
+            }
+
+            $lanIp = '';
+            if (preg_match('/^# push-route-host[ \t]+(\S+)/m', $legacyText, $m)) { $lanIp = $m[1]; }
+            if ($lanIp === '') { $lanIp = (string)ovpnDetectLanIp(); }
+            $extra = '';
+            if ($lanIp !== '') { $extra .= "# push-route-host {$lanIp}\n"; }
+            if (preg_match('/^# client-remote-host[ \t]+(\S+)/m', $legacyText, $m)) { $extra .= "# client-remote-host {$m[1]}\n"; }
+
+            $confText = "port {$port}\nproto udp\ndev tun1\n"
+                . "ca {$caCrt}\ncert {$srvCrt}\nkey {$srvKey}\ndh none\ncrl-verify {$pki}/crl.pem\n"
+                . "server {$net} 255.255.255.0\n"
+                . $extra
+                . "client-config-dir {$ccdDir}\nkeepalive 10 120\n\n"
+                . "data-ciphers " . ovpnModernDataCiphers() . "\nauth SHA256\n\n"
+                . "tls-version-min 1.2\ntopology subnet\npersist-key\npersist-tun\n"
+                . "status {$logDir}/openvpn-status.log 1\nstatus-version 3\n"
+                . "reneg-sec 86400\npush \"reneg-sec 86400\"\n"
+                . "management " . ovpnMgmtSocketForInstance('modern') . " unix\nmanagement-client-user asterisk\nverb 3\n";
+            if (@file_put_contents($conf, $confText) === false) { return false; }
+        }
+        @touch("{$logDir}/openvpn.log");
+        return is_file($conf) && is_file($caCrt) && is_file($srvCrt) && is_file("{$pki}/crl.pem");
+    }
+
+    function ovpn_mgr_resolve_paths($ampWebRoot, $instance = 'legacy') {
         $ampWebRoot = rtrim($ampWebRoot, '/');
         $phoneSettingsDir = "{$ampWebRoot}/PhoneSettings";
+        $instance = ($instance === 'modern') ? 'modern' : 'legacy';
         $baseDir = "{$phoneSettingsDir}/openvpn";
-        $pkiDir  = "{$baseDir}/legacy_pki";
+        $pkiDir  = ovpnPkiDir($baseDir, $instance);
 
         return [
+            'instance'          => $instance,
             'ampWebRoot'        => $ampWebRoot,
             'phoneSettingsDir'  => $phoneSettingsDir,
             'baseDir'           => $baseDir,
             'pkgDir'            => "{$phoneSettingsDir}/vpnkeys",
             'pkiDir'            => $pkiDir,
-            'serverConf'        => "{$baseDir}/legacy-vpn.conf",
+            'serverConf'        => ovpnConfPath($baseDir, $instance),
+            'logDir'            => ovpnLogDir($baseDir, $instance),
+            'ccdDir'            => ovpnCcdDir($baseDir, $instance),
+            'pidFile'           => ovpnPidFile($baseDir, $instance),
             'crlFile'           => "{$pkiDir}/crl.pem",
             'serverKey'         => "{$pkiDir}/private/server.key",
-            'ovpnctl'           => "{$ampWebRoot}/admin/modules/ovpn_mgr/scripts/ovpnctl",
+            'ovpnctl'           => ovpnctlPathForInstance("{$ampWebRoot}/admin/modules/ovpn_mgr/scripts", $instance),
         ];
     }
 
@@ -250,12 +495,277 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
     }
 
     /** The address a built package's vpn.cnf connects to ("remote <host> <port>"), or ''. */
+    /** Port of the "remote <host> <port>" line inside a package, or '' if unknown. */
+    /**
+     * The packages in $pkgDir that belong to one instance (both share the
+     * directory). A package belongs to the instance whose PKI holds its
+     * extension's certificate; packages nobody has a certificate for stay with the
+     * legacy instance. An extension that exists on both is told apart by the port
+     * in the package's vpn.cnf.
+     */
+    function ovpnInstancePackages($pkgDir, $pkiDir, $serverConf) {
+        $instance = ovpnInstanceFromPki($pkiDir);
+        $otherPki = dirname($pkiDir) . '/' . ($instance === 'modern' ? 'legacy_pki' : 'modern_pki');
+        $thisPort = (string)getActiveServerSettings($serverConf)['port'];
+        $all = glob("{$pkgDir}/*.tar") ?: [];
+        return array_values(array_filter($all, function ($tar) use ($pkiDir, $otherPki, $instance, $thisPort) {
+            $parsed = ovpnParsePackageName($tar);
+            if ($parsed === null) { return $instance === 'legacy'; }
+            $inHere  = is_file("{$pkiDir}/issued/{$parsed['ext']}.crt");
+            $inOther = is_file("{$otherPki}/issued/{$parsed['ext']}.crt");
+            if ($inHere && $inOther) { return getPackageRemotePort($tar) === $thisPort; }
+            if ($inHere) { return true; }
+            return $instance === 'legacy' && !$inOther;
+        }));
+    }
+
+    /**
+     * Which instance a package belongs to (both share $pkgDir). The instance whose PKI holds the
+     * package's extension certificate; an extension that exists on both is told apart by the port in
+     * the package's vpn.cnf; a package nobody has a certificate for goes by its port too and
+     * otherwise stays with the legacy instance.
+     */
+    function ovpnPackageInstance($pkgPath, $baseDir) {
+        $parsed = ovpnParsePackageName($pkgPath, true);
+        if ($parsed === null) { return 'legacy'; }
+        $ext     = $parsed['ext'];
+        $inModern = is_file(ovpnPkiDir($baseDir, 'modern') . "/issued/{$ext}.crt");
+        $inLegacy = is_file(ovpnPkiDir($baseDir, 'legacy') . "/issued/{$ext}.crt");
+        if ($inModern && !$inLegacy) { return 'modern'; }
+        if ($inLegacy && !$inModern) { return 'legacy'; }
+        $modernConf = ovpnConfPath($baseDir, 'modern');
+        $modernPort = is_file($modernConf) ? (string)getActiveServerSettings($modernConf)['port'] : '';
+        $pkgPort    = getPackageRemotePort($pkgPath);
+        return ($modernPort !== '' && $pkgPort === $modernPort) ? 'modern' : 'legacy';
+    }
+
+    /**
+     * Finds packages (certificates) that are being used by more than one device. A server without
+     * duplicate-cn lets only one session per certificate live: each new connection drops the previous one,
+     * and the dropped device reconnects a moment later and drops the other in turn.
+     *
+     * Reads the server log: every successful connection writes "<ip:port> [CN] Peer Connection Initiated with
+     * [AF_INET]<ip>:<port>", and the OpenVPN client's platform/version are logged as "peer info" lines with the
+     * same ip:port. For each CN the connections of the last $windowSeconds are put in order and consecutive ones
+     * from the same address are merged (a device reconnecting). An address that comes back after a different one
+     * (A, B, A) means two devices are taking the package from each other. A single change of address (a device
+     * roaming or being replaced) is not reported. Devices behind the same public address cannot be told apart.
+     *
+     * Returns a list of ['cn', 'devices' => [['ip', 'label', 'last']], 'switches', 'last'].
+     */
+    function ovpnDetectSharedPackages($logText, $windowSeconds = 3600, $now = null) {
+        $now = ($now === null) ? time() : (int)$now;
+        $peers = [];     // "ip:port" => ['PLAT' =>, 'VER' =>, 'GUI_VER' =>]
+        $sessions = [];  // CN => list of ['ts', 'ip', 'peer']
+        foreach (preg_split('/\r?\n/', (string)$logText) as $line) {
+            if (!preg_match('/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (\S+) (.*)$/', $line, $m)) { continue; }
+            $who = $m[2];
+            $msg = $m[3];
+            if (preg_match('/^peer info: IV_(PLAT|VER|GUI_VER)=(.+)$/', $msg, $pm)) {
+                $peers[$who][$pm[1]] = trim($pm[2]);
+                continue;
+            }
+            if (preg_match('/^\[([^\]]+)\] Peer Connection Initiated with \[AF_INET6?\](.+):(\d+)$/', $msg, $cm)) {
+                $ts = strtotime($m[1]);
+                if ($ts === false || $ts < $now - (int)$windowSeconds) { continue; }
+                $sessions[$cm[1]][] = ['ts' => $ts, 'ip' => trim($cm[2], '[]'), 'peer' => $who];
+            }
+        }
+
+        $result = [];
+        foreach ($sessions as $cn => $list) {
+            // Merge consecutive connections from the same address.
+            $seq = [];
+            foreach ($list as $sess) {
+                if (!empty($seq) && $seq[count($seq) - 1]['ip'] === $sess['ip']) {
+                    $seq[count($seq) - 1] = $sess;
+                } else {
+                    $seq[] = $sess;
+                }
+            }
+            if (count($seq) < 3) { continue; }
+            $seen = []; $repeat = false;
+            foreach ($seq as $sess) {
+                if (isset($seen[$sess['ip']])) { $repeat = true; break; }
+                $seen[$sess['ip']] = true;
+            }
+            if (!$repeat) { continue; }
+
+            $devices = [];
+            foreach ($seq as $sess) {
+                $info  = $peers[$sess['peer']] ?? [];
+                $label = '';
+                if (!empty($info['PLAT'])) {
+                    $plat  = ['win' => 'Windows', 'linux' => 'Linux', 'mac' => 'macOS', 'ios' => 'iOS', 'android' => 'Android'][strtolower($info['PLAT'])] ?? $info['PLAT'];
+                    $app   = (!empty($info['GUI_VER']) && strncmp($info['GUI_VER'], 'OC', 2) === 0) ? 'OpenVPN Connect' : 'OpenVPN';
+                    $label = $plat . ', ' . $app . (!empty($info['VER']) ? ' ' . $info['VER'] : '');
+                }
+                $devices[$sess['ip']] = ['ip' => $sess['ip'], 'label' => $label, 'last' => $sess['ts']];
+            }
+            $result[] = [
+                'cn'       => (string)$cn,
+                'devices'  => array_values($devices),
+                'switches' => count($seq) - 1,
+                'last'     => $seq[count($seq) - 1]['ts'],
+            ];
+        }
+        return $result;
+    }
+
+    /** The instance a cipher connects to: CBC ciphers are served by the legacy server, GCM by the modern one. */
+    function ovpnInstanceForCipher($cipher) {
+        return ovpnIsCbcCipher($cipher) ? 'legacy' : 'modern';
+    }
+
+    function getPackageRemotePort($pkgPath) {
+        $cnf = @shell_exec('tar -xOf ' . escapeshellarg($pkgPath) . ' vpn.cnf 2>/dev/null');
+        if (is_string($cnf) && preg_match('/^remote[ \t]+\S+[ \t]+(\d+)/m', $cnf, $m)) {
+            return trim($m[1]);
+        }
+        return '';
+    }
+
     function getPackageRemote($pkgPath) {
         $cnf = @shell_exec('tar -xOf ' . escapeshellarg($pkgPath) . ' vpn.cnf 2>/dev/null');
         if (is_string($cnf) && preg_match('/^remote[ \t]+(\S+)/m', $cnf, $m)) {
             return trim($m[1]);
         }
         return '';
+    }
+
+    // ---- "VPN Access" list: networks allowed to reach the phones' tunnel addresses ----
+    // The list lives in a root-owned file written by `ovpnctl lan-access-sync`
+    // (which re-validates everything); the GUI only reads it.
+
+    function ovpnLanAccessFile() {
+        return '/etc/ovpn_mgr/lan-access';
+    }
+
+    /** One address or network as a.b.c.d/nn, or null if unacceptable (same rules as ovpnctl's norm_src_net). */
+    function ovpnNormalizeSourceNet($v) {
+        $v = trim((string)$v);
+        if (!preg_match('~^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:/(\d{1,2}))?$~', $v, $m)) { return null; }
+        $o = [(int)$m[1], (int)$m[2], (int)$m[3], (int)$m[4]];
+        foreach ($o as $x) { if ($x > 255) { return null; } }
+        $pfx = (isset($m[5]) && $m[5] !== '') ? (int)$m[5] : 32;
+        if ($pfx < 8 || $pfx > 32) { return null; }
+        if ($o[0] === 0 || $o[0] === 127 || $o[0] >= 224) { return null; }
+        return implode('.', $o) . '/' . $pfx;
+    }
+
+    /** Splits typed text (one per line; commas/spaces also separate; # starts a comment) into [valid normalised list, rejected tokens]. */
+    function ovpnParseLanAccessInput($text) {
+        $ok = []; $bad = [];
+        foreach (preg_split('/\r\n|\r|\n/', (string)$text) as $line) {
+            $line = trim((string)preg_replace('/#.*$/', '', $line));
+            if ($line === '') { continue; }
+            foreach (preg_split('/[\s,;]+/', $line) as $tok) {
+                if ($tok === '') { continue; }
+                $n = ovpnNormalizeSourceNet($tok);
+                if ($n === null) { $bad[] = $tok; }
+                elseif (!in_array($n, $ok, true)) { $ok[] = $n; }
+            }
+        }
+        return [$ok, $bad];
+    }
+
+    /** The saved list (empty if none, or if the file can't be read). */
+    function ovpnReadLanAccess() {
+        $f = ovpnLanAccessFile();
+        if (!is_readable($f)) { return []; }
+        $parsed = ovpnParseLanAccessInput((string)@file_get_contents($f));
+        return $parsed[0];
+    }
+
+    /** The PBX's own LAN (always allowed): ['dev' => default-route interface, 'cidr' => its connected subnet]; '' where unknown. */
+    function ovpnDetectLanInfo() {
+        $info = ['dev' => '', 'cidr' => ''];
+        $out = [];
+        @exec('ip -4 route show default 2>/dev/null', $out);
+        foreach ($out as $l) {
+            if (preg_match('/\bdev\s+([A-Za-z0-9_.@-]{1,15})/', $l, $m)) { $info['dev'] = $m[1]; break; }
+        }
+        if ($info['dev'] === '') { return $info; }
+        $out2 = [];
+        @exec('ip -4 -o route show dev ' . escapeshellarg($info['dev']) . ' proto kernel scope link 2>/dev/null', $out2);
+        foreach ($out2 as $l) {
+            if (preg_match('~^(\d+\.\d+\.\d+\.\d+/\d+)~', $l, $m)) { $info['cidr'] = $m[1]; break; }
+        }
+        return $info;
+    }
+
+    /** A server config's VPN pool ("server 10.3.0.0 255.255.255.0") as ['net' => '10.3.0.0', 'cidr' => '10.3.0.0/24'], or null. */
+    function ovpnServerPoolFromConf($confPath) {
+        $text = is_readable($confPath) ? (string)@file_get_contents($confPath) : '';
+        if (!preg_match('/^[ \t]*server[ \t]+(\d+\.\d+\.\d+\.\d+)[ \t]+(\d+\.\d+\.\d+\.\d+)/m', $text, $m)) { return null; }
+        $net = ip2long($m[1]); $mask = ip2long($m[2]);
+        if ($net === false || $mask === false) { return null; }
+        $bits = 0;
+        for ($i = 31; $i >= 0 && (($mask >> $i) & 1); $i--) { $bits++; }
+        return ['net' => $m[1], 'cidr' => $m[1] . '/' . $bits];
+    }
+
+    /**
+     * Fingerprint of the directives OpenVPN actually reads from a server
+     * config: comments, blank lines and whitespace differences are ignored, so
+     * the "# push-route-host" / "# client-remote-host" notes (edited without a
+     * restart) never count as a change.
+     */
+    function ovpnConfFingerprint($confPath) {
+        $text = (string)@file_get_contents($confPath);
+        $lines = [];
+        foreach (preg_split('/\r?\n/', $text) as $line) {
+            $line = trim($line);
+            if ($line === '' || $line[0] === '#' || $line[0] === ';') { continue; }
+            $lines[] = preg_replace('/\s+/', ' ', $line);
+        }
+        return md5(implode("\n", $lines));
+    }
+
+    /** Records which config the daemon is about to load (written on every GUI start). */
+    function ovpnWriteLoadedConfSnapshot($baseDir, $instance, $confPath) {
+        @file_put_contents(ovpnStateFile($baseDir, $instance, '.loaded_conf'), ovpnConfFingerprint($confPath) . "\n", LOCK_EX);
+    }
+
+    /** Unix time a process started (from /proc), or 0 if it can't be read. */
+    function ovpnProcessStartTime($pid) {
+        $pid = (int)$pid;
+        if ($pid <= 0) { return 0; }
+        $stat = @file_get_contents("/proc/{$pid}/stat");
+        $btime = 0;
+        foreach (preg_split('/\r?\n/', (string)@file_get_contents('/proc/stat')) as $l) {
+            if (strpos($l, 'btime ') === 0) { $btime = (int)substr($l, 6); break; }
+        }
+        if (!is_string($stat) || $btime <= 0) { return 0; }
+        $rp = strrpos($stat, ')');           // the command name may contain spaces
+        if ($rp === false) { return 0; }
+        $f = preg_split('/\s+/', trim(substr($stat, $rp + 1)));
+        if (!isset($f[19])) { return 0; }    // starttime is field 22 overall = index 19 after the command name
+        $ticks = 100;                        // CLK_TCK is 100 on Linux
+        return $btime + (int)floor(((int)$f[19]) / $ticks);
+    }
+
+    /**
+     * Why a running daemon is out of step with its config, or '' if it is not.
+     * The daemon only reads its config (including the client-config-dir path
+     * that decides which phones get a route) when it starts.
+     *  - With a snapshot (written by every GUI start since 3.00): the config's
+     *    directives differ from what the daemon was started with.
+     *  - Without one (daemon started before 3.00): the config file was written
+     *    after the daemon started. This can show a false "restart needed" after
+     *    a save that didn't need one; it clears at the next restart.
+     */
+    function ovpnDaemonRestartReason($baseDir, $instance, $confPath, $pid) {
+        $start = ovpnProcessStartTime($pid);
+        $mtime = (int)@filemtime($confPath);
+        if ($start <= 0 || $mtime <= 0 || $mtime <= $start + 5) { return ''; }
+        $snapFile = ovpnStateFile($baseDir, $instance, '.loaded_conf');
+        if (is_file($snapFile)) {
+            $snap = trim((string)@file_get_contents($snapFile));
+            return ($snap !== '' && $snap !== ovpnConfFingerprint($confPath))
+                ? 'The server config changed after this daemon started.' : '';
+        }
+        return 'The server config was written after this daemon started.';
     }
 
     /**
@@ -273,9 +783,10 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
      * module-written files are removed.
      */
     function ovpnSyncCcdFiles($baseDir, $pkiDir, $pkgDir, $lanIp = '', $onlyExt = null) {
-        $ccdDir = "{$baseDir}/ccd";
+        $syncInstance = ovpnInstanceFromPki($pkiDir);
+        $ccdDir = ovpnCcdDir($baseDir, $syncInstance);
         if ($lanIp === '') {
-            $lanIp = ovpnRouteLanIp((string)@file_get_contents("{$baseDir}/legacy-vpn.conf"));
+            $lanIp = ovpnRouteLanIp((string)@file_get_contents(ovpnConfPath($baseDir, $syncInstance)));
         }
         if (!filter_var($lanIp, FILTER_VALIDATE_IP)) { return false; }
         if ($onlyExt !== null && !preg_match('/^[A-Za-z0-9_-]{1,64}$/', (string)$onlyExt)) { return false; }
@@ -285,6 +796,7 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
         $header = '# managed by ovpn_mgr: rewritten on every daemon start and package build';
         $exts = [];
         $targetsLan = [];
+        $pkgInfo = [];   // ext => list of [package file, remote host, connects to the LAN address?]
         if ($onlyExt !== null) {
             $exts[(string)$onlyExt] = true;
             $tars = glob("{$pkgDir}/*_{$onlyExt}_*ovpn.tar") ?: [];
@@ -300,7 +812,9 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
             if ($onlyExt !== null && $id['ext'] !== (string)$onlyExt) { continue; }
             $exts[$id['ext']] = true;
             $remote = getPackageRemote($tar);
-            if ($remote !== '' && ovpnRemoteIsServerLan($remote, $lanIp)) {
+            $isLan = ($remote !== '' && ovpnRemoteIsServerLan($remote, $lanIp));
+            $pkgInfo[$id['ext']][] = [basename($tar), $remote, $isLan];
+            if ($isLan) {
                 $targetsLan[$id['ext']] = true;
             }
         }
@@ -314,8 +828,18 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
             if (!empty($targetsLan[$cn])) {
                 $body .= "# This client connects to the PBX LAN address ({$lanIp}) directly, so no route to it\n"
                        . "# is pushed: it would send the phone's own tunnel traffic back into the tunnel.\n";
+                foreach ($pkgInfo[$cn] ?? [] as $pi) {
+                    if ($pi[2]) { $body .= "# Decided by package {$pi[0]}: remote {$pi[1]} is the PBX LAN address\n"; }
+                }
             } else {
                 $body .= "push \"route {$lanIp} 255.255.255.255\"\n";
+                if (empty($pkgInfo[$cn])) {
+                    $body .= "# No package found for this client, so the route is pushed by default.\n";
+                } else {
+                    foreach ($pkgInfo[$cn] as $pi) {
+                        $body .= "# Route pushed: package {$pi[0]} connects to " . ($pi[1] !== '' ? $pi[1] : '(unknown)') . ", not the PBX LAN address ({$lanIp})\n";
+                    }
+                }
             }
             $file = "{$ccdDir}/{$cn}";
             if (@file_get_contents($file) !== $body) {
@@ -365,7 +889,7 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
     }
 
     /**
-     * Ciphers the UI offers, weakest to strongest as shown, plus the order
+     * Ciphers the server accepts, weakest to strongest (the UI lists them strongest first), plus the order
      * used when writing the server's data-ciphers list (strongest first).
      */
     function ovpnAllowedCiphers() {
@@ -383,6 +907,16 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
      * AES-256-CBC.
      */
     function getDefaultCipher($serverConf) {
+        // The modern instance is AES-GCM only. The default only decides what is
+        // pre-selected for new packages; the server needs no fallback cipher.
+        if (ovpnConfInstance($serverConf) === 'modern') {
+            $modernText = is_readable($serverConf) ? (string)@file_get_contents($serverConf) : '';
+            if (preg_match('/^# default-cipher[ \t]+([A-Za-z0-9\-]+)/m', $modernText, $mm)
+                && in_array($mm[1], ovpnModernCiphers(), true)) {
+                return $mm[1];
+            }
+            return 'AES-256-GCM';
+        }
         if (is_readable($serverConf)) {
             $content = (string)@file_get_contents($serverConf);
             if (preg_match('/^# default-cipher[ \t]+([A-Za-z0-9\-]+)/m', $content, $m)
@@ -409,6 +943,7 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
     }
 
     function setDefaultCipher($serverConf, $cipher) {
+        if (ovpnConfInstance($serverConf) === 'modern' && !in_array($cipher, ovpnModernCiphers(), true)) { return false; }
         if (!in_array($cipher, ovpnAllowedCiphers(), true)) { return false; }
         if (!is_readable($serverConf) || !is_writable($serverConf)) { return false; }
         $content = (string)file_get_contents($serverConf);
@@ -470,11 +1005,13 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
     function ovpnEnsureStatusSymlink($logDir) {
         $logDir = rtrim((string)$logDir, '/');
         $link   = $logDir . '/openvpn-status.log';
-        if (is_link($link) && @readlink($link) === OVPN_MGR_STATUS_FILE) { return true; }
+        // The logs directory belongs to one instance; each one gets its own tmpfs file.
+        $target = ovpnStatusTmpfsForInstance(ovpnInstanceFromLogDir($logDir));
+        if (is_link($link) && @readlink($link) === $target) { return true; }
         if (!is_dir($logDir) || !is_writable($logDir)) { return false; }
         if (is_dir($link) && !is_link($link)) { return false; }
         if (is_link($link) || file_exists($link)) { @unlink($link); }
-        $ok = @symlink(OVPN_MGR_STATUS_FILE, $link);
+        $ok = @symlink($target, $link);
         if ($ok) {
             @lchown($link, 'asterisk');
             @lchgrp($link, 'asterisk');
@@ -537,6 +1074,13 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
     function syncServerCiphers($serverConf, $pkgDir, array $extraCiphers = []) {
         if (!is_readable($serverConf) || !is_writable($serverConf)) { return false; }
         $original = (string)file_get_contents($serverConf);
+        if (ovpnConfInstance($serverConf) === 'modern') {
+            // Modern instance: GCM only, no fallback/cipher directives at all
+            // (every client it serves negotiates through data-ciphers).
+            $text = ovpnSetServerDirective($original, 'data-ciphers', ovpnModernDataCiphers());
+            if ($text === $original) { return false; }
+            return file_put_contents($serverConf, $text) !== false;
+        }
         $fallback = getDefaultCipher($serverConf);
 
         $text = ovpnSetServerDirective($original, 'data-ciphers', implode(':', ovpnAllowedCiphers()));
@@ -559,23 +1103,32 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
      */
     function buildClientPackage($pkiDir, $pkgDir, $baseDir, $ext, $mac, $serverIp, $port, $cipher = null, $syncServer = true, $includeDataCiphers = false) {
         // No (or an invalid) cipher means "the server's default cipher".
+        $instance = ovpnInstanceFromPki($pkiDir);
         $allowedCiphers = ovpnAllowedCiphers();
-        if (!in_array($cipher, $allowedCiphers, true)) { $cipher = getDefaultCipher("{$baseDir}/legacy-vpn.conf"); }
+        if (!in_array($cipher, $allowedCiphers, true)) { $cipher = getDefaultCipher(ovpnConfPath($baseDir, $instance)); }
+        // The modern instance only negotiates AES-GCM; never build a CBC package for it.
+        if ($instance === 'modern' && ovpnIsCbcCipher($cipher)) { $cipher = 'AES-256-GCM'; }
         if (!file_exists($pkgDir)) {
             @mkdir($pkgDir, 0775, true);
         }
 
+        // Never let a caller-supplied name overwrite the CA / server material.
+        if (ovpnNormalizeExt($ext) !== (string)$ext) { return null; }
+        if ((string)$mac === '' || !preg_match('/^[A-Za-z0-9-]+$/', (string)$mac)) { return null; }
         $clientKey = "{$pkiDir}/private/{$ext}.key";
         $clientCrt = "{$pkiDir}/issued/{$ext}.crt";
         $clientCsr = "{$pkiDir}/{$ext}.csr";
 
         if (!file_exists($clientCrt)) {
-            exec("openssl req -new -nodes -batch -sha1 -newkey rsa:1024 -out " . escapeshellarg($clientCsr) . " -keyout " . escapeshellarg($clientKey) . " -subj " . escapeshellarg("/CN={$ext}/") . " 2>&1");
-            exec("openssl x509 -req -days 3650 -sha1 -in " . escapeshellarg($clientCsr) . " -CA " . escapeshellarg("{$pkiDir}/ca.crt") . " -CAkey " . escapeshellarg("{$pkiDir}/private/ca.key") . " -set_serial " . random_int(100, 99999) . " -out " . escapeshellarg($clientCrt) . " 2>&1");
+            $isModernPki = ($instance === 'modern');
+            $csrAlgo  = $isModernPki ? '-sha256 -newkey rsa:2048' : '-sha1 -newkey rsa:1024';
+            $signAlgo = $isModernPki ? ('-sha256 -extfile ' . escapeshellarg("{$pkiDir}/openssl.cnf") . ' -extensions v3_client') : '-sha1';
+            exec("openssl req -new -nodes -batch {$csrAlgo} -out " . escapeshellarg($clientCsr) . " -keyout " . escapeshellarg($clientKey) . " -subj " . escapeshellarg("/CN={$ext}/") . " 2>&1");
+            exec("openssl x509 -req -days 3650 {$signAlgo} -in " . escapeshellarg($clientCsr) . " -CA " . escapeshellarg("{$pkiDir}/ca.crt") . " -CAkey " . escapeshellarg("{$pkiDir}/private/ca.key") . " -set_serial " . random_int(100, 99999) . " -out " . escapeshellarg($clientCrt) . " 2>&1");
             @unlink($clientCsr);
         }
 
-        $buildDir = "{$baseDir}/build_{$ext}";
+        $buildDir = "{$baseDir}/build" . ($instance === 'modern' ? '-modern' : '') . "_{$ext}";
         $keysSubDir = "{$buildDir}/keys";
         @mkdir($keysSubDir, 0775, true);
 
@@ -654,7 +1207,7 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
             // module's own handlers pass $syncServer=false and sync once
             // themselves (so they can restart only when something changed).
             if ($syncServer) {
-                syncServerCiphers("{$baseDir}/legacy-vpn.conf", $pkgDir, [$cipher]);
+                syncServerCiphers(ovpnConfPath($baseDir, $instance), $pkgDir, [$cipher]);
             }
         } else {
             @unlink($tarPath);
@@ -726,14 +1279,28 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
         @unlink($targetCrt);
         @unlink($targetKey);
 
-        foreach (glob("{$pkgDir}/*_{$revokeExt}_*_ovpn.tar") as $matchingTar) { @unlink($matchingTar); }
-        foreach (glob("{$pkgDir}/*_{$revokeExt}_ovpn.tar") as $matchingTar) { @unlink($matchingTar); }
+        // Both instances share one package directory. An extension can legitimately
+        // exist on both (a phone moved from the legacy to the modern instance keeps
+        // its number), so only remove packages that point at THIS instance's port.
+        $instPort = (string)getActiveServerSettings($serverConf)['port'];
+        $otherPkiDir = dirname($pkiDir) . '/' . (ovpnInstanceFromPki($pkiDir) === 'modern' ? 'legacy_pki' : 'modern_pki');
+        $extOnOtherInstance = is_file("{$otherPkiDir}/issued/{$revokeExt}.crt");
+        $tarGlobs = array_merge(
+            glob("{$pkgDir}/*_{$revokeExt}_*_ovpn.tar") ?: [],
+            glob("{$pkgDir}/*_{$revokeExt}_ovpn.tar") ?: []
+        );
+        foreach ($tarGlobs as $matchingTar) {
+            $tarPort = getPackageRemotePort($matchingTar);
+            // Only when the other instance also has this extension; otherwise behave as before.
+            if ($extOnOtherInstance && $tarPort !== '' && $tarPort !== $instPort) { continue; }
+            @unlink($matchingTar);
+        }
 
         // The CRL only stops NEW handshakes. A tunnel that is already up keeps
         // running (and stays listed as connected) until it renegotiates, so end
         // any live session for this extension now. The cert is already revoked
         // above, so the phone cannot simply reconnect.
-        ovpn_mgr_kill_extension_sessions($revokeExt);
+        ovpn_mgr_kill_extension_sessions($revokeExt, ovpnConfInstance($serverConf));
     }
 
     /**
@@ -743,10 +1310,10 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
      * daemon, missing sudo rule or missing management socket just means there is
      * nothing to kill. Returns the number of sessions it asked OpenVPN to drop.
      */
-    function ovpn_mgr_kill_extension_sessions($ext) {
-        $ext = preg_replace('/[^0-9]/', '', (string)$ext);
+    function ovpn_mgr_kill_extension_sessions($ext, $instance = 'legacy') {
+        $ext = ovpnNormalizeExt($ext);
         if ($ext === '') { return 0; }
-        $ovpnctl = dirname(__DIR__) . '/scripts/ovpnctl';
+        $ovpnctl = ovpnctlPathForInstance(dirname(__DIR__) . '/scripts', $instance);
         if (!file_exists($ovpnctl)) { return 0; }
 
         $out = []; $rc = 0;
@@ -778,9 +1345,10 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
      * the installed OpenVPN version.
      */
     function startOpenVpnServer($ovpnctl, $serverConf, $baseDir, $serverKey) {
-        $logDir = "{$baseDir}/logs";
+        $instance = ovpnConfInstance($serverConf);
+        $logDir = ovpnLogDir($baseDir, $instance);
         $logFile = "{$logDir}/openvpn.log";
-        $pkiDir = "{$baseDir}/legacy_pki";
+        $pkiDir = ovpnPkiDir($baseDir, $instance);
         $crlFile = "{$pkiDir}/crl.pem";
 
         if (!file_exists($logDir)) {
@@ -894,7 +1462,7 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
             // session list instead of the log) and the "Kill Connection"
             // button (issues client-kill over this socket).
             $cleanContent = ovpnSetServerDirective($cleanContent, 'status-version', '3');
-            $cleanContent = ovpnSetServerDirective($cleanContent, 'management', '/run/ovpn_mgr/mgmt.sock unix');
+            $cleanContent = ovpnSetServerDirective($cleanContent, 'management', ovpnMgmtSocketForInstance($instance) . ' unix');
             $cleanContent = ovpnSetServerDirective($cleanContent, 'management-client-user', 'asterisk');
             // Daily TLS renegotiation (2.70); existing installs converge on every start.
             $cleanContent = ovpnApplyRenegDirectives($cleanContent);
@@ -912,7 +1480,7 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
             // Route to the PBX's LAN address: pushed per client (ccd files),
             // not globally, so phones on the PBX's own LAN and remote phones
             // can share one server. See ovpnPrepareRoutePolicy().
-            $routePolicy = ovpnPrepareRoutePolicy($cleanContent, "{$baseDir}/ccd");
+            $routePolicy = ovpnPrepareRoutePolicy($cleanContent, ovpnCcdDir($baseDir, $instance));
             $cleanContent = $routePolicy['text'];
             @file_put_contents($serverConf, $cleanContent);
             if ($routePolicy['lan_ip'] !== '') {
@@ -927,6 +1495,9 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
         // Status file on tmpfs (2.70): re-create the symlink if anything removed it,
         // otherwise OpenVPN would silently go back to rewriting a file on disk.
         ovpnEnsureStatusSymlink($logDir);
+
+        // What this daemon is about to load; the page compares the config against it (restart-needed notice).
+        ovpnWriteLoadedConfSnapshot($baseDir, ovpnConfInstance($serverConf), $serverConf);
 
         exec('sudo -n ' . escapeshellarg($ovpnctl) . ' start 2>&1', $output, $returnCode);
         if ($returnCode !== 0 && !empty($output)) {
@@ -947,22 +1518,69 @@ if (!defined('OVPN_MGR_CLIENT_OPS_LOADED')) {
      */
     function revokeExtensionAndRestart($paths, $revokeExt) {
         revokeExtension($paths['pkiDir'], $paths['serverConf'], $paths['crlFile'], $paths['pkgDir'], $revokeExt);
-        if (!file_exists("{$paths['baseDir']}/.stopped")) {
+        if (!file_exists(ovpnStateFile($paths['baseDir'], $paths['instance'] ?? 'legacy', '.stopped'))) {
             stopOpenVpnServer($paths['ovpnctl']);
             startOpenVpnServer($paths['ovpnctl'], $paths['serverConf'], $paths['baseDir'], $paths['serverKey']);
         }
     }
 
     /**
+     * Identifiers that may never be used as an extension / certificate name:
+     * they are the names of the CA and server files in the PKI, and
+     * buildClientPackage() writes <name>.key / <name>.crt there.
+     */
+    function ovpnReservedNames() {
+        return ['ca', 'server', 'dh', 'ta', 'crl', 'index', 'serial', 'crlnumber', 'private', 'issued', 'reqs', 'revoked', 'certs', 'inline'];
+    }
+
+    /**
+     * Normalizes the Extension field. Anything is accepted - a number, a
+     * name, or just "-" - as long as it can be used safely as a certificate
+     * CN, a file name and a ccd file name: letters, digits and "-" only
+     * (spaces, "_", "." and other characters become "-"; "_" is the
+     * separator in package file names). Returns '' if nothing usable is
+     * left, or if the result is a reserved PKI name.
+     */
+    function ovpnNormalizeExt($raw) {
+        $v = trim((string)$raw);
+        $v = preg_replace('/[^A-Za-z0-9-]+/', '-', $v);
+        $v = substr($v, 0, 64);
+        if ($v === '' || in_array(strtolower($v), ovpnReservedNames(), true)) { return ''; }
+        return $v;
+    }
+
+    /**
+     * Normalizes the MAC field. A real MAC address (12 hex digits, with or
+     * without ":" "-" "." separators) becomes lowercase hex, exactly as
+     * before. Anything else is kept as a label (e.g. "MasterKey") with the
+     * same character rules as ovpnNormalizeExt(), case preserved.
+     * Returns '' if nothing usable is left.
+     */
+    function ovpnNormalizeMac($raw) {
+        $v = trim((string)$raw);
+        $bare = preg_replace('/[:.\-\s]/', '', $v);
+        if (preg_match('/^[0-9a-fA-F]{12}$/', $bare)) { return strtolower($bare); }
+        // Previously any run of hex digits was accepted and lowercased.
+        if (preg_match('/^[0-9a-fA-F]+$/', $bare) && !preg_match('/[^0-9a-fA-F:.\-\s]/', $v)) { return strtolower($bare); }
+        $v = preg_replace('/[^A-Za-z0-9-]+/', '-', $v);
+        return substr($v, 0, 64);
+    }
+
+    /**
      * Extracts [mac, ext] from a generated client package filename
      * (<mac>_<ext>_ovpn.tar or the older <mac>_<ext>_<8hex>_ovpn.tar).
-     * Returns null for anything else.
+     * mac and ext may be any letters/digits/"-" (see ovpnNormalizeMac /
+     * ovpnNormalizeExt); neither can contain "_". With $allowKeys the
+     * legacy *_keys.tar suffix is accepted too. Returns null otherwise.
      */
-    function ovpnParsePackageName($filename) {
+    function ovpnParsePackageName($filename, $allowKeys = false) {
         $filename = basename((string)$filename);
-        if (preg_match('/^([a-f0-9]+)_(\d+)_[a-f0-9]{8}_ovpn\.tar$/i', $filename, $m)
-            || preg_match('/^([a-f0-9]+)_(\d+)_ovpn\.tar$/i', $filename, $m)) {
-            return ['mac' => strtolower($m[1]), 'ext' => $m[2]];
+        $suffix = $allowKeys ? '(?:ovpn|keys)' : 'ovpn';
+        if (preg_match('/^([A-Za-z0-9-]+)_([A-Za-z0-9-]+)_[a-f0-9]{8}_' . $suffix . '\.tar$/i', $filename, $m)
+            || preg_match('/^([A-Za-z0-9-]+)_([A-Za-z0-9-]+)_' . $suffix . '\.tar$/i', $filename, $m)) {
+            $mac = $m[1];
+            if (preg_match('/^[0-9a-f]{12}$/i', $mac)) { $mac = strtolower($mac); }
+            return ['mac' => $mac, 'ext' => $m[2]];
         }
         return null;
     }

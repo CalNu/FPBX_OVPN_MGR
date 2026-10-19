@@ -36,7 +36,10 @@ $target = ['net' => $networkIp, 'mask' => (string)$prefix];
 // Remember only the exact entry this module previously inserted, so subnet
 // changes can remove that stale entry without deleting administrator networks.
 $stateDir = '/etc/ovpn_mgr';
-$stateFile = $stateDir . '/sip-localnet-managed.json';
+// One state file per OpenVPN instance, or syncing the modern pool would treat the
+// legacy pool as its own stale entry and remove it.
+$stateSuffix = (basename($conf) === 'modern-vpn.conf') ? '-modern' : '';
+$stateFile = $stateDir . '/sip-localnet-managed' . $stateSuffix . '.json';
 $previousManaged = null;
 if (is_readable($stateFile)) {
     $state = json_decode((string)file_get_contents($stateFile), true);

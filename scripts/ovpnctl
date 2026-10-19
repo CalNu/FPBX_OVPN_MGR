@@ -16,6 +16,22 @@
 
 set -euo pipefail
 
+# --- Instance selection ---------------------------------------------------
+# The module runs up to two independent OpenVPN daemons: "legacy" (the
+# original one: RSA-1024/SHA-1 PKI, AES-CBC, for old phone firmware) and
+# "modern" (RSA-2048/SHA-256 PKI, AES-GCM, TLS 1.2+). Every subcommand works
+# on one of them. The instance is an optional LAST argument ("start modern",
+# "kill-client 7 modern"); without it the legacy daemon is addressed, exactly
+# as before. scripts/ovpnctl-modern is a two-line shim that appends "modern"
+# so callers that only know a script path need no changes.
+INSTANCE="legacy"
+if [ "$#" -ge 2 ]; then
+  _last="${!#}"
+  case "$_last" in
+    modern|legacy) INSTANCE="$_last"; set -- "${@:1:$(($#-1))}" ;;
+  esac
+fi
+
 # --- Locate ourselves and the FreePBX web root without hardcoding it ---
 # This script lives at <AMPWEBROOT>/admin/modules/ovpn_mgr/scripts/ovpnctl
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,31 +50,46 @@ if [ -L "$PHONE_SETTINGS_DIR" ]; then
     echo "Refusing to use symlinked $PHONE_SETTINGS_DIR; OpenVPN data must stay outside /tftpboot." >&2
     exit 1
 fi
+# One base directory for both instances; only the file names differ.
 BASE_DIR="${PHONE_SETTINGS_DIR}/openvpn"
 if [ -d /tftpboot/openvpn ] && [ ! -d "$BASE_DIR" ]; then
     echo "Legacy VPN data found at /tftpboot/openvpn; migrate it to $BASE_DIR before starting OpenVPN." >&2
     exit 1
 fi
-CONF="${BASE_DIR}/legacy-vpn.conf"
-LOG_DIR="${BASE_DIR}/logs"
+if [ "$INSTANCE" = "modern" ]; then
+    CONF="${BASE_DIR}/modern-vpn.conf"
+    LOG_DIR="${BASE_DIR}/logs-modern"
+    PID_FILE="${BASE_DIR}/openvpn-modern.pid"
+    FILE_SFX="-modern"      # state files, socket, systemd unit
+    MARK_SFX="_MODERN"      # iptables comment marks
+    TUN_DEV="tun1"          # modern-vpn.conf pins "dev tun1"
+else
+    CONF="${BASE_DIR}/legacy-vpn.conf"
+    LOG_DIR="${BASE_DIR}/logs-legacy"
+    PID_FILE="${BASE_DIR}/openvpn.pid"
+    FILE_SFX=""
+    MARK_SFX=""
+    TUN_DEV="tun0"
+fi
 LOG_FILE="${LOG_DIR}/openvpn.log"
 STATUS_FILE="${LOG_DIR}/openvpn-status.log"
-PID_FILE="${BASE_DIR}/openvpn.pid"
 
 STATE_DIR="/etc/ovpn_mgr"
-NAT_STATE_FILE="${STATE_DIR}/nat-state"
-NAT_MARK="OVPN_MGR_NAT"
-PORT_STATE_FILE="${STATE_DIR}/port-state"
-PORT_MARK="OVPN_MGR_PORT"
-TRUST_STATE_FILE="${STATE_DIR}/trust-state"
-TRUST_MARK="OVPN_MGR_TRUST"
+NAT_STATE_FILE="${STATE_DIR}/nat-state${FILE_SFX}"
+NAT_MARK="OVPN_MGR_NAT${MARK_SFX}"
+PORT_STATE_FILE="${STATE_DIR}/port-state${FILE_SFX}"
+PORT_MARK="OVPN_MGR_PORT${MARK_SFX}"
+TRUST_STATE_FILE="${STATE_DIR}/trust-state${FILE_SFX}"
+TRUST_MARK="OVPN_MGR_TRUST${MARK_SFX}"
+LAN_NAT_MARK="OVPN_MGR_LANTUN${MARK_SFX}"   # LAN -> this tunnel masquerade (see ensure_lan_nat)
+LAN_ACCESS_FILE="${STATE_DIR}/lan-access"      # extra source networks allowed into the tunnels (one per line, shared by both instances)
 
 # Must match the "management ... unix" path legacy-vpn.conf declares
 # (written by install.php / reconciled by startOpenVpnServer() in
 # lib/client_ops.php). Under /run (tmpfs) rather than $BASE_DIR so it
 # never ends up somewhere web-served, and so it's naturally gone after a
 # reboot instead of pointing at a dead socket from the prior boot.
-MGMT_SOCK="/run/ovpn_mgr/mgmt.sock"
+MGMT_SOCK="/run/ovpn_mgr/mgmt${FILE_SFX}.sock"
 
 is_port()   { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 is_cidr()   { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; }
@@ -75,6 +106,7 @@ find_bin() {
 
 OPENVPN_BIN="$(find_bin openvpn /usr/sbin/openvpn /usr/local/sbin/openvpn)"
 IPTABLES_BIN="$(find_bin iptables /sbin/iptables /usr/sbin/iptables)"
+IP_BIN="$(find_bin ip /sbin/ip /usr/sbin/ip /bin/ip /usr/bin/ip)"
 
 # OpenSSL 1.1 vs 3.x need different handling: SECLEVEL/provider syntax is
 # OpenSSL-3-only and OpenVPN will refuse to start with those directives
@@ -94,8 +126,106 @@ find_openssl_cnf() {
 }
 
 # --- Daemon lifecycle helpers -------------------------------------------
-OVPN_UNIT="ovpn-mgr-openvpn.service"
+OVPN_UNIT="ovpn-mgr-openvpn${FILE_SFX}.service"
 OVPN_UNIT_FILE="/etc/systemd/system/${OVPN_UNIT}"
+
+# Prints a server config's VPN pool ("server 10.3.0.0 255.255.255.0") as a
+# CIDR (10.3.0.0/24); fails if the file or the directive is missing/odd.
+conf_server_cidr() {
+    local f="$1" net mask a b c d bits=0 oct
+    [ -r "$f" ] || return 1
+    read -r net mask < <(awk '$1=="server" && $2 ~ /^[0-9.]+$/ {print $2, $3; exit}' "$f") || return 1
+    [ -n "${net:-}" ] && [ -n "${mask:-}" ] || return 1
+    IFS=. read -r a b c d <<< "$mask"
+    for oct in "$a" "$b" "$c" "$d"; do
+      case "$oct" in
+        255) bits=$((bits + 8)) ;; 254) bits=$((bits + 7)) ;; 252) bits=$((bits + 6)) ;;
+        248) bits=$((bits + 5)) ;; 240) bits=$((bits + 4)) ;; 224) bits=$((bits + 3)) ;;
+        192) bits=$((bits + 2)) ;; 128) bits=$((bits + 1)) ;; 0) ;; *) return 1 ;;
+      esac
+    done
+    is_cidr "${net}/${bits}" || return 1
+    echo "${net}/${bits}"
+}
+
+# Validates one source address or network and prints it normalised
+# (a.b.c.d/nn). A bare address becomes /32. Prefixes shorter than /8, and
+# 0.x, 127.x and multicast/reserved first octets, are rejected.
+norm_src_net() {
+    local v="$1" o ip pfx
+    [[ "$v" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/([0-9]{1,2}))?$ ]] || return 1
+    for o in 1 2 3 4; do
+      [ "${BASH_REMATCH[$o]}" -le 255 ] || return 1
+    done
+    pfx="${BASH_REMATCH[6]:-32}"
+    [ "$pfx" -ge 8 ] && [ "$pfx" -le 32 ] || return 1
+    ip="$((10#${BASH_REMATCH[1]})).$((10#${BASH_REMATCH[2]})).$((10#${BASH_REMATCH[3]})).$((10#${BASH_REMATCH[4]}))"
+    o=$((10#${BASH_REMATCH[1]}))
+    [ "$o" -ne 0 ] && [ "$o" -ne 127 ] && [ "$o" -lt 224 ] || return 1
+    echo "${ip}/${pfx}"
+}
+
+# Lets other networks reach the phones' tunnel addresses. A host's packet is
+# forwarded into the tunnel still carrying its own source address (a PC on the
+# PBX's LAN such as 192.168.0.107, or a PC arriving over another VPN such as
+# 10.2.0.10); a phone at another site has no route back to that, so its replies
+# never return. Masquerading those sources as they enter this instance's
+# tunnel makes the phone see the PBX (10.x.0.1) and answer through the tunnel.
+#
+# Sources masqueraded: the PBX's own LAN (the connected subnet of the
+# default-route interface, always), the other server's VPN pool (always), plus
+# every network in $LAN_ACCESS_FILE (the "VPN Access" list in the GUI, written
+# by lan-access-sync).
+#
+# Touches only forwarded traffic: "! --src-type LOCAL" leaves everything the
+# PBX itself sends (source 192.168.0.3, e.g. replies to a phone provisioning
+# against the LAN address, SIP, NTP) exactly as it is, and traffic a phone sends
+# TO the PBX never passes through POSTROUTING at all.
+#
+# Idempotent: removes every rule carrying this module's mark first, so repeated
+# calls neither stack duplicates nor leave a stale network behind. Best effort -
+# any failure just skips the rule.
+ensure_lan_nat() {
+    [ -n "$IPTABLES_BIN" ] || return 0
+    local dev lan rule src
+    local -a parts
+    local -a srcs=()
+
+    if [ -n "$IP_BIN" ]; then
+      dev="$("$IP_BIN" -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+      if is_iface "$dev"; then
+        lan="$("$IP_BIN" -4 -o route show dev "$dev" proto kernel scope link 2>/dev/null | awk '{print $1; exit}')"
+        if is_cidr "$lan"; then srcs+=("$lan"); fi
+      fi
+    fi
+    # The other server's VPN pool, always: computers connected to the Legacy server reach
+    # the Modern server's clients and the other way round without being listed in the GUI.
+    for src in "${BASE_DIR}/modern-vpn.conf" "${BASE_DIR}/legacy-vpn.conf"; do
+      [ "$src" != "$CONF" ] || continue
+      src="$(conf_server_cidr "$src")" || continue
+      case " ${srcs[*]:-} " in *" ${src} "*) continue ;; esac
+      srcs+=("$src")
+    done
+    if [ -r "$LAN_ACCESS_FILE" ]; then
+      while read -r src; do
+        src="$(norm_src_net "$src")" || continue
+        case " ${srcs[*]:-} " in *" ${src} "*) continue ;; esac
+        srcs+=("$src")
+      done < "$LAN_ACCESS_FILE"
+    fi
+
+    while rule="$("$IPTABLES_BIN" -t nat -S POSTROUTING 2>/dev/null | grep -m1 -- "--comment ${LAN_NAT_MARK}\( \|\$\)")" && [ -n "$rule" ]; do
+      read -ra parts <<< "${rule/-A /-D }"
+      "$IPTABLES_BIN" -t nat "${parts[@]}" 2>/dev/null || break
+    done
+    if [ "${#srcs[@]}" -gt 0 ]; then
+      for src in "${srcs[@]}"; do
+        "$IPTABLES_BIN" -t nat -I POSTROUTING 1 -s "$src" -o "$TUN_DEV" \
+          -m addrtype ! --src-type LOCAL -m comment --comment "$LAN_NAT_MARK" -j MASQUERADE 2>/dev/null || true
+      done
+    fi
+    return 0
+}
 
 # Is an openvpn process using our config alive? (matched by --config, not
 # the pidfile, which can be stale or missing.)
@@ -157,10 +287,10 @@ ensure_fw_rules() {
   port="$(awk '$1=="port" && $2 ~ /^[0-9]+$/ {print $2; exit}' "$CONF")"
   read -r net mask <<< "$(awk '$1=="server" && $2 ~ /^[0-9.]+$/ {print $2, $3; exit}' "$CONF")"
   if is_port "${port:-}"; then
-    bash "${BASH_SOURCE[0]}" port-sync "$port" || echo "port-sync failed" >&2
+    bash "${BASH_SOURCE[0]}" port-sync "$port" "$INSTANCE" || echo "port-sync failed" >&2
   fi
   if [ -n "${net:-}" ] && [ -n "${mask:-}" ] && bits="$(mask_bits "$mask")"; then
-    bash "${BASH_SOURCE[0]}" trust-sync "${net}/${bits}" || echo "trust-sync failed" >&2
+    bash "${BASH_SOURCE[0]}" trust-sync "${net}/${bits}" "$INSTANCE" || echo "trust-sync failed" >&2
   fi
 }
 
@@ -168,6 +298,9 @@ start_daemon() {
     [ -n "$OPENVPN_BIN" ] || { echo "openvpn binary not found" >&2; exit 1; }
     mkdir -p "$LOG_DIR"
     touch "$LOG_FILE"
+
+    # LAN hosts reaching the phones through this tunnel (re-applied on every start, so it also survives reboots).
+    ensure_lan_nat
 
     # Pre-flight: OpenVPN cannot start without /dev/net/tun. Load/create it if
     # it is genuinely missing (fresh VM/container images often ship without it
@@ -215,7 +348,9 @@ start_daemon() {
     chown root:asterisk "$(dirname "$MGMT_SOCK")" 2>/dev/null || true
     chmod 750 "$(dirname "$MGMT_SOCK")" 2>/dev/null || true
 
-    if [ "$(openssl_major_version)" -ge 3 ]; then
+    # The relaxed OpenSSL security level (and the legacy provider) exist so old
+    # phones can connect; the modern instance never gets them.
+    if [ "$INSTANCE" = "legacy" ] && [ "$(openssl_major_version)" -ge 3 ]; then
       openssl_cnf="$(find_openssl_cnf)"
       OPENSSL_CONF="$openssl_cnf" OPENSSL_CIPHER_LIST="DEFAULT:@SECLEVEL=0" \
         "$OPENVPN_BIN" --config "$CONF" \
@@ -309,7 +444,7 @@ stop_daemon() {
     # in place to keep the root:asterisk 0640 ownership; the daemon rewrites
     # it on the next start.)
     if [ -f "$STATUS_FILE" ]; then : > "$STATUS_FILE" 2>/dev/null || true; fi
-    ip link delete tun0 2>/dev/null || true
+    ip link delete "$TUN_DEV" 2>/dev/null || true
 }
 
 cmd="${1:-}"
@@ -319,6 +454,22 @@ case "$cmd" in
 
   check)
     echo "ovpnctl ok"
+    ;;
+
+  paths)
+    # Read-only: which files/unit/socket this invocation resolved to.
+    echo "instance=${INSTANCE}"
+    echo "conf=${CONF}"
+    echo "base=${BASE_DIR}"
+    echo "log=${LOG_FILE}"
+    echo "status=${STATUS_FILE}"
+    echo "pid=${PID_FILE}"
+    echo "mgmt=${MGMT_SOCK}"
+    echo "unit=${OVPN_UNIT}"
+    echo "tun=${TUN_DEV}"
+    echo "nat_mark=${NAT_MARK}"
+    echo "port_mark=${PORT_MARK}"
+    echo "trust_mark=${TRUST_MARK}"
     ;;
 
   status)
@@ -457,6 +608,35 @@ case "$cmd" in
     "$FWC" firewall restart
     ;;
 
+  fw-iface-desc)
+    # fw-iface-desc <tunN> <text>
+    # Sets the description FreePBX Firewall shows for a tunnel interface (Firewall > Interfaces).
+    # Firewall keeps interface zone + description in a JSON file only root can rewrite (the GUI never
+    # saves tun interfaces itself). Only tunN names and a short plain-text label are accepted, and the
+    # file's owner and mode are kept.
+    iface="${1:?missing interface}"
+    text="${2:?missing text}"
+    [[ "$iface" =~ ^tun[0-9]{1,3}$ ]] || { echo "invalid interface" >&2; exit 1; }
+    [[ "$text" =~ ^[A-Za-z0-9\ ._/\(\)+,:-]{1,80}$ ]] || { echo "invalid text" >&2; exit 1; }
+    IFACE_JSON="/var/spool/asterisk/firewall/interface-zones.json"
+    [ -f "$IFACE_JSON" ] || { echo "FreePBX Firewall interface file not found" >&2; exit 1; }
+    PHP_BIN="$(find_bin php /usr/bin/php /usr/local/bin/php)"
+    [ -n "$PHP_BIN" ] || { echo "php not found" >&2; exit 1; }
+    TMP_JSON="$(mktemp "${IFACE_JSON}.XXXXXX")"
+    "$PHP_BIN" -r '
+      $d = json_decode((string)file_get_contents($argv[1]), true);
+      if (!is_array($d)) { $d = []; }
+      $e = (isset($d[$argv[2]]) && is_array($d[$argv[2]])) ? $d[$argv[2]] : [];
+      if (empty($e["ZONE"])) { $e["ZONE"] = "internal"; }
+      $e["DESCRIPTION"] = $argv[3];
+      $d[$argv[2]] = $e;
+      file_put_contents($argv[4], json_encode($d));
+    ' "$IFACE_JSON" "$iface" "$text" "$TMP_JSON"
+    chown --reference="$IFACE_JSON" "$TMP_JSON"
+    chmod --reference="$IFACE_JSON" "$TMP_JSON"
+    mv -f "$TMP_JSON" "$IFACE_JSON"
+    ;;
+
   fw-trusted)
     # fw-trusted <add|del> <cidr|tun+>
     action="${1:?missing action}"
@@ -537,6 +717,18 @@ case "$cmd" in
     exec "$PHP_BIN" "$HELPER" "$CONF"
     ;;
 
+  fw-register)
+    # Registers every instance with FreePBX Firewall (custom service for its port, its subnet in the
+    # Trusted zone with a description, a description for its tunnel interface) and restarts the
+    # firewall once if anything was added. Fixed operation, no arguments; run by setup-root.sh.
+    PHP_BIN="$(find_bin php /usr/bin/php /usr/local/bin/php)"
+    [ -n "$PHP_BIN" ] || { echo "php binary not found" >&2; exit 1; }
+    HELPER="${MODULE_DIR}/scripts/fw-register.php"
+    [ -f "$HELPER" ] || { echo "Missing firewall helper: $HELPER" >&2; exit 1; }
+    [ -d "${AMPWEBROOT}/admin/modules/firewall" ] || { echo "FreePBX Firewall module not present; nothing to do."; exit 0; }
+    exec "$PHP_BIN" "$HELPER"
+    ;;
+
   kill-client)
     # kill-client <client_id>
     # Ends exactly one connected session immediately via OpenVPN's local
@@ -569,8 +761,35 @@ case "$cmd" in
     fi
     ;;
 
+  lan-access-sync)
+    # lan-access-sync [address-or-network ...]
+    # Replaces the list of extra source networks allowed into the VPN tunnels
+    # (the GUI's "VPN Access" popup) and applies it to this instance now. The
+    # GUI calls it once per instance with the same list. Each entry is
+    # re-validated here: this runs as root.
+    entries=()
+    n=0
+    for a in "$@"; do
+      [ -n "$a" ] || continue
+      n=$((n + 1))
+      [ "$n" -le 64 ] || { echo "too many entries (max 64)" >&2; exit 1; }
+      v="$(norm_src_net "$a")" || { echo "invalid entry: $a" >&2; exit 1; }
+      entries+=("$v")
+    done
+    mkdir -p "$STATE_DIR"
+    chmod a+rx "$STATE_DIR" 2>/dev/null || true
+    tmp="$(mktemp "${STATE_DIR}/lan-access.XXXXXX")"
+    : > "$tmp"
+    if [ "${#entries[@]}" -gt 0 ]; then printf '%s\n' "${entries[@]}" > "$tmp"; fi
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$LAN_ACCESS_FILE"
+    ensure_lan_nat
+    echo "LAN_ACCESS_OK"
+    ;;
+
   nat-restore)
     # Run at boot by ovpn-mgr-nat.service. No-op if nothing was ever saved.
+    ensure_lan_nat
     [ -f "$NAT_STATE_FILE" ] || exit 0
     [ -n "$IPTABLES_BIN" ] || exit 0
     read -r cidr iface < "$NAT_STATE_FILE"
@@ -581,7 +800,7 @@ case "$cmd" in
     ;;
 
   *)
-    echo "usage: ovpnctl {check|status|start|stop|start-daemon|stop-daemon|ipforward-on|nat-sync|nat-restore|port-sync|port-restore|fw-ensure|fw-available|fw-restart|fw-trusted|trust-sync|sip-localnet-sync|kill-client}" >&2
+    echo "usage: ovpnctl {check|paths|status|start|stop|start-daemon|stop-daemon|ipforward-on|nat-sync|nat-restore|lan-access-sync|port-sync|port-restore|fw-ensure|fw-available|fw-restart|fw-trusted|fw-iface-desc|fw-register|trust-sync|sip-localnet-sync|kill-client} [modern|legacy]" >&2
     exit 1
     ;;
 esac

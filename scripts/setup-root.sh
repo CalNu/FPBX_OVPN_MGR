@@ -49,6 +49,12 @@ SUDOERS_FILE="/etc/sudoers.d/ovpn_mgr"
 STATE_DIR="/etc/ovpn_mgr"
 UNIT_FILE="/etc/systemd/system/ovpn-mgr-nat.service"
 OPENVPN_UNIT_FILE="/etc/systemd/system/ovpn-mgr-openvpn.service"
+# Second ("modern") OpenVPN instance: its own unit, and a root-owned shim
+# that runs ovpnctl against it. The shim lives OUTSIDE the module directory
+# on purpose: the module directory is writable by the web user, a sudo-able
+# script there would be a root escalation. /usr/local/sbin is root-only.
+MODERN_UNIT_FILE="/etc/systemd/system/ovpn-mgr-openvpn-modern.service"
+MODERN_SHIM="/usr/local/sbin/ovpn_mgr-ctl-modern"
 FIXPERMS_UNIT_FILE="/etc/systemd/system/ovpn-mgr-fixperms.service"
 FIXPERMS_WATCH_UNIT_FILE="/etc/systemd/system/ovpn-mgr-fixperms-watch.service"
 FIXPERMS_PATH_UNIT_FILE="/etc/systemd/system/ovpn-mgr-fixperms.path"
@@ -67,6 +73,7 @@ if [ -L "$PHONE_SETTINGS_DIR" ]; then
     exit 1
 fi
 VPN_DATA_DIR="${PHONE_SETTINGS_DIR}/openvpn"
+MODERN_CONF="${VPN_DATA_DIR}/modern-vpn.conf"
 if [ -d /tftpboot/openvpn ] && [ ! -d "$VPN_DATA_DIR" ]; then
     echo "Legacy VPN data found at /tftpboot/openvpn; migrate it to $VPN_DATA_DIR before setup." >&2
     exit 1
@@ -146,9 +153,22 @@ echo "==> Registered ${WRAPPER} with fwconsole chown (${CHOWN_CONF})"
 chown root:asterisk "$WRAPPER"
 chmod 750 "$WRAPPER"
 
-# --- 2. Sudoers rule, scoped to exactly this one script ---
+# --- 1b. Root-owned shim for the modern OpenVPN instance ---
+# ovpnctl addresses an instance through an optional last argument. The shim
+# fixes that argument to "modern", so the web GUI can drive the second daemon
+# through a plain script path.
+mkdir -p "$(dirname "$MODERN_SHIM")"
+cat > "$MODERN_SHIM" <<SHIM_EOF
+#!/bin/bash
+exec "${WRAPPER}" "\$@" modern
+SHIM_EOF
+chown root:asterisk "$MODERN_SHIM"
+chmod 750 "$MODERN_SHIM"
+echo "==> Installed ${MODERN_SHIM} (root:asterisk 0750)"
+
+# --- 2. Sudoers rule, scoped to exactly these two scripts ---
 TMP_SUDOERS="$(mktemp)"
-echo "asterisk ALL=(root) NOPASSWD: ${WRAPPER}" > "$TMP_SUDOERS"
+echo "asterisk ALL=(root) NOPASSWD: ${WRAPPER}, ${MODERN_SHIM}" > "$TMP_SUDOERS"
 
 if ! visudo -cf "$TMP_SUDOERS" >/dev/null 2>&1; then
     echo "Generated sudoers rule failed validation, aborting." >&2
@@ -214,6 +234,26 @@ else
     echo "Fail2Ban not detected; skipping VPN subnet whitelist."
 fi
 
+# --- 3a. Same whitelist for the modern instance's pool (if it exists) ---
+if [ -f "$MODERN_CONF" ] && command -v php >/dev/null 2>&1 && command -v fail2ban-client >/dev/null 2>&1; then
+    F2B_LOCAL="/etc/fail2ban/jail.local"
+    F2B_SNAP_M="$(mktemp)"
+    F2B_HAD_M=0
+    if [ -f "$F2B_LOCAL" ]; then F2B_HAD_M=1; cp -p "$F2B_LOCAL" "$F2B_SNAP_M"; fi
+    if php "$FAIL2BAN_HELPER" "$MODERN_CONF" "$F2B_LOCAL" >/dev/null 2>&1; then
+        if fail2ban-client -t >/dev/null 2>&1; then
+            systemctl is-active --quiet fail2ban 2>/dev/null && { fail2ban-client reload >/dev/null 2>&1 || true; }
+            echo "Whitelisted the modern VPN pool in Fail2Ban."
+        else
+            if [ "$F2B_HAD_M" -eq 1 ]; then cp -p "$F2B_SNAP_M" "$F2B_LOCAL"; else rm -f "$F2B_LOCAL"; fi
+            echo "WARNING: Fail2Ban config test failed; the modern pool whitelist was rolled back." >&2
+        fi
+    else
+        echo "WARNING: could not add the modern VPN pool to the Fail2Ban whitelist." >&2
+    fi
+    rm -f "$F2B_SNAP_M"
+fi
+
 # --- 3b. Add the OpenVPN pool to FreePBX SIP Settings NAT Local Networks ---
 # This is the supported Sipsettings BMO/KVStore setting, not a direct edit to
 # generated sip.conf/pjsip.conf. The helper preserves existing Local Networks.
@@ -244,6 +284,16 @@ if [ -f "$OPENVPN_CONF" ] && [ -f "$SIP_LOCALNET_HELPER" ] && command -v php >/d
     fi
 else
     echo "WARNING: OpenVPN config or SIP Local Networks helper unavailable; skipping FreePBX SIP Settings sync." >&2
+fi
+
+# --- 3b2. Same SIP Local Networks entry for the modern instance's pool ---
+if [ -f "$MODERN_CONF" ] && [ -f "$SIP_LOCALNET_HELPER" ] && command -v php >/dev/null 2>&1; then
+    SIP_M_OUT="$(php "$SIP_LOCALNET_HELPER" "$MODERN_CONF" 2>&1)" || true
+    if printf '%s\n' "$SIP_M_OUT" | grep -qx 'SIP_LOCALNET_SYNC_OK'; then
+        echo "Synced the modern VPN pool into FreePBX SIP Settings Local Networks."
+    else
+        echo "WARNING: Could not confirm the modern VPN pool was synced into SIP Settings Local Networks: ${SIP_M_OUT}" >&2
+    fi
 fi
 
 # --- 3c. Grant 'asterisk' read access to the web server's access log -------
@@ -383,6 +433,8 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=${WRAPPER} nat-restore
 ExecStart=${WRAPPER} port-restore
+ExecStart=${WRAPPER} nat-restore modern
+ExecStart=${WRAPPER} port-restore modern
 RemainAfterExit=no
 
 [Install]
@@ -424,6 +476,29 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
     chmod 644 "$UNIT_FILE" "$OPENVPN_UNIT_FILE"
+    # Second daemon, same shape: only the pid file and the instance argument differ.
+    cat > "$MODERN_UNIT_FILE" <<EOF
+[Unit]
+Description=ovpn_mgr OpenVPN server (modern instance)
+After=network-online.target ovpn-mgr-nat.service
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=forking
+PIDFile=${VPN_DATA_DIR}/openvpn-modern.pid
+ExecStart=${WRAPPER} start-daemon modern
+ExecStop=${WRAPPER} stop-daemon modern
+TimeoutStartSec=30
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$MODERN_UNIT_FILE"
     if [ "$OLD_OVPN_UNIT_SUM" = "$(cksum < "$OPENVPN_UNIT_FILE")" ]; then
         OVPN_UNIT_CHANGED=0
     fi
@@ -432,6 +507,9 @@ EOF
     systemctl enable ovpn-mgr-fixperms.path >/dev/null 2>&1 || true
     systemctl enable ovpn-mgr-nat.service >/dev/null 2>&1 || true
     systemctl enable ovpn-mgr-openvpn.service >/dev/null 2>&1 || true
+    if [ -f "$MODERN_CONF" ]; then
+        systemctl enable ovpn-mgr-openvpn-modern.service >/dev/null 2>&1 || true
+    fi
     # Perms first, then NAT restored after network/firewall setup, then OpenVPN starts.
     if ! systemctl restart ovpn-mgr-fixperms.service; then
         echo "WARNING: ovpn-mgr-fixperms.service failed; ${WRAPPER} may not be root:asterisk 0750. Inspect: systemctl status ovpn-mgr-fixperms.service" >&2
@@ -445,7 +523,7 @@ EOF
 fi
 
 # --- Directory ownership for module-managed files ---
-mkdir -p "${VPN_DATA_DIR}/logs" 2>/dev/null || true
+mkdir -p "${VPN_DATA_DIR}/logs-legacy" 2>/dev/null || true
 chown -R asterisk:asterisk "${VPN_DATA_DIR}" 2>/dev/null || true
 
 # --- Start/restart OpenVPN under systemd so it also starts after reboot ---
@@ -477,7 +555,30 @@ else
     "$WRAPPER" start || echo "    (start reported an error - check the module's log for details)"
 fi
 
+# --- Modern instance: run it under its own unit (once install has created it) ---
+if [ -f "$MODERN_CONF" ] && command -v systemctl >/dev/null 2>&1; then
+    echo "==> Enabling the modern OpenVPN instance (udp/$(awk '$1=="port"{print $2; exit}' "$MODERN_CONF" 2>/dev/null))..."
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ "$FORCE_RESTART" != "1" ] && systemctl is-active --quiet ovpn-mgr-openvpn-modern.service && [ -f "${VPN_DATA_DIR}/openvpn-modern.pid" ]; then
+        systemctl enable ovpn-mgr-openvpn-modern.service >/dev/null 2>&1 || true
+        echo "    Already running under systemd; leaving it (and its clients) untouched."
+    else
+        "$WRAPPER" stop-daemon modern || true
+        systemctl enable ovpn-mgr-openvpn-modern.service >/dev/null 2>&1 || true
+        if ! systemctl restart ovpn-mgr-openvpn-modern.service; then
+            echo "WARNING: The modern OpenVPN service did not start cleanly. Inspect: systemctl status ovpn-mgr-openvpn-modern.service" >&2
+            echo "         Recent logs: journalctl -u ovpn-mgr-openvpn-modern.service -n 80 --no-pager" >&2
+        fi
+    fi
+fi
+
+# --- FreePBX Firewall: register both instances (port service, trusted subnet, descriptions) ---
+# Done here, with the daemons up, so a fresh install is complete without a Restart from the GUI.
+echo "==> Registering the OpenVPN instances with FreePBX Firewall..."
+"$WRAPPER" fw-register || echo "    (firewall registration reported an error - a Restart from the GUI will retry it)"
+
 echo "Done."
+echo "  - ${MODERN_SHIM} lets 'asterisk' drive the modern instance (root:asterisk 0750, same sudoers rule)"
 echo "  - ${WRAPPER} is now root:asterisk 0750"
 echo "  - ovpn-mgr-fixperms.service reapplies that ownership/mode on every boot,"
 echo "    after FreePBX's own permission sweep runs, so this no longer needs to"

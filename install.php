@@ -17,11 +17,41 @@ if (is_dir("{$tftpDir}/openvpn") && !is_dir($baseDir)) {
 $pkgDir      = "{$phoneSettingsDir}/vpnkeys";
 $pkiDir      = "{$baseDir}/legacy_pki";
 $serverConf  = "{$baseDir}/legacy-vpn.conf";
-$logDir      = "{$baseDir}/logs";
+$logDir      = "{$baseDir}/logs-legacy";
 $logFile     = "{$logDir}/openvpn.log";
 $statusFile  = "{$logDir}/openvpn-status.log";
 $module_name = 'ovpn_mgr';
 $module_root = __DIR__;
+
+// 0a. (2.75) The legacy instance's per-instance folders are now logs-legacy and
+//     ccd-legacy (the modern instance uses logs-modern / ccd-modern). Rename
+//     existing ones BEFORE anything below creates the new names, point
+//     legacy-vpn.conf at them, and restart the daemon afterwards if it was
+//     running (its old paths are in its running configuration).
+$ovpnLegacyMoves = [ "{$baseDir}/logs" => "{$baseDir}/logs-legacy", "{$baseDir}/ccd" => "{$baseDir}/ccd-legacy" ];
+$ovpnLegacyNeedsMove = false;
+foreach ($ovpnLegacyMoves as $ovpnFrom => $ovpnTo) {
+    if (is_dir($ovpnFrom) && !is_link($ovpnFrom) && !file_exists($ovpnTo)) { $ovpnLegacyNeedsMove = true; }
+}
+$ovpnRestartLegacyAfter = false;
+if ($ovpnLegacyNeedsMove) {
+    $ovpnLegacyPid = (int)trim((string)@file_get_contents("{$baseDir}/openvpn.pid"));
+    if ($ovpnLegacyPid > 1 && is_dir("/proc/{$ovpnLegacyPid}")) {
+        $ovpnRestartLegacyAfter = true;
+        @exec('kill ' . $ovpnLegacyPid . ' 2>&1');
+        for ($ovpnWait = 0; $ovpnWait < 10 && is_dir("/proc/{$ovpnLegacyPid}"); $ovpnWait++) { usleep(300000); }
+    }
+    foreach ($ovpnLegacyMoves as $ovpnFrom => $ovpnTo) {
+        if (is_dir($ovpnFrom) && !is_link($ovpnFrom) && !file_exists($ovpnTo)) { @rename($ovpnFrom, $ovpnTo); }
+    }
+    if (is_file($serverConf)) {
+        $ovpnLegacyConf = (string)file_get_contents($serverConf);
+        $ovpnLegacyConf = preg_replace('#^(client-config-dir[ \t]+)' . preg_quote("{$baseDir}/ccd", '#') . '[ \t]*$#m', '${1}' . "{$baseDir}/ccd-legacy", $ovpnLegacyConf);
+        $ovpnLegacyConf = preg_replace('#^(status[ \t]+)' . preg_quote("{$baseDir}/logs/", '#') . '#m', '${1}' . "{$baseDir}/logs-legacy/", $ovpnLegacyConf);
+        @file_put_contents($serverConf, $ovpnLegacyConf);
+    }
+    echo "Renamed the legacy instance's logs and ccd folders to logs-legacy and ccd-legacy.\n";
+}
 
 // This install script intentionally does NOT:
 //   - prompt for or handle a root password
@@ -255,7 +285,7 @@ if (!file_exists($serverConf)) {
     // ovpnApplyRenegDirectives() in lib/client_ops.php. Existing installs are
     // brought in line by step 4c below and on every daemon start.
     $serverConfigContent = <<<CONF
-port 1194
+port 1195
 proto udp
 dev tun
 ca {$pkiDir}/ca.crt
@@ -263,9 +293,9 @@ cert {$pkiDir}/server.crt
 key {$pkiDir}/private/server.key
 dh {$pkiDir}/dh.pem
 crl-verify {$crlFile}
-server 10.1.0.0 255.255.255.0
+server 10.3.0.0 255.255.255.0
 # push-route-host {$rawServerIp}
-client-config-dir {$baseDir}/ccd
+client-config-dir {$baseDir}/ccd-legacy
 keepalive 10 120
 
 cipher AES-256-CBC
@@ -318,11 +348,36 @@ if (!$ovpnLibUsable) {
     }
 }
 if ($ovpnLibUsable && file_exists($serverConf)) {
-    $routePolicy = ovpnPrepareRoutePolicy((string)@file_get_contents($serverConf), "{$baseDir}/ccd");
+    $routePolicy = ovpnPrepareRoutePolicy((string)@file_get_contents($serverConf), "{$baseDir}/ccd-legacy");
     if ($routePolicy['lan_ip'] !== '') {
         @file_put_contents($serverConf, $routePolicy['text']);
         ovpnSyncCcdFiles($baseDir, $pkiDir, $pkgDir, $routePolicy['lan_ip']);
     }
+}
+
+// 4b2. (2.73/2.74) Second, "modern" OpenVPN instance inside the same base
+//      directory: modern_pki, modern-vpn.conf, logs-modern, ccd-modern and
+//      openvpn-modern.pid next to their legacy counterparts. Its PKI is RSA-2048 /
+//      SHA-256, it speaks AES-GCM only with TLS 1.2+. The legacy instance (RSA-1024
+//      / SHA-1, AES-CBC) stays exactly as it is for phones with very old OpenVPN
+//      firmware. Created only if missing; never touches legacy files. A 2.73 layout
+//      (separate openvpn-modern directory) is moved into place first. Started by
+//      setup-root.sh (its own systemd unit).
+if ($ovpnLibUsable && function_exists('ovpnEnsureModernInstance')) {
+    if (function_exists('ovpnMigrateModernBase') && ovpnMigrateModernBase($phoneSettingsDir)) {
+        echo "Moved the modern OpenVPN instance into {$baseDir}. Re-run setup-root.sh to restart it from there.\n";
+    }
+    if (!ovpnEnsureModernInstance($phoneSettingsDir, $serverConf)) {
+        echo "Note: the modern OpenVPN instance could not be created (is openssl available?). The legacy instance is unaffected.\n";
+    }
+    foreach (['modern_pki', 'ccd-modern', 'logs-modern'] as $modernSub) {
+        if (is_dir("{$baseDir}/{$modernSub}")) {
+            @exec("chown -R asterisk:asterisk " . escapeshellarg("{$baseDir}/{$modernSub}") . " 2>&1");
+            @exec("chmod -R 775 " . escapeshellarg("{$baseDir}/{$modernSub}") . " 2>&1");
+        }
+    }
+    foreach (glob("{$baseDir}/modern_pki/private/*.key") ?: [] as $mk) { @chmod($mk, 0600); }
+    foreach (glob("{$baseDir}/modern-vpn.conf") ?: [] as $mc) { @exec("chown asterisk:asterisk " . escapeshellarg($mc) . " 2>&1"); }
 }
 
 // 4c. (2.70) Status file on tmpfs. {$logDir}/openvpn-status.log becomes a symlink to
@@ -423,4 +478,11 @@ if (!file_exists($htaccess_path) || file_get_contents($htaccess_path) !== $htacc
     @chmod($htaccess_path, 0644);
 }
 
-
+// 0a (continued): bring the legacy daemon back up from its renamed folders.
+if (!empty($ovpnRestartLegacyAfter) && function_exists('posix_geteuid') && posix_geteuid() === 0) {
+    if (is_file('/etc/systemd/system/ovpn-mgr-openvpn.service')) {
+        @exec('systemctl restart ovpn-mgr-openvpn.service 2>&1');
+    } elseif (is_file(__DIR__ . '/scripts/ovpnctl')) {
+        @exec('bash ' . escapeshellarg(__DIR__ . '/scripts/ovpnctl') . ' start-daemon 2>&1');
+    }
+}

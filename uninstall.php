@@ -34,6 +34,11 @@ $fixpermsUnitFile = '/etc/systemd/system/ovpn-mgr-fixperms.service';
 if (file_exists($ovpnctl)) {
     exec('sudo -n ' . escapeshellarg($ovpnctl) . ' stop 2>&1');
 }
+// The modern instance has its own root-owned shim (created by setup-root.sh).
+$modernCtl = '/usr/local/sbin/ovpn_mgr-ctl-modern';
+if (file_exists($modernCtl)) {
+    exec('sudo -n ' . escapeshellarg($modernCtl) . ' stop 2>&1');
+}
 $pidFile = "{$baseDir}/openvpn.pid";
 if (file_exists($pidFile)) {
     $pid = intval(trim((string)@file_get_contents($pidFile)));
@@ -48,13 +53,15 @@ if (file_exists($pidFile)) {
 //    manual step, not an oversight:
 //
 //      # stop and disable the module's three systemd units first
-//      sudo systemctl disable --now ovpn-mgr-openvpn.service \
+//      sudo systemctl disable --now ovpn-mgr-openvpn.service ovpn-mgr-openvpn-modern.service \
 //                                   ovpn-mgr-nat.service \
 //                                   ovpn-mgr-fixperms.service \
 //                                   ovpn-mgr-fixperms.path 2>/dev/null
 //      sudo rm -f /etc/sudoers.d/ovpn_mgr \
 //                 /etc/sysctl.d/99-ovpn-mgr.conf \
 //                 /etc/systemd/system/ovpn-mgr-openvpn.service \
+//                 /etc/systemd/system/ovpn-mgr-openvpn-modern.service \
+//                 /usr/local/sbin/ovpn_mgr-ctl-modern \
 //                 /etc/systemd/system/ovpn-mgr-nat.service \
 //                 /etc/systemd/system/ovpn-mgr-fixperms.service \
 //                 /etc/systemd/system/ovpn-mgr-fixperms-watch.service \
