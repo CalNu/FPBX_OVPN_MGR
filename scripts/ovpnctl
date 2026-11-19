@@ -185,17 +185,16 @@ norm_src_net() {
 # Idempotent: removes every rule carrying this module's mark first, so repeated
 # calls neither stack duplicates nor leave a stale network behind. Best effort -
 # any failure just skips the rule.
-ensure_lan_nat() {
-    [ -n "$IPTABLES_BIN" ] || return 0
-    local dev lan rule src
-    local -a parts
-    local -a srcs=()
-
+# Fills the global array LAN_SRCS with every source network that should be masqueraded
+# into this instance's tunnel (see above). Shared by ensure_lan_nat and lan-nat-status.
+collect_lan_sources() {
+    local dev lan src
+    LAN_SRCS=()
     if [ -n "$IP_BIN" ]; then
       dev="$("$IP_BIN" -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')"
       if is_iface "$dev"; then
         lan="$("$IP_BIN" -4 -o route show dev "$dev" proto kernel scope link 2>/dev/null | awk '{print $1; exit}')"
-        if is_cidr "$lan"; then srcs+=("$lan"); fi
+        if is_cidr "$lan"; then LAN_SRCS+=("$lan"); fi
       fi
     fi
     # The other server's VPN pool, always: computers connected to the Legacy server reach
@@ -203,23 +202,31 @@ ensure_lan_nat() {
     for src in "${BASE_DIR}/modern-vpn.conf" "${BASE_DIR}/legacy-vpn.conf"; do
       [ "$src" != "$CONF" ] || continue
       src="$(conf_server_cidr "$src")" || continue
-      case " ${srcs[*]:-} " in *" ${src} "*) continue ;; esac
-      srcs+=("$src")
+      case " ${LAN_SRCS[*]:-} " in *" ${src} "*) continue ;; esac
+      LAN_SRCS+=("$src")
     done
     if [ -r "$LAN_ACCESS_FILE" ]; then
       while read -r src; do
         src="$(norm_src_net "$src")" || continue
-        case " ${srcs[*]:-} " in *" ${src} "*) continue ;; esac
-        srcs+=("$src")
+        case " ${LAN_SRCS[*]:-} " in *" ${src} "*) continue ;; esac
+        LAN_SRCS+=("$src")
       done < "$LAN_ACCESS_FILE"
     fi
+
+}
+
+ensure_lan_nat() {
+    [ -n "$IPTABLES_BIN" ] || return 0
+    local rule src
+    local -a parts
+    collect_lan_sources
 
     while rule="$("$IPTABLES_BIN" -t nat -S POSTROUTING 2>/dev/null | grep -m1 -- "--comment ${LAN_NAT_MARK}\( \|\$\)")" && [ -n "$rule" ]; do
       read -ra parts <<< "${rule/-A /-D }"
       "$IPTABLES_BIN" -t nat "${parts[@]}" 2>/dev/null || break
     done
-    if [ "${#srcs[@]}" -gt 0 ]; then
-      for src in "${srcs[@]}"; do
+    if [ "${#LAN_SRCS[@]}" -gt 0 ]; then
+      for src in "${LAN_SRCS[@]}"; do
         "$IPTABLES_BIN" -t nat -I POSTROUTING 1 -s "$src" -o "$TUN_DEV" \
           -m addrtype ! --src-type LOCAL -m comment --comment "$LAN_NAT_MARK" -j MASQUERADE 2>/dev/null || true
       done
@@ -787,6 +794,30 @@ case "$cmd" in
     echo "LAN_ACCESS_OK"
     ;;
 
+  lan-nat-status)
+    # lan-nat-status
+    # One line per source network this instance should masquerade into its tunnel:
+    # "ACTIVE <net>" if the rule is really in the nat table, "MISSING <net>" if not.
+    [ -n "$IPTABLES_BIN" ] || { echo "NO_IPTABLES"; exit 0; }
+    collect_lan_sources
+    for src in "${LAN_SRCS[@]}"; do
+      if "$IPTABLES_BIN" -t nat -C POSTROUTING -s "$src" -o "$TUN_DEV" \
+           -m addrtype ! --src-type LOCAL -m comment --comment "$LAN_NAT_MARK" -j MASQUERADE 2>/dev/null; then
+        echo "ACTIVE $src"
+      else
+        echo "MISSING $src"
+      fi
+    done
+    echo "LAN_STATUS_OK"
+    ;;
+
+  lan-nat-apply)
+    # lan-nat-apply
+    # Re-creates this instance's masquerade rules from the saved list without changing the list.
+    ensure_lan_nat
+    echo "LAN_NAT_APPLIED"
+    ;;
+
   nat-restore)
     # Run at boot by ovpn-mgr-nat.service. No-op if nothing was ever saved.
     ensure_lan_nat
@@ -800,7 +831,7 @@ case "$cmd" in
     ;;
 
   *)
-    echo "usage: ovpnctl {check|paths|status|start|stop|start-daemon|stop-daemon|ipforward-on|nat-sync|nat-restore|lan-access-sync|port-sync|port-restore|fw-ensure|fw-available|fw-restart|fw-trusted|fw-iface-desc|fw-register|trust-sync|sip-localnet-sync|kill-client} [modern|legacy]" >&2
+    echo "usage: ovpnctl {check|paths|status|start|stop|start-daemon|stop-daemon|ipforward-on|nat-sync|nat-restore|lan-access-sync|lan-nat-status|lan-nat-apply|port-sync|port-restore|fw-ensure|fw-available|fw-restart|fw-trusted|fw-iface-desc|fw-register|trust-sync|sip-localnet-sync|kill-client} [modern|legacy]" >&2
     exit 1
     ;;
 esac

@@ -64,31 +64,6 @@ if ($ovpnLegacyNeedsMove) {
 
 // 0. Directory initialization (all owned by the web/asterisk user this
 //    installer itself runs as - no elevated privilege required).
-// deploy_module_symlink() is always non-destructive: if $target already
-// exists as a real (non-symlink) directory, it does nothing and returns
-// false rather than deleting/replacing it. It only ever replaces an
-// existing symlink (with an equivalent or updated one - never touching
-// the real data at whatever that symlink points to) or creates a new
-// symlink where nothing existed before.
-if (!function_exists('deploy_module_symlink')) {
-    function deploy_module_symlink($source, $target) {
-        if (!file_exists($source) && !is_link($source)) {
-            return false;
-        }
-        if (is_link($target) || file_exists($target)) {
-            if (is_dir($target) && !is_link($target)) {
-                return false;
-            }
-            @unlink($target);
-        }
-        if (@symlink($source, $target)) {
-            @chown($target, 'asterisk');
-            @chgrp($target, 'asterisk');
-            return true;
-        }
-        return false;
-    }
-}
 
 // Ensure PhoneSettings itself is a real directory. Do not create a
 // PhoneSettings -> /tftpboot symlink; VPN private keys must never land
@@ -137,16 +112,22 @@ if (!file_exists($statusFile)) {
 @chgrp($statusFile, 'asterisk');
 @chmod($statusFile, 0640);
 
-// 0.1 Convenience cross-links for module access and provisioning. VPN
-//     state itself is not linked into /tftpboot.
-//     No touching of other modules' own directories - the old code used
-//     to hijack admin/modules/yealink_epm here, which has been removed.
-deploy_module_symlink($tftpDir, $module_root . '/tftpboot');            // module/tftpboot -> /tftpboot
-deploy_module_symlink($phoneSettingsDir, $module_root . '/PhoneSettings'); // module/PhoneSettings -> PhoneSettings
-deploy_module_symlink($module_root, $phoneSettingsDir . '/' . $module_name); // PhoneSettings/ovpn_mgr -> module
-deploy_module_symlink($tftpDir, $phoneSettingsDir . '/tftpboot');       // PhoneSettings/tftpboot -> /tftpboot
-deploy_module_symlink($module_root, $tftpDir . '/' . $module_name);    // tftpboot/ovpn_mgr -> module
-deploy_module_symlink($phoneSettingsDir, $tftpDir . '/PhoneSettings'); // tftpboot/PhoneSettings -> PhoneSettings
+// 0.1 Remove the convenience cross-links that older versions created. Nothing in
+//     the module uses them any more, and /tftpboot/PhoneSettings in particular
+//     pointed at the directory that holds the VPN PKI and private keys. Only
+//     symbolic links are removed; a real directory of the same name is never touched.
+foreach ([
+    $module_root . '/tftpboot',
+    $module_root . '/PhoneSettings',
+    $phoneSettingsDir . '/' . $module_name,
+    $phoneSettingsDir . '/tftpboot',
+    $tftpDir . '/' . $module_name,
+    $tftpDir . '/PhoneSettings',
+] as $obsoleteLink) {
+    if (is_link($obsoleteLink)) {
+        @unlink($obsoleteLink);
+    }
+}
 
 // 1. Prevent directory browsing of the web-served phone-provisioning dirs.
 foreach ([$baseDir, $pkgDir] as $webDir) {
@@ -417,19 +398,13 @@ if (file_exists($signerScript)) {
 
 // 6. Prepare (but do not activate) the privileged helper(s). Left owned
 //    by the web user with mode 0755 so they can be inspected/used
-//    directly as-is (generate_client.sh doesn't itself need elevated
-//    privilege); running setup-root.sh as root additionally re-chowns
-//    them to root:asterisk 0750 and installs a matching sudoers rule,
-//    needed only if an external caller invokes them with "sudo".
+//    directly as-is; running setup-root.sh as root additionally re-chowns
+//    ovpnctl to root:asterisk 0750 and installs the matching sudoers rule.
 //    Nothing here writes to /etc/sudoers.d or requires a root password.
 $ovpnctl = "{$module_root}/scripts/ovpnctl";
-$genClient = "{$module_root}/scripts/generate_client.sh";
 $setupScript = "{$module_root}/scripts/setup-root.sh";
 if (file_exists($ovpnctl)) {
     @chmod($ovpnctl, 0755);
-}
-if (file_exists($genClient)) {
-    @chmod($genClient, 0755);
 }
 if (file_exists($setupScript)) {
     @chmod($setupScript, 0755);

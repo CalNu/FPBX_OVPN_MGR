@@ -153,30 +153,12 @@ function csrf_require() {
 // ============================================================================
 // Helper Functions (pure computation)
 // ============================================================================
-function reqIpsToNetmask($reqIps) {
-    $needed = intval($reqIps) + 3;
-    $bits = 32 - ceil(log($needed, 2));
-    if ($bits < 16) { $bits = 16; }
-    if ($bits > 29) { $bits = 29; }
-    $mask = (0xFFFFFFFF << (32 - $bits)) & 0xFFFFFFFF;
-    return long2ip($mask);
-}
-
 function cidrToNetmask($cidr) {
     $cidr = intval($cidr);
     if ($cidr < 16) { $cidr = 16; }
     if ($cidr > 29) { $cidr = 29; }
     $mask = (0xFFFFFFFF << (32 - $cidr)) & 0xFFFFFFFF;
     return long2ip($mask);
-}
-
-function netmaskToReqIps($netmask) {
-    $long = ip2long($netmask);
-    if ($long === false) { return 250; }
-    $base = sprintf("%b", $long);
-    $cidr = substr_count($base, '1');
-    $hostBits = 32 - $cidr;
-    return ($hostBits > 1) ? (pow(2, $hostBits) - 3) : 1;
 }
 
 function calculateSubnetDetails($hostIp, $netmask) {
@@ -1178,6 +1160,29 @@ if (isset($_POST['action']) && $_POST['action'] === 'update_server_settings') {
 // Client Package Builder
 // ============================================================================
 // ============================================================================
+// Legacy server acknowledgment (one time)
+// ============================================================================
+// Pressing the button in the Legacy tab of Server Settings records the acknowledgment in
+// <PhoneSettings>/openvpn/.legacy_ack. After that Legacy (AES-CBC) packages can be built,
+// edited and changed to without being asked again. Deleting that file asks again.
+function ovpnLegacyAckFile($baseDir) { return rtrim((string)$baseDir, '/') . '/.legacy_ack'; }
+function ovpnLegacyAcked($baseDir) { return is_file(ovpnLegacyAckFile($baseDir)); }
+function ovpnLegacyAckInfo($baseDir) {
+    $raw = @file_get_contents(ovpnLegacyAckFile($baseDir));
+    return is_string($raw) ? trim($raw) : '';
+}
+if (isset($_POST['action']) && $_POST['action'] === 'acknowledge_legacy') {
+    csrf_require();
+    if (!ovpnLegacyAcked($baseDir)) {
+        $who = preg_replace('/[^A-Za-z0-9_.@-]/', '', (string)($_SESSION['AMP_user']->username ?? ''));
+        @file_put_contents(ovpnLegacyAckFile($baseDir), date('Y-m-d H:i:s') . ($who !== '' ? " by {$who}" : '') . "\n");
+        @chmod(ovpnLegacyAckFile($baseDir), 0640);
+    }
+    header("Location: config.php?display=ovpn_mgr");
+    exit();
+}
+
+// ============================================================================
 // Edit Package MAC/Extension Action
 // ============================================================================
 if (isset($_POST['action']) && $_POST['action'] === 'edit_package') {
@@ -1212,7 +1217,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'edit_package') {
         $fromCtx = ovpnInstanceCtx($baseDir, $moduleRoot, $fromInst);
         $toCtx   = ovpnInstanceCtx($baseDir, $moduleRoot, $toInst);
 
-        if (!is_file($toCtx['serverConf']) || !is_dir($toCtx['pkiDir'])) {
+        if (ovpnIsCbcCipher($selectedCipher) && !ovpnLegacyAcked($baseDir)) {
+            $_SESSION['ovpn_mgr_settings_error'] = 'The Legacy server uses obsolete cryptography and is only for phones that cannot connect to the Modern server. Press the acknowledgment button in the Legacy tab of OpenVPN Server Settings first. Nothing was changed.';
+        } elseif (!is_file($toCtx['serverConf']) || !is_dir($toCtx['pkiDir'])) {
             $_SESSION['ovpn_mgr_settings_error'] = 'The ' . ($toInst === 'modern' ? 'Modern' : 'Legacy') . ' OpenVPN server does not exist yet, so nothing was changed.';
         } elseif ($fromInst === $toInst) {
             ovpnSelectInstance($fromInst);
@@ -1292,6 +1299,11 @@ if (isset($_POST['action']) && $_POST['action'] === 'generate_package') {
         $selectedCipher = (string)($_POST['cipher'] ?? '');
         if (!in_array($selectedCipher, ovpnAllowedCiphers(), true)) {
             $selectedCipher = getDefaultCipher(ovpnConfPath($baseDir, $ovpnModernExists ? 'modern' : 'legacy'));
+        }
+        if (ovpnIsCbcCipher($selectedCipher) && !ovpnLegacyAcked($baseDir)) {
+            $_SESSION['ovpn_mgr_settings_error'] = 'Could not build the package: the Legacy server uses obsolete cryptography and is only for phones that cannot connect to the Modern server. Press the acknowledgment button in the Legacy tab of OpenVPN Server Settings first.';
+            header("Location: config.php?display=ovpn_mgr");
+            exit();
         }
         $genInst = ovpnInstanceForCipher($selectedCipher);
         if ($genInst === 'modern' && !$ovpnModernExists) {
@@ -1703,7 +1715,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_change_cipher') {
         $toCtx   = ovpnInstanceCtx($baseDir, $moduleRoot, $toInst);
         $toLabel = ($toInst === 'modern') ? 'Modern' : 'Legacy';
 
-        if (!is_file($toCtx['serverConf']) || !is_dir($toCtx['pkiDir'])) {
+        if (ovpnIsCbcCipher($newCipher) && !ovpnLegacyAcked($baseDir)) {
+            $_SESSION['ovpn_mgr_settings_error'] = 'The Legacy server uses obsolete cryptography and is only for phones that cannot connect to the Modern server. Press the acknowledgment button in the Legacy tab of OpenVPN Server Settings first. Nothing was changed.';
+        } elseif (!is_file($toCtx['serverConf']) || !is_dir($toCtx['pkiDir'])) {
             $_SESSION['ovpn_mgr_settings_error'] = "The {$toLabel} OpenVPN server does not exist yet, so nothing was changed.";
         } else {
             $groups   = ovpnGroupPackagesByInstance($pkgDir, $baseDir, (array)($_POST['pkgs'] ?? []));
@@ -2171,6 +2185,21 @@ if (ovpnFirewallModuleUsable() && (($_SESSION['ovpn_fw_labels_ts'] ?? 0) < time(
                 <div class="ovpn-set-panes">
                 <?php foreach ($ovpnInstanceList as $li): $c = $ovpnInst[$li]; $serverHostIsIp = (bool) filter_var($c['settings']['ip'], FILTER_VALIDATE_IP); ?>
                     <div class="ovpn-set-pane" data-instance="<?php echo $li; ?>"<?php echo $li === $ovpnInstanceList[0] ? '' : ' style="display: none;"'; ?>>
+                    <?php if ($li === 'legacy'): ?>
+                    <div id="ovpn_legacy_gate" role="alert" style="margin: 0 0 12px; padding: 10px 12px; border: 2px solid #d9534f; border-radius: 4px; background: #f2dede; color: #a94442; font-size: 12px; line-height: 1.5;">
+                        <strong style="font-size: 13px;"><i class="fa fa-exclamation-triangle"></i> LEGACY SERVER &mdash; USE ONLY FOR PHONES THAT CANNOT CONNECT TO THE MODERN SERVER</strong>
+                        <div style="margin: 6px 0 8px;">The Legacy server uses obsolete cryptography: RSA-1024 / SHA-1 certificates, 1024-bit Diffie-Hellman, TLS 1.0 and AES-CBC. It can be attacked far more easily than the Modern server. Try the Modern server first, and build a Legacy package only for a phone that has failed to connect to it. Legacy packages cannot be built until you acknowledge this once.</div>
+                        <?php if (ovpnLegacyAcked($baseDir)): ?>
+                        <div id="ovpn_legacy_acked" style="font-weight: bold;"><i class="fa fa-check"></i> Acknowledged <?php echo htmlspecialchars(ovpnLegacyAckInfo($baseDir)); ?></div>
+                        <?php else: ?>
+                        <form method="post" action="config.php?display=ovpn_mgr" id="ovpnLegacyAckForm" style="margin: 0;">
+                            <input type="hidden" name="action" value="acknowledge_legacy">
+                            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
+                            <button type="submit" class="btn btn-danger btn-sm" id="ovpn_legacy_ack_btn"><i class="fa fa-exclamation-triangle"></i> I understand the risk, and this phone cannot connect to the Modern server</button>
+                        </form>
+                        <?php endif; ?>
+                    </div>
+                    <?php endif; ?>
                     <form method="post" action="config.php?display=ovpn_mgr" id="ovpnSettingsForm-<?php echo $li; ?>" class="ovpn-settings-form" data-instance="<?php echo $li; ?>">
                         <input type="hidden" name="action" value="update_server_settings">
                         <input type="hidden" name="instance" value="<?php echo $li; ?>">
@@ -2255,10 +2284,16 @@ if (ovpnFirewallModuleUsable() && (($_SESSION['ovpn_fw_labels_ts'] ?? 0) < time(
                     <h3 class="panel-title" style="margin: 0;"><i class="fa fa-cube"></i> Build Provisioning Package (vpn.tar)</h3>
                 </div>
                 <div class="panel-body">
+                    
                     <form method="post" action="config.php?display=ovpn_mgr" id="ovpnGenerateForm">
                         <input type="hidden" name="action" value="generate_package">
                         <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken); ?>">
-                        
+
+                        <!-- The one-time Legacy acknowledgment button lives in the Legacy tab of OpenVPN Server Settings. -->
+                        <div id="ovpn_build_locked_note" role="alert" style="display: none; margin: 0 0 10px; padding: 7px 10px; border: 1px solid #d9534f; border-radius: 4px; background: #f2dede; color: #a94442; font-size: 12px;">
+                            <i class="fa fa-lock"></i> <strong>Legacy is locked.</strong> Press the acknowledgment button under the red warning in the Legacy tab of OpenVPN Server Settings (needed once) to build Legacy (AES-CBC) packages.
+                        </div>
+
                         <div style="display: flex; align-items: flex-end; gap: 10px; margin-bottom: 10px; flex-wrap: wrap;">
                             <!-- Extension Input with Icon Overlay -->
                             <div class="form-group" style="margin-bottom: 0;">
@@ -2297,12 +2332,15 @@ if (ovpnFirewallModuleUsable() && (($_SESSION['ovpn_fw_labels_ts'] ?? 0) < time(
                                 <label for="ovpn_cipher" style="font-size: 11px; display: block; margin-bottom: 5px; padding-left: 5px;">Cipher</label>
                                 <div style="display: flex; align-items: center; gap: 10px;">
                                     <select id="ovpn_cipher" name="cipher" class="form-control" style="height: 34px; width: 190px; max-width: 100%;" data-default-modern="<?php echo htmlspecialchars($ovpnDefaultModern); ?>" data-default-legacy="<?php echo htmlspecialchars($ovpnDefaultLegacy); ?>">
-                                        <?php if ($ovpnModernExists): ?>
-                                        <option value="AES-256-GCM"<?php echo $ovpnPreselectCipher === 'AES-256-GCM' ? ' selected' : ''; ?>>AES-256-GCM - Modern</option>
-                                        <option value="AES-128-GCM"<?php echo $ovpnPreselectCipher === 'AES-128-GCM' ? ' selected' : ''; ?>>AES-128-GCM - Modern</option>
-                                        <?php endif; ?>
-                                        <option value="AES-256-CBC"<?php echo $ovpnPreselectCipher === 'AES-256-CBC' ? ' selected' : ''; ?>>AES-256-CBC - Legacy</option>
-                                        <option value="AES-128-CBC"<?php echo $ovpnPreselectCipher === 'AES-128-CBC' ? ' selected' : ''; ?>>AES-128-CBC - Legacy</option>
+                                        <?php
+                                        // Only the ciphers of the tab being shown: GCM on Modern, CBC on Legacy (the tabs swap them).
+                                        $ovpnBuildFirst = $ovpnInstanceList[0]; // the Server Settings tab that opens first; JS follows the tab afterwards
+                                        $ovpnBuildCiphers = ($ovpnBuildFirst === 'modern')
+                                            ? ['AES-256-GCM' => 'AES-256-GCM - Modern', 'AES-128-GCM' => 'AES-128-GCM - Modern']
+                                            : ['AES-256-CBC' => 'AES-256-CBC - Legacy', 'AES-128-CBC' => 'AES-128-CBC - Legacy'];
+                                        foreach ($ovpnBuildCiphers as $ovpnBc => $ovpnBcLabel): ?>
+                                        <option value="<?php echo $ovpnBc; ?>"<?php echo $ovpnPreselectCipher === $ovpnBc ? ' selected' : ''; ?>><?php echo $ovpnBcLabel; ?></option>
+                                        <?php endforeach; ?>
                                     </select>
                                     <label for="ovpn_cipher_default" style="font-size: 11px; font-weight: normal; margin: 0; white-space: nowrap; cursor: pointer;" title="Pre-selects this cipher for new packages. For a legacy cipher it also becomes the legacy server's fallback cipher; AES-128-CBC is only a fallback when it is the default or a phone is using it.">
                                         <input type="checkbox" id="ovpn_cipher_default" name="set_default_cipher" value="1" style="margin: 0 4px 0 0; vertical-align: middle;">
@@ -2327,7 +2365,7 @@ if (ovpnFirewallModuleUsable() && (($_SESSION['ovpn_fw_labels_ts'] ?? 0) < time(
                             Package will target the <strong id="ovpn_target_label"></strong> OpenVPN server <strong id="ovpn_target_hostport"></strong> and SIP Gateway <strong id="ovpn_target_sip"></strong>
                         </div>
                         
-                        <button type="submit" class="btn btn-success btn-block" style="max-width: 375px;">
+                        <button type="submit" id="ovpn_generate_btn" class="btn btn-success btn-block" style="max-width: 375px;">
                             <i class="fa fa-plus"></i> Generate Keys & Build Package
                         </button>
                     </form>
@@ -2349,7 +2387,7 @@ if (ovpnFirewallModuleUsable() && (($_SESSION['ovpn_fw_labels_ts'] ?? 0) < time(
                             <?php else: foreach ($connectedClients as $client): ?>
                                 <tr>
                                     <td style="vertical-align: middle !important;"><code><?php echo htmlspecialchars($client['mac']); ?></code></td>
-                                    <td style="vertical-align: middle !important;"><code><?php echo htmlspecialchars($client['virtual_ip']); ?></code></td>
+                                    <td style="vertical-align: middle !important;"><?php $vIp = (string)$client['virtual_ip']; if (filter_var($vIp, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)): ?><a href="http://<?php echo htmlspecialchars($vIp, ENT_QUOTES); ?>/" target="_blank" rel="noopener noreferrer" title="Open the phone's web interface (http://<?php echo htmlspecialchars($vIp, ENT_QUOTES); ?>/) in a new tab"><code><?php echo htmlspecialchars($vIp); ?></code></a><?php else: ?><code><?php echo htmlspecialchars($vIp); ?></code><?php endif; ?></td>
                                     <td style="vertical-align: middle !important;"><?php echo htmlspecialchars($client['real_ip']); ?></td>
                                     <td style="padding-left: 10px; " data-sv="<?php echo htmlspecialchars($client['active_cipher'], ENT_QUOTES); ?>">
                                         <span class="label <?php echo $client['instance'] === 'modern' ? 'label-success' : 'label-warning'; ?>" title="Connected to the <?php echo $client['instance'] === 'modern' ? 'Modern' : 'Legacy'; ?> server"><?php echo htmlspecialchars($client['active_cipher']); ?></span>
@@ -2524,6 +2562,11 @@ if (ovpnFirewallModuleUsable() && (($_SESSION['ovpn_fw_labels_ts'] ?? 0) < time(
                             Include data-ciphers (requires OpenVPN 2.5+ client &mdash; confirm before enabling)
                         </label>
                     </div>
+
+                    <div id="edit_legacy_gate" role="alert" style="display: none; margin: 10px 0 0; padding: 8px 10px; border: 2px solid #d9534f; border-radius: 4px; background: #f2dede; color: #a94442; font-size: 12px; line-height: 1.5;">
+                        <strong><i class="fa fa-lock"></i> LEGACY SERVER &mdash; USE ONLY FOR PHONES THAT CANNOT CONNECT TO THE MODERN SERVER</strong>
+                        <div style="margin-top: 4px;">Press the acknowledgment button in the Legacy tab of OpenVPN Server Settings (needed once) before choosing an AES-CBC cipher.</div>
+                    </div>
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-default" data-dismiss="modal">Cancel</button>
@@ -2568,6 +2611,11 @@ if (ovpnFirewallModuleUsable() && (($_SESSION['ovpn_fw_labels_ts'] ?? 0) < time(
                             <input type="checkbox" id="bulk_include_data_ciphers" name="include_data_ciphers" value="1" style="margin: 0 4px 0 0; vertical-align: middle;">
                             Include data-ciphers (requires OpenVPN 2.5+ client &mdash; confirm before enabling)
                         </label>
+                    </div>
+
+                    <div id="bulk_legacy_gate" role="alert" style="display: none; margin: 10px 0 0; padding: 8px 10px; border: 2px solid #d9534f; border-radius: 4px; background: #f2dede; color: #a94442; font-size: 12px; line-height: 1.5;">
+                        <strong><i class="fa fa-lock"></i> LEGACY SERVER &mdash; USE ONLY FOR PHONES THAT CANNOT CONNECT TO THE MODERN SERVER</strong>
+                        <div style="margin-top: 4px;">Press the acknowledgment button in the Legacy tab of OpenVPN Server Settings (needed once) before choosing an AES-CBC cipher.</div>
                     </div>
                 </div>
                 <div class="modal-footer">
@@ -2762,6 +2810,42 @@ if (ovpnFirewallModuleUsable() && (($_SESSION['ovpn_fw_labels_ts'] ?? 0) < time(
 <?php
     $ovpnLanAccessNow = ovpnReadLanAccess();
     $ovpnLanInfo      = ovpnDetectLanInfo();
+    // The always-included masquerade rules live only in the kernel's nat table, so a firewall reload (or a
+    // daemon that started before something flushed it) silently loses them. Check them for real on every page
+    // load and re-apply any that are missing, then show the true state next to each entry.
+    $ovpnLanSrcState = [];   // source network => ['ok' => bool, 'healed' => bool]
+    foreach ($ovpnInstanceList as $stInst) {
+        $stCtx = ovpnInstanceCtx($baseDir, $moduleRoot, $stInst);
+        $stOut = []; $stRc = 0;
+        @exec('sudo -n ' . escapeshellarg($stCtx['ovpnctl']) . ' lan-nat-status 2>&1', $stOut, $stRc);
+        $stMissing = false; $stSeen = [];
+        foreach ($stOut as $stLine) {
+            if (preg_match('~^(ACTIVE|MISSING) (\S+)$~', trim($stLine), $stM)) {
+                $stSeen[$stM[2]] = ($stM[1] === 'ACTIVE');
+                if ($stM[1] === 'MISSING') { $stMissing = true; }
+            }
+        }
+        $stHealed = false;
+        if ($stMissing) {
+            $fixOut = []; $fixRc = 0;
+            @exec('sudo -n ' . escapeshellarg($stCtx['ovpnctl']) . ' lan-nat-apply 2>&1', $fixOut, $fixRc);
+            if ($fixRc === 0 && in_array('LAN_NAT_APPLIED', $fixOut, true)) { $stHealed = true; }
+        }
+        foreach ($stSeen as $stSrc => $stActive) {
+            $prev = $ovpnLanSrcState[$stSrc] ?? ['ok' => true, 'healed' => false, 'known' => false];
+            $ovpnLanSrcState[$stSrc] = [
+                'ok'     => $prev['ok'] && ($stActive || $stHealed),
+                'healed' => $prev['healed'] || (!$stActive && $stHealed),
+                'known'  => true,
+            ];
+        }
+    }
+    $ovpnAutoRows = [];   // [network, description]
+    if ($ovpnLanInfo['cidr'] !== '') { $ovpnAutoRows[] = [$ovpnLanInfo['cidr'], 'this PBX\'s own LAN']; }
+    foreach ($ovpnInstanceList as $poolInst0) {
+        $pool0 = ovpnServerPoolFromConf(ovpnConfPath($baseDir, $poolInst0));
+        if ($pool0 !== null) { $ovpnAutoRows[] = [$pool0['cidr'], ucfirst($poolInst0) . ' server VPN subnet']; }
+    }
     // Each server's VPN pool (always allowed into the other server's tunnel) and an example phone address from the first one.
     $ovpnPoolsShown = []; $ovpnExamplePhoneIp = '';
     foreach ($ovpnInstanceList as $poolInst) {
@@ -2783,12 +2867,30 @@ if (ovpnFirewallModuleUsable() && (($_SESSION['ovpn_fw_labels_ts'] ?? 0) < time(
                 </div>
                 <div class="modal-body">
                     <p>Computers on these addresses can reach the phones' VPN addresses<?php if ($ovpnExamplePhoneIp !== ''): ?> (for example <code><?php echo htmlspecialchars($ovpnExamplePhoneIp); ?></code>)<?php endif; ?>. Their traffic is sent into the VPN as if it came from the PBX, so the phone can answer. This list applies to both the Legacy and Modern servers, and does not affect phones provisioning to the PBX itself.</p>
-                    <p style="margin-bottom: 4px;"><strong>Always included:</strong>
-                        <?php if ($ovpnLanInfo['cidr'] !== ''): ?><code><?php echo htmlspecialchars($ovpnLanInfo['cidr']); ?></code> (this PBX's own LAN)<?php else: ?>this PBX's own LAN (not detected right now)<?php endif; ?></p>
-                    <?php if (count($ovpnPoolsShown) > 1): ?>
-                        <p style="margin-bottom: 4px;"><strong>Also always included:</strong> the two servers' VPN subnets (<?php echo htmlspecialchars(implode(', ', $ovpnPoolsShown)); ?>), so each server's clients can reach the other's.</p>
-                    <?php endif; ?>
-                    <label for="lanAccessText" style="margin-top: 8px;">Also allow (one address or network per line)</label>
+                    <label style="margin-top: 4px;">Always included (added automatically, cannot be removed)</label>
+                    <div class="form-control" style="height: auto; font-family: monospace; background: #f4f4f4; cursor: default; padding: 6px 10px;">
+                        <?php if (empty($ovpnAutoRows)): ?>
+                            <span class="text-muted">none detected right now</span>
+                        <?php endif; ?>
+                        <?php foreach ($ovpnAutoRows as $autoRow):
+                            $st = $ovpnLanSrcState[$autoRow[0]] ?? null; ?>
+                            <div>
+                                <?php echo htmlspecialchars($autoRow[0]); ?>
+                                <span class="text-muted" style="font-family: inherit;">&nbsp;&mdash; <?php echo htmlspecialchars($autoRow[1]); ?></span>
+                                <?php if ($st === null): ?>
+                                    <span class="label label-default">status unknown</span>
+                                <?php elseif (!$st['ok']): ?>
+                                    <span class="label label-danger">not active</span>
+                                <?php elseif ($st['healed']): ?>
+                                    <span class="label label-warning">was missing, re-applied</span>
+                                <?php else: ?>
+                                    <span class="label label-success">active</span>
+                                <?php endif; ?>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+                    <p class="help-block" style="margin-bottom: 0;">These are checked against the live firewall each time this page loads, and re-applied if something removed them. Each server's subnet only needs a route on the client side to be reachable.</p>
+                    <label for="lanAccessText" style="margin-top: 12px;">Also allow (one address or network per line)</label>
                     <textarea id="lanAccessText" name="lan_access" rows="7" class="form-control" spellcheck="false" style="font-family: monospace;" placeholder="10.2.0.10&#10;10.0.20.0/24"><?php echo htmlspecialchars(implode("\n", $ovpnLanAccessNow)); ?></textarea>
                     <p class="help-block" style="margin-bottom: 0;">Use the address the PBX actually sees on the incoming traffic. Run <code>tcpdump -ni any icmp and host <?php echo htmlspecialchars($ovpnExamplePhoneIp !== '' ? $ovpnExamplePhoneIp : '<phone VPN address>'); ?></code> while you ping the phone, and use the source shown on the <?php echo $ovpnLanInfo['dev'] !== '' ? '<code>' . htmlspecialchars($ovpnLanInfo['dev']) . '</code>' : 'LAN interface'; ?> line. Single addresses or networks from /8 to /32, up to 64 entries. Applied immediately to every server; no restart needed.</p>
                 </div>
@@ -2925,6 +3027,7 @@ var OVPN_INSTANCES = <?php
     echo json_encode((object)$ovpnJsInst);
 ?>;
 var OVPN_HAS_MODERN = <?php echo json_encode($ovpnModernExists); ?>;
+var OVPN_LEGACY_ACKED = <?php echo json_encode(ovpnLegacyAcked($baseDir)); ?>;
 
 // AES-GCM is served by the modern instance, AES-CBC by the legacy one.
 function ovpnInstanceForCipher(cipher) { return /-CBC$/.test(cipher || '') ? 'legacy' : 'modern'; }
@@ -3177,6 +3280,7 @@ function showOvpnConfirm(message, onConfirm) {
         $tab.addClass('active').attr('aria-selected', 'true');
         $('.ovpn-set-pane').hide().filter('[data-instance="' + inst + '"]').show();
         try { localStorage.setItem(STORE, inst); } catch (e) {}
+        if (window.ovpnBuildSync) window.ovpnBuildSync(inst);
     }
     $('#ovpnSetTabs').on('click', '.ovpn-set-tab', function (e) { e.preventDefault(); this.blur(); show($(this).data('instance')); });
     try { var saved = localStorage.getItem(STORE); if (saved) show(saved); } catch (e) {}
@@ -3597,6 +3701,81 @@ function updateDataCiphersRow(selectId, rowId, checkboxId, presetChecked) {
             );
         });
     }
+})();
+// Build Provisioning Package follows the tab that is open in OpenVPN Server Settings: with Modern open it
+// offers only the AES-GCM ciphers, with Legacy open only AES-CBC. Opening Legacy shows the red warning in
+// that tab, and Legacy packages cannot be built until its button has been pressed once.
+(function () {
+    var sel = document.getElementById('ovpn_cipher');
+    var form = document.getElementById('ovpnGenerateForm');
+    if (!sel || !form) return;
+    var CIPHERS = {
+        modern: [['AES-256-GCM', 'AES-256-GCM - Modern'], ['AES-128-GCM', 'AES-128-GCM - Modern']],
+        legacy: [['AES-256-CBC', 'AES-256-CBC - Legacy'], ['AES-128-CBC', 'AES-128-CBC - Legacy']]
+    };
+    var note = document.getElementById('ovpn_build_locked_note');
+    var btn = document.getElementById('ovpn_generate_btn');
+    var lockable = [form.elements['ext'], form.elements['mac'], sel, btn];
+    var current = null;
+
+    function applyLock() {
+        var locked = (current === 'legacy' && !OVPN_LEGACY_ACKED);
+        for (var i = 0; i < lockable.length; i++) { if (lockable[i]) lockable[i].disabled = locked; }
+        if (note) note.style.display = locked ? '' : 'none';
+    }
+    function fireChange(el) {
+        var ev;
+        if (typeof Event === 'function') { ev = new Event('change', { bubbles: true }); }
+        else { ev = document.createEvent('Event'); ev.initEvent('change', true, true); }
+        el.dispatchEvent(ev);
+    }
+    function show(inst) {
+        if (!CIPHERS[inst]) return;
+        var changed = (current !== inst);
+        current = inst;
+        if (changed || !sel.options.length) {
+            var want = sel.getAttribute('data-default-' + inst) || '';
+            var list = CIPHERS[inst], has = false, i;
+            for (i = 0; i < list.length; i++) { if (list[i][0] === want) has = true; }
+            if (!has) want = list[0][0];
+            while (sel.options.length) { sel.remove(0); }
+            for (i = 0; i < list.length; i++) {
+                var o = document.createElement('option');
+                o.value = list[i][0];
+                o.text = list[i][1];
+                sel.add(o);
+            }
+            sel.value = want;
+        }
+        applyLock();
+        fireChange(sel);
+    }
+    window.ovpnBuildSync = show;
+    form.addEventListener('submit', function (e) {
+        if (current === 'legacy' && !OVPN_LEGACY_ACKED) { e.preventDefault(); e.stopImmediatePropagation(); }
+    }, true);
+    // The Server Settings tab has already been restored from the browser by now.
+    show($('#ovpnSetTabs .ovpn-set-tab.active').data('instance') || 'modern');
+})();
+
+// Edit / bulk-change dialogs have no tabs: choosing an AES-CBC (Legacy) cipher before the Legacy warning has
+// been acknowledged (once, in Server Settings) shows a red notice and blocks saving. The server refuses it too.
+function ovpnSyncLegacyGate(selectId, gateId, modalId) {
+    var sel = document.getElementById(selectId), gate = document.getElementById(gateId);
+    if (!sel || !gate) return;
+    var blocked = /-CBC$/.test(sel.value || '') && !OVPN_LEGACY_ACKED;
+    gate.style.display = blocked ? '' : 'none';
+    $('#' + modalId + ' button[type="submit"]').prop('disabled', blocked);
+}
+(function () {
+    [['edit_cipher', 'edit_legacy_gate', 'editPackageModal'],
+     ['bulk_cipher', 'bulk_legacy_gate', 'bulkCipherModal']].forEach(function (g) {
+        var sel = document.getElementById(g[0]);
+        if (!sel) return;
+        var sync = function () { ovpnSyncLegacyGate(g[0], g[1], g[2]); };
+        sel.addEventListener('change', sync);
+        $('#' + g[2]).on('show.bs.modal', sync);
+    });
 })();
 // Sortable "Created Provisioning Archives" table (Extension / MAC / Cipher / Date Created).
 // Purely client-side; the chosen sort is remembered in this browser.

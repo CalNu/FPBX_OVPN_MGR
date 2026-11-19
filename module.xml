@@ -1,7 +1,7 @@
 <module>
     <rawname>ovpn_mgr</rawname>
     <name>OpenVPN Manager</name>
-    <version>3.03</version>
+    <version>3.05</version>
     <publisher>HG</publisher>
     <license>GPLv3+</license>
     <category>Utilities</category>
